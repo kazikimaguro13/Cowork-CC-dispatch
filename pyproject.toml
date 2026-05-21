@@ -10,7 +10,9 @@ readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
 authors = [{ name = "Cowork" }]
-dependencies = []
+dependencies = [
+  "pydantic>=2,<3",
+]
 
 [project.optional-dependencies]
 dev = [
