@@ -1,0 +1,16 @@
+# dispatch scaffolding (prototype bridge) — not part of the product
+_ai_workspace/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+
+# env / secrets
+.env
