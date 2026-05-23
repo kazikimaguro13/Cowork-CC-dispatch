@@ -1,0 +1,134 @@
+{
+  "version": 1,
+  "saved_at": "2026-05-23T02:49:38.386381+00:00",
+  "project": "実務案件A",
+  "generation": "bash_prototype",
+  "records": [
+    {
+      "spec_id": "spec_001",
+      "started_at": "2026-05-12T00:00:00Z",
+      "finished_at": "2026-05-12T00:00:00Z",
+      "status": "done",
+      "attempts": 1,
+      "failure_category": null,
+      "intervention": false
+    },
+    {
+      "spec_id": "spec_002",
+      "started_at": "2026-05-12T00:00:00Z",
+      "finished_at": "2026-05-12T00:00:00Z",
+      "status": "done",
+      "attempts": 1,
+      "failure_category": null,
+      "intervention": false
+    },
+    {
+      "spec_id": "spec_003",
+      "started_at": "2026-05-19T00:00:00Z",
+      "finished_at": "2026-05-19T00:00:00Z",
+      "status": "done",
+      "attempts": 1,
+      "failure_category": null,
+      "intervention": false
+    },
+    {
+      "spec_id": "spec_004",
+      "started_at": "2026-05-19T00:00:00Z",
+      "finished_at": "2026-05-19T00:00:00Z",
+      "status": "done",
+      "attempts": 1,
+      "failure_category": null,
+      "intervention": false
+    },
+    {
+      "spec_id": "spec_005",
+      "started_at": "2026-05-20T00:00:00Z",
+      "finished_at": "2026-05-20T00:00:00Z",
+      "status": "done",
+      "attempts": 1,
+      "failure_category": null,
+      "intervention": false
+    },
+    {
+      "spec_id": "spec_006",
+      "started_at": "2026-05-20T00:00:00Z",
+      "finished_at": "2026-05-20T00:00:00Z",
+      "status": "done",
+      "attempts": 1,
+      "failure_category": null,
+      "intervention": false
+    },
+    {
+      "spec_id": "spec_007",
+      "started_at": "2026-05-20T00:00:00Z",
+      "finished_at": "2026-05-20T00:00:00Z",
+      "status": "done",
+      "attempts": 1,
+      "failure_category": null,
+      "intervention": false
+    },
+    {
+      "spec_id": "spec_008",
+      "started_at": "2026-05-20T00:00:00Z",
+      "finished_at": "2026-05-20T00:00:00Z",
+      "status": "done",
+      "attempts": 1,
+      "failure_category": null,
+      "intervention": false
+    },
+    {
+      "spec_id": "spec_009",
+      "started_at": "2026-05-20T00:00:00Z",
+      "finished_at": "2026-05-20T00:00:00Z",
+      "status": "done",
+      "attempts": 1,
+      "failure_category": null,
+      "intervention": false
+    },
+    {
+      "spec_id": "spec_010",
+      "started_at": "2026-05-20T00:00:00Z",
+      "finished_at": "2026-05-20T00:00:00Z",
+      "status": "done",
+      "attempts": 1,
+      "failure_category": null,
+      "intervention": false
+    },
+    {
+      "spec_id": "spec_011",
+      "started_at": "2026-05-20T00:00:00Z",
+      "finished_at": "2026-05-20T00:00:00Z",
+      "status": "done",
+      "attempts": 1,
+      "failure_category": null,
+      "intervention": false
+    },
+    {
+      "spec_id": "spec_012",
+      "started_at": "2026-05-20T00:00:00Z",
+      "finished_at": "2026-05-20T00:00:00Z",
+      "status": "done",
+      "attempts": 1,
+      "failure_category": null,
+      "intervention": false
+    },
+    {
+      "spec_id": "spec_013",
+      "started_at": "2026-05-20T00:00:00Z",
+      "finished_at": "2026-05-20T00:00:00Z",
+      "status": "done",
+      "attempts": 1,
+      "failure_category": null,
+      "intervention": false
+    },
+    {
+      "spec_id": "spec_014",
+      "started_at": "2026-05-20T00:00:00Z",
+      "finished_at": "2026-05-20T00:00:00Z",
+      "status": "done",
+      "attempts": 1,
+      "failure_category": null,
+      "intervention": false
+    }
+  ]
+}

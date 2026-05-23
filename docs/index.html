@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>ccd dashboard</title>
+<style>
+:root {
+  color-scheme: light dark;
+  --bg: #0f172a;
+  --panel: #1e293b;
+  --text: #e2e8f0;
+  --muted: #94a3b8;
+  --accent: #38bdf8;
+  --success: #4ade80;
+  --warn: #facc15;
+  --danger: #f87171;
+  --chip-backfill: #f59e0b;
+  --chip-native: #22c55e;
+  --chip-other: #64748b;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; background: var(--bg); color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+  "Helvetica Neue", Arial, sans-serif; line-height: 1.45; }
+main { max-width: 1080px; margin: 0 auto; padding: 32px 20px 64px; }
+.page-header h1 { margin: 0 0 4px; font-size: 2rem; letter-spacing: -0.01em; }
+.subtitle { color: var(--muted); margin: 0; font-size: 0.95rem; }
+.quality { margin-top: 16px; }
+.chip-row { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 6px; }
+.chip { display: inline-block; padding: 2px 10px; border-radius: 999px;
+  font-size: 0.8rem; font-weight: 600; color: #0f172a; }
+.chip-backfill { background: var(--chip-backfill); }
+.chip-native { background: var(--chip-native); }
+.chip-other { background: var(--chip-other); color: var(--text); }
+.quality-note { color: var(--muted); font-size: 0.9rem; margin: 6px 0 0; }
+.quality-note code { background: rgba(148,163,184,0.15); padding: 1px 4px;
+  border-radius: 3px; font-size: 0.85em; }
+.panel { background: var(--panel); border-radius: 12px; padding: 20px 24px;
+  margin-top: 24px; box-shadow: 0 1px 0 rgba(255,255,255,0.04) inset; }
+.panel h2 { margin: 0 0 12px; font-size: 1.1rem; letter-spacing: 0.02em;
+  text-transform: uppercase; color: var(--muted); }
+.panel .caption { color: var(--muted); margin: 0 0 8px; font-size: 0.85rem; }
+.panel .empty { color: var(--muted); margin: 4px 0 0; }
+.hero { display: grid; grid-template-columns: minmax(220px, 280px) 1fr;
+  gap: 24px; align-items: center; }
+.hero-primary { text-align: center; padding: 8px 4px; }
+.hero-label { color: var(--muted); font-size: 0.85rem;
+  text-transform: uppercase; letter-spacing: 0.06em; }
+.hero-value { font-size: 3.2rem; font-weight: 700; color: var(--success);
+  line-height: 1.05; margin-top: 4px; }
+.hero-sub { color: var(--muted); margin-top: 2px; font-variant-numeric: tabular-nums; }
+.hero-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 12px; }
+.hero-cell { background: rgba(15,23,42,0.55); border-radius: 8px;
+  padding: 10px 12px; }
+.hero-cell-label { color: var(--muted); font-size: 0.78rem;
+  text-transform: uppercase; letter-spacing: 0.04em; }
+.hero-cell-value { font-size: 1.15rem; margin-top: 2px;
+  font-variant-numeric: tabular-nums; }
+.bar-label, .bar-count, .axis-label { fill: var(--text); font-size: 12px;
+  font-family: inherit; }
+.axis-label-small { fill: var(--muted); font-size: 10px; font-family: inherit; }
+.bar-fill { fill: var(--accent); }
+.bar-count { fill: var(--muted); }
+.grid { stroke: rgba(148,163,184,0.25); stroke-width: 1; }
+.trend-success { stroke: var(--success); stroke-width: 2; }
+.trend-auto { stroke: var(--accent); stroke-width: 2; }
+.trend-first { stroke: var(--warn); stroke-width: 2; }
+.trend-success-swatch { fill: var(--success); }
+.trend-auto-swatch { fill: var(--accent); }
+.trend-first-swatch { fill: var(--warn); }
+table.runs, table.specs { width: 100%; border-collapse: collapse; font-size: 0.9rem; }
+table.runs th, table.runs td, table.specs th, table.specs td {
+  padding: 8px 10px; border-bottom: 1px solid rgba(148,163,184,0.15);
+  text-align: left; vertical-align: top; }
+table.runs th, table.specs th { color: var(--muted); font-weight: 600;
+  font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.04em; }
+table.runs td.num, table.runs th.num, table.specs td.num, table.specs th.num {
+  text-align: right; font-variant-numeric: tabular-nums; }
+.detail-row > td { padding: 0 10px 10px; border-bottom: 1px solid
+  rgba(148,163,184,0.15); }
+details summary { cursor: pointer; color: var(--muted); padding: 4px 0;
+  font-size: 0.85rem; }
+table.specs { margin-top: 6px; background: rgba(15,23,42,0.4);
+  border-radius: 6px; overflow: hidden; }
+</style>
+</head>
+<body>
+<main>
+<header class="page-header"><h1>ccd dashboard</h1><p class="subtitle">run 5 件 · dispatch 74 件 · 生成 2026-05-23T03:04:58+00:00</p></header>
+<section class="quality" aria-label="データ品質"><div class="chip-row" aria-label="世代"><span class="chip chip-backfill">bash_prototype</span></div><p class="quality-note">バックフィルした run は <code>attempts=1</code> / <code>intervention=false</code> を既定値としています。一発合格率・リトライ回復率・自律完走率はこの欠損の影響を受けるため、上限寄りの概算値です。元の <code>result_*.md</code> がこれらのフィールドを持たないためです。安全停止率は下限、一発合格率・リトライ・自律完走の各指標は上限の目安として読んでください。</p></section>
+<section class="panel hero" aria-label="主要指標"><div class="hero-primary"><div class="hero-label">自律完走率</div><div class="hero-value">100.0%</div><div class="hero-sub">74/74 (100.0%)</div></div><div class="hero-grid"><div class="hero-cell"><div class="hero-cell-label">dispatch 成功率</div><div class="hero-cell-value">74/74 (100.0%)</div></div><div class="hero-cell"><div class="hero-cell-label">一発合格率</div><div class="hero-cell-value">74/74 (100.0%)</div></div><div class="hero-cell"><div class="hero-cell-label">リトライ回復率</div><div class="hero-cell-value">0/0 (0.0%)</div></div><div class="hero-cell"><div class="hero-cell-label">安全停止率</div><div class="hero-cell-value">0/0 (0.0%)</div></div><div class="hero-cell"><div class="hero-cell-label">総 dispatch 数</div><div class="hero-cell-value">74</div></div><div class="hero-cell"><div class="hero-cell-label">プロジェクト数</div><div class="hero-cell-value">5</div></div><div class="hero-cell"><div class="hero-cell-label">所要時間 平均</div><div class="hero-cell-value">0.0秒 (n=71)</div></div><div class="hero-cell"><div class="hero-cell-label">所要時間 中央値</div><div class="hero-cell-value">0.0秒</div></div></div></section>
+<section class="panel" aria-label="失敗カテゴリ"><h2>失敗カテゴリ</h2><p class="empty">失敗の記録はありません。</p></section>
+<section class="panel" aria-label="推移"><h2>推移</h2><p class="caption">dispatch を時系列順（古い → 新しい）に並べた累積率です。</p><svg viewBox="0 0 760 18" width="100%" preserveAspectRatio="xMinYMin meet" role="img" aria-label="凡例"><rect x="48" y="4" width="14" height="3" class="trend-success-swatch"/><text x="68" y="9" class="axis-label">dispatch成功率</text><rect x="248" y="4" width="14" height="3" class="trend-auto-swatch"/><text x="268" y="9" class="axis-label">自律完走率</text><rect x="448" y="4" width="14" height="3" class="trend-first-swatch"/><text x="468" y="9" class="axis-label">一発合格率</text></svg><svg viewBox="0 0 760 240" width="100%" preserveAspectRatio="xMinYMin meet" role="img" aria-label="dispatch 系列の累積率"><line x1="48" y1="204.0" x2="744" y2="204.0" class="grid"/><text x="42" y="208.0" class="axis-label" text-anchor="end">0%</text><line x1="48" y1="157.0" x2="744" y2="157.0" class="grid"/><text x="42" y="161.0" class="axis-label" text-anchor="end">25%</text><line x1="48" y1="110.0" x2="744" y2="110.0" class="grid"/><text x="42" y="114.0" class="axis-label" text-anchor="end">50%</text><line x1="48" y1="63.0" x2="744" y2="63.0" class="grid"/><text x="42" y="67.0" class="axis-label" text-anchor="end">75%</text><line x1="48" y1="16.0" x2="744" y2="16.0" class="grid"/><text x="42" y="20.0" class="axis-label" text-anchor="end">100%</text><line x1="48.0" y1="204" x2="48.0" y2="208" class="grid"/><text x="48.0" y="222" class="axis-label" text-anchor="middle">2026-05-11</text><text x="48.0" y="234" class="axis-label-small" text-anchor="middle">#1</text><line x1="391.2" y1="204" x2="391.2" y2="208" class="grid"/><text x="391.2" y="222" class="axis-label" text-anchor="middle">2026-05-18</text><text x="391.2" y="234" class="axis-label-small" text-anchor="middle">#37</text><line x1="744.0" y1="204" x2="744.0" y2="208" class="grid"/><text x="744.0" y="222" class="axis-label" text-anchor="middle">2026-05-23</text><text x="744.0" y="234" class="axis-label-small" text-anchor="middle">#74</text><polyline class="trend-success" fill="none" points="48.0,16.0 57.5,16.0 67.1,16.0 76.6,16.0 86.1,16.0 95.7,16.0 105.2,16.0 114.7,16.0 124.3,16.0 133.8,16.0 143.3,16.0 152.9,16.0 162.4,16.0 171.9,16.0 181.5,16.0 191.0,16.0 200.5,16.0 210.1,16.0 219.6,16.0 229.2,16.0 238.7,16.0 248.2,16.0 257.8,16.0 267.3,16.0 276.8,16.0 286.4,16.0 295.9,16.0 305.4,16.0 315.0,16.0 324.5,16.0 334.0,16.0 343.6,16.0 353.1,16.0 362.6,16.0 372.2,16.0 381.7,16.0 391.2,16.0 400.8,16.0 410.3,16.0 419.8,16.0 429.4,16.0 438.9,16.0 448.4,16.0 458.0,16.0 467.5,16.0 477.0,16.0 486.6,16.0 496.1,16.0 505.6,16.0 515.2,16.0 524.7,16.0 534.2,16.0 543.8,16.0 553.3,16.0 562.8,16.0 572.4,16.0 581.9,16.0 591.5,16.0 601.0,16.0 610.5,16.0 620.1,16.0 629.6,16.0 639.1,16.0 648.7,16.0 658.2,16.0 667.7,16.0 677.3,16.0 686.8,16.0 696.3,16.0 705.9,16.0 715.4,16.0 724.9,16.0 734.5,16.0 744.0,16.0"/><polyline class="trend-auto" fill="none" points="48.0,16.0 57.5,16.0 67.1,16.0 76.6,16.0 86.1,16.0 95.7,16.0 105.2,16.0 114.7,16.0 124.3,16.0 133.8,16.0 143.3,16.0 152.9,16.0 162.4,16.0 171.9,16.0 181.5,16.0 191.0,16.0 200.5,16.0 210.1,16.0 219.6,16.0 229.2,16.0 238.7,16.0 248.2,16.0 257.8,16.0 267.3,16.0 276.8,16.0 286.4,16.0 295.9,16.0 305.4,16.0 315.0,16.0 324.5,16.0 334.0,16.0 343.6,16.0 353.1,16.0 362.6,16.0 372.2,16.0 381.7,16.0 391.2,16.0 400.8,16.0 410.3,16.0 419.8,16.0 429.4,16.0 438.9,16.0 448.4,16.0 458.0,16.0 467.5,16.0 477.0,16.0 486.6,16.0 496.1,16.0 505.6,16.0 515.2,16.0 524.7,16.0 534.2,16.0 543.8,16.0 553.3,16.0 562.8,16.0 572.4,16.0 581.9,16.0 591.5,16.0 601.0,16.0 610.5,16.0 620.1,16.0 629.6,16.0 639.1,16.0 648.7,16.0 658.2,16.0 667.7,16.0 677.3,16.0 686.8,16.0 696.3,16.0 705.9,16.0 715.4,16.0 724.9,16.0 734.5,16.0 744.0,16.0"/><polyline class="trend-first" fill="none" points="48.0,16.0 57.5,16.0 67.1,16.0 76.6,16.0 86.1,16.0 95.7,16.0 105.2,16.0 114.7,16.0 124.3,16.0 133.8,16.0 143.3,16.0 152.9,16.0 162.4,16.0 171.9,16.0 181.5,16.0 191.0,16.0 200.5,16.0 210.1,16.0 219.6,16.0 229.2,16.0 238.7,16.0 248.2,16.0 257.8,16.0 267.3,16.0 276.8,16.0 286.4,16.0 295.9,16.0 305.4,16.0 315.0,16.0 324.5,16.0 334.0,16.0 343.6,16.0 353.1,16.0 362.6,16.0 372.2,16.0 381.7,16.0 391.2,16.0 400.8,16.0 410.3,16.0 419.8,16.0 429.4,16.0 438.9,16.0 448.4,16.0 458.0,16.0 467.5,16.0 477.0,16.0 486.6,16.0 496.1,16.0 505.6,16.0 515.2,16.0 524.7,16.0 534.2,16.0 543.8,16.0 553.3,16.0 562.8,16.0 572.4,16.0 581.9,16.0 591.5,16.0 601.0,16.0 610.5,16.0 620.1,16.0 629.6,16.0 639.1,16.0 648.7,16.0 658.2,16.0 667.7,16.0 677.3,16.0 686.8,16.0 696.3,16.0 705.9,16.0 715.4,16.0 724.9,16.0 734.5,16.0 744.0,16.0"/></svg></section>
+<section class="panel" aria-label="run 一覧"><h2>run 一覧</h2><table class="runs"><thead><tr><th>日付</th><th>プロジェクト</th><th>世代</th><th class="num">spec数</th><th class="num">完了</th><th class="num">失敗</th><th class="num">所要時間 平均</th></tr></thead><tbody><tr><td>2026-05-23</td><td>Cowork-CC-dispatch</td><td><span class="chip chip-backfill">bash_prototype</span></td><td class="num">8</td><td class="num">8</td><td class="num">0</td><td class="num">0.0秒</td></tr><tr class="detail-row"><td colspan="7"><details><summary>spec 別の明細</summary><table class="specs"><thead><tr><th>spec_id</th><th>ステータス</th><th>失敗カテゴリ</th><th class="num">所要時間</th></tr></thead><tbody><tr><td>spec_001</td><td>done</td><td>—</td><td class="num">0.0秒</td></tr><tr><td>spec_002</td><td>done</td><td>—</td><td class="num">0.0秒</td></tr><tr><td>spec_003</td><td>done</td><td>—</td><td class="num">0.0秒</td></tr><tr><td>spec_004</td><td>done</td><td>—</td><td class="num">0.0秒</td></tr><tr><td>spec_005</td><td>done</td><td>—</td><td class="num">0.0秒</td></tr><tr><td>spec_006</td><td>done</td><td>—</td><td class="num">0.0秒</td></tr><tr><td>spec_007</td><td>done</td><td>—</td><td class="num">0.0秒</td></tr><tr><td>spec_008</td><td>done</td><td>—</td><td class="num">0.0秒</td></tr></tbody></table></details></td></tr><tr><td>2026-05-21</td><td>axis-knowledge-rag</td><td><span class="chip chip-backfill">bash_prototype</span></td><td class="num">18</td><td class="num">18</td><td class="num">0</td><td class="num">0.0秒</td></tr><tr class="detail-row"><td colspan="7"><details><summary>spec 別の明細</summary><table class="specs"><thead><tr><th>spec_id</th><th>ステータス</th><th>失敗カテゴリ</th><th class="num">所要時間</th></tr></thead><tbody><tr><td>spec_056</td><td>done</td><td>—</td><td class="num">0.0秒</td></tr><tr><td>spec_057</td><td>done</td><td>—</td><td class="num">0.0秒</td></tr><tr><td>spec_058</td><td>done</td><td>—</td><td class="num">0.0秒</td></tr><tr><td>spec_059</td><td>done</td><td>—</td><td class="num">0.0秒</td></tr><tr><td>spec_060</td><td>done</td><td>—</td><td class="num">—</td></tr><tr><td>spec_061</td><td>done</td><td>—</td><td class="num">0.0秒</td></tr><tr><td>spec_062</td><td>done</td><td>—</td><td class="num">0.0秒</td></tr><tr><td>spec_063</td><td>done</td><td>—</td><td class="num">0.0秒</td></tr><tr><td>spec_064</td><td>done</td><td>—</td><td class="num">0.0秒</td></tr><tr><td>spec_065</td><td>done</td><td>—</td><td class="num">0.0秒</td></tr><tr><td>spec_066</td><td>done</td><td>—</td><td class="num">0.0秒</td></tr><tr><td>spec_067</td><td>done</td><td>—</td><td class="num">0.0秒</td></tr><tr><td>spec_068</td><td>done</td><td>—</td><td class="num">0.0秒</td></tr><tr><td>spec_069</td><td>done</td><td>—</td><td class="num">0.0秒</td></tr><tr><td>spec_070</td><td>done</td><td>—</td><td class="num">0.0秒</td></tr><tr><td>spec_071</td><td>done</td><td>—</td><td class="num">0.0秒</td></tr><tr><td>spec_072</td><td>done</td><td>—</td><td class="num">—</td></tr><tr><td>spec_055</td><td>done</td><td>—</td><td class="num">—</td></tr></tbody></table></details></td></tr><tr><td>2026-05-20</td><td>実務案件A</td><td><span class="chip chip-backfill">bash_prototype</span></td><td class="num">14</td><td class="num">14</td><td class="num">0</td><td class="num">0.0秒</td></tr><tr class="detail-row"><td colspan="7"><details><summary>spec 別の明細</summary><table class="specs"><thead><tr><th>spec_id</th><th>ステータス</th><th>失敗カテゴリ</th><th class="num">所要時間</th></tr></thead><tbody><tr><td>spec_001</td><td>done</td><td>—</td><td class="num">0.0秒</td></tr><tr><td>spec_002</td><td>done</td><td>—</td><td class="num">0.0秒</td></tr><tr><td>spec_003</td><td>done</td><td>—</td><td class="num">0.0秒</td></tr><tr><td>spec_004</td><td>done</td><td>—</td><td class="num">0.0秒</td></tr><tr><td>spec_005</td><td>done</td><td>—</td><td class="num">0.0秒</td></tr><tr><td>spec_006</td><td>done</td><td>—</td><td class="num">0.0秒</td></tr><tr><td>spec_007</td><td>done</td><td>—</td><td class="num">0.0秒</td></tr><tr><td>spec_008</td><td>done</td><td>—</td><td class="num">0.0秒</td></tr><tr><td>spec_009</td><td>done</td><td>—</td><td class="num">0.0秒</td></tr><tr><td>spec_010</td><td>done</td><td>—</td><td class="num">0.0秒</td></tr><tr><td>spec_011</td><td>done</td><td>—</td><td class="num">0.0秒</td></tr><tr><td>spec_012</td><td>done</td><td>—</td><td class="num">0.0秒</td></tr><tr><td>spec_013</td><td>done</td><td>—</td><td class="num">0.0秒</td></tr><tr><td>spec_014</td><td>done</td><td>—</td><td class="num">0.0秒</td></tr></tbody></table></details></td></tr><tr><td>2026-05-22</td><td>実務案件B</td><td><span class="chip chip-backfill">bash_prototype</span></td><td class="num">24</td><td class="num">24</td><td class="num">0</td><td class="num">0.0秒</td></tr><tr class="detail-row"><td colspan="7"><details><summary>spec 別の明細</summary><table class="specs"><thead><tr><th>spec_id</th><th>ステータス</th><th>失敗カテゴリ</th><th class="num">所要時間</th></tr></thead><tbody><tr><td>spec_001</td><td>done</td><td>—</td><td class="num">0.0秒</td></tr><tr><td>spec_002</td><td>done</td><td>—</td><td class="num">0.0秒</td></tr><tr><td>spec_003</td><td>done</td><td>—</td><td class="num">0.0秒</td></tr><tr><td>spec_004</td><td>done</td><td>—</td><td class="num">0.0秒</td></tr><tr><td>spec_005</td><td>done</td><td>—</td><td class="num">0.0秒</td></tr><tr><td>spec_006</td><td>done</td><td>—</td><td class="num">0.0秒</td></tr><tr><td>spec_007</td><td>done</td><td>—</td><td class="num">0.0秒</td></tr><tr><td>spec_008</td><td>done</td><td>—</td><td class="num">0.0秒</td></tr><tr><td>spec_009</td><td>done</td><td>—</td><td class="num">0.0秒</td></tr><tr><td>spec_010</td><td>done</td><td>—</td><td class="num">0.0秒</td></tr><tr><td>spec_011</td><td>done</td><td>—</td><td class="num">0.0秒</td></tr><tr><td>spec_012</td><td>done</td><td>—</td><td class="num">0.0秒</td></tr><tr><td>spec_013</td><td>done</td><td>—</td><td class="num">0.0秒</td></tr><tr><td>spec_014</td><td>done</td><td>—</td><td class="num">0.0秒</td></tr><tr><td>spec_015</td><td>done</td><td>—</td><td class="num">0.0秒</td></tr><tr><td>spec_016</td><td>done</td><td>—</td><td class="num">0.0秒</td></tr><tr><td>spec_017</td><td>done</td><td>—</td><td class="num">0.0秒</td></tr><tr><td>spec_018</td><td>done</td><td>—</td><td class="num">0.0秒</td></tr><tr><td>spec_019</td><td>done</td><td>—</td><td class="num">0.0秒</td></tr><tr><td>spec_020</td><td>done</td><td>—</td><td class="num">0.0秒</td></tr><tr><td>spec_021</td><td>done</td><td>—</td><td class="num">0.0秒</td></tr><tr><td>spec_022</td><td>done</td><td>—</td><td class="num">0.0秒</td></tr><tr><td>spec_023</td><td>done</td><td>—</td><td class="num">0.0秒</td></tr><tr><td>spec_024</td><td>done</td><td>—</td><td class="num">0.0秒</td></tr></tbody></table></details></td></tr><tr><td>2026-05-22</td><td>実務案件C</td><td><span class="chip chip-backfill">bash_prototype</span></td><td class="num">10</td><td class="num">10</td><td class="num">0</td><td class="num">0.0秒</td></tr><tr class="detail-row"><td colspan="7"><details><summary>spec 別の明細</summary><table class="specs"><thead><tr><th>spec_id</th><th>ステータス</th><th>失敗カテゴリ</th><th class="num">所要時間</th></tr></thead><tbody><tr><td>spec_001</td><td>done</td><td>—</td><td class="num">0.0秒</td></tr><tr><td>spec_002</td><td>done</td><td>—</td><td class="num">0.0秒</td></tr><tr><td>spec_003</td><td>done</td><td>—</td><td class="num">0.0秒</td></tr><tr><td>spec_004</td><td>done</td><td>—</td><td class="num">0.0秒</td></tr><tr><td>spec_005</td><td>done</td><td>—</td><td class="num">0.0秒</td></tr><tr><td>spec_006</td><td>done</td><td>—</td><td class="num">0.0秒</td></tr><tr><td>spec_007</td><td>done</td><td>—</td><td class="num">0.0秒</td></tr><tr><td>spec_008</td><td>done</td><td>—</td><td class="num">0.0秒</td></tr><tr><td>spec_009</td><td>done</td><td>—</td><td class="num">0.0秒</td></tr><tr><td>spec_010</td><td>done</td><td>—</td><td class="num">0.0秒</td></tr></tbody></table></details></td></tr></tbody></table></section>
+</main>
+</body>
+</html>

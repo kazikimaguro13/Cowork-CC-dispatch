@@ -1,0 +1,98 @@
+{
+  "version": 1,
+  "saved_at": "2026-05-23T02:49:38.638649+00:00",
+  "project": "実務案件C",
+  "generation": "bash_prototype",
+  "records": [
+    {
+      "spec_id": "spec_001",
+      "started_at": "2026-05-11T00:00:00Z",
+      "finished_at": "2026-05-11T00:00:00Z",
+      "status": "done",
+      "attempts": 1,
+      "failure_category": null,
+      "intervention": false
+    },
+    {
+      "spec_id": "spec_002",
+      "started_at": "2026-05-11T00:00:00Z",
+      "finished_at": "2026-05-11T00:00:00Z",
+      "status": "done",
+      "attempts": 1,
+      "failure_category": null,
+      "intervention": false
+    },
+    {
+      "spec_id": "spec_003",
+      "started_at": "2026-05-12T00:00:00Z",
+      "finished_at": "2026-05-12T00:00:00Z",
+      "status": "done",
+      "attempts": 1,
+      "failure_category": null,
+      "intervention": false
+    },
+    {
+      "spec_id": "spec_004",
+      "started_at": "2026-05-12T00:00:00Z",
+      "finished_at": "2026-05-12T00:00:00Z",
+      "status": "done",
+      "attempts": 1,
+      "failure_category": null,
+      "intervention": false
+    },
+    {
+      "spec_id": "spec_005",
+      "started_at": "2026-05-12T00:00:00Z",
+      "finished_at": "2026-05-12T00:00:00Z",
+      "status": "done",
+      "attempts": 1,
+      "failure_category": null,
+      "intervention": false
+    },
+    {
+      "spec_id": "spec_006",
+      "started_at": "2026-05-12T00:00:00Z",
+      "finished_at": "2026-05-12T00:00:00Z",
+      "status": "done",
+      "attempts": 1,
+      "failure_category": null,
+      "intervention": false
+    },
+    {
+      "spec_id": "spec_007",
+      "started_at": "2026-05-12T00:00:00Z",
+      "finished_at": "2026-05-12T00:00:00Z",
+      "status": "done",
+      "attempts": 1,
+      "failure_category": null,
+      "intervention": false
+    },
+    {
+      "spec_id": "spec_008",
+      "started_at": "2026-05-22T00:00:00Z",
+      "finished_at": "2026-05-22T00:00:00Z",
+      "status": "done",
+      "attempts": 1,
+      "failure_category": null,
+      "intervention": false
+    },
+    {
+      "spec_id": "spec_009",
+      "started_at": "2026-05-22T00:00:00Z",
+      "finished_at": "2026-05-22T00:00:00Z",
+      "status": "done",
+      "attempts": 1,
+      "failure_category": null,
+      "intervention": false
+    },
+    {
+      "spec_id": "spec_010",
+      "started_at": "2026-05-22T00:00:00Z",
+      "finished_at": "2026-05-22T00:00:00Z",
+      "status": "done",
+      "attempts": 1,
+      "failure_category": null,
+      "intervention": false
+    }
+  ]
+}
