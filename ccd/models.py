@@ -20,6 +20,7 @@ class DispatchStatus(StrEnum):
     FAILED = "failed"
     BLOCKED = "blocked"
     HALTED = "halted"
+    PARTIAL = "partial"
 
 
 class FailureCategory(StrEnum):

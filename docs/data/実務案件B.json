@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "saved_at": "2026-05-23T02:49:38.541461+00:00",
+  "saved_at": "2026-05-23T04:55:14.183942+00:00",
   "project": "実務案件B",
   "generation": "bash_prototype",
   "records": [
@@ -197,7 +197,7 @@
       "spec_id": "spec_022",
       "started_at": "2026-05-22T00:00:00Z",
       "finished_at": "2026-05-22T00:00:00Z",
-      "status": "done",
+      "status": "partial",
       "attempts": 1,
       "failure_category": null,
       "intervention": false
@@ -213,6 +213,15 @@
     },
     {
       "spec_id": "spec_024",
+      "started_at": "2026-05-22T00:00:00Z",
+      "finished_at": "2026-05-22T00:00:00Z",
+      "status": "done",
+      "attempts": 1,
+      "failure_category": null,
+      "intervention": false
+    },
+    {
+      "spec_id": "spec_025",
       "started_at": "2026-05-22T00:00:00Z",
       "finished_at": "2026-05-22T00:00:00Z",
       "status": "done",

@@ -65,6 +65,7 @@ class MetricsReport(BaseModel):
 
     total_specs: int = Field(ge=0)
     done: int = Field(ge=0)
+    partial: int = Field(ge=0)
     failures: int = Field(ge=0)
 
     dispatch_success_rate: Rate
@@ -81,14 +82,28 @@ MetricsSource = ChainResult | Sequence[DispatchRecord]
 
 
 def aggregate(source: MetricsSource) -> MetricsReport:
-    """Aggregate a `ChainResult` (or `DispatchRecord` sequence) into a `MetricsReport`."""
+    """Aggregate a `ChainResult` (or `DispatchRecord` sequence) into a `MetricsReport`.
+
+    ``PARTIAL`` records are counted on their own axis: they are neither
+    successes (excluded from the success numerator) nor failures (excluded
+    from the failure denominator and the failure taxonomy). Hiding them in
+    either bucket would either inflate the success rate or fake a failure
+    category — both are wrong for a status that means "shipped with caveats".
+    """
 
     records = _records_of(source)
     total = len(records)
     done_records = [r for r in records if r.status is DispatchStatus.DONE]
-    fail_records = [r for r in records if r.status is not DispatchStatus.DONE]
+    partial_records = [r for r in records if r.status is DispatchStatus.PARTIAL]
+    fail_records = [
+        r
+        for r in records
+        if r.status is not DispatchStatus.DONE
+        and r.status is not DispatchStatus.PARTIAL
+    ]
 
     done = len(done_records)
+    partial = len(partial_records)
     failures = len(fail_records)
 
     dispatch_success_rate = _rate(done, total)
@@ -118,6 +133,7 @@ def aggregate(source: MetricsSource) -> MetricsReport:
     return MetricsReport(
         total_specs=total,
         done=done,
+        partial=partial,
         failures=failures,
         dispatch_success_rate=dispatch_success_rate,
         autonomous_completion_rate=autonomous_completion_rate,
@@ -140,6 +156,7 @@ def render_report(report: MetricsReport) -> str:
         "",
         f"- Total specs: {report.total_specs}",
         f"- Done: {report.done}",
+        f"- Partial: {report.partial}",
         f"- Failures: {report.failures}",
         "",
         "## Scoreboard",

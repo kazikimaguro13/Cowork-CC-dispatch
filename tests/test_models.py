@@ -24,6 +24,7 @@ def test_dispatch_status_values() -> None:
         "failed",
         "blocked",
         "halted",
+        "partial",
     }
 
 

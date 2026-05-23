@@ -174,12 +174,23 @@ def test_parse_ignores_inline_kv_in_body(tmp_path: Path) -> None:
 def test_backfill_project_parses_valid_skips_invalid(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    project = _stage_outbox(tmp_path)
+    project = _stage_outbox(
+        tmp_path,
+        fixture_names=[
+            "result_001.md",
+            "result_002.md",
+            "result_003.md",
+            "result_004.md",
+            "result_005.md",
+            "result_006.md",
+        ],
+    )
     with caplog.at_level(logging.WARNING):
         run = backfill_project(
             project, label="fixture-project", generation="bash_prototype"
         )
-    # 4 valid (001-004) out of 6 fixtures; result_005 and 006 are skipped.
+    # 4 valid (001-004) out of 6 fixtures; result_005 (no status) and
+    # result_006 (in-progress; not a known status) are still skipped.
     assert len(run.records) == 4
     assert run.project == "fixture-project"
     assert run.generation == "bash_prototype"
@@ -191,7 +202,15 @@ def test_backfill_project_parses_valid_skips_invalid(
 
 
 def test_backfill_project_renumbers_non_standard_spec_ids(tmp_path: Path) -> None:
-    project = _stage_outbox(tmp_path)
+    project = _stage_outbox(
+        tmp_path,
+        fixture_names=[
+            "result_001.md",
+            "result_002.md",
+            "result_003.md",
+            "result_004.md",
+        ],
+    )
     run = backfill_project(
         project, label="fixture-project", generation="bash_prototype"
     )
@@ -215,7 +234,15 @@ def test_backfill_project_renumbers_non_standard_spec_ids(tmp_path: Path) -> Non
 
 
 def test_backfill_project_dates_are_midnight_utc(tmp_path: Path) -> None:
-    project = _stage_outbox(tmp_path)
+    project = _stage_outbox(
+        tmp_path,
+        fixture_names=[
+            "result_001.md",
+            "result_002.md",
+            "result_003.md",
+            "result_004.md",
+        ],
+    )
     run = backfill_project(project, label="x", generation="bash_prototype")
     for r in run.records:
         assert r.started_at.hour == 0
@@ -246,7 +273,15 @@ def test_backfill_project_missing_results_dir_returns_empty(
 
 
 def test_write_run_file_excludes_body_and_commits(tmp_path: Path) -> None:
-    project = _stage_outbox(tmp_path)
+    project = _stage_outbox(
+        tmp_path,
+        fixture_names=[
+            "result_001.md",
+            "result_002.md",
+            "result_003.md",
+            "result_004.md",
+        ],
+    )
     run = backfill_project(project, label="x", generation="bash_prototype")
 
     out_dir = tmp_path / "runs"
@@ -285,7 +320,15 @@ def test_write_run_file_slugifies_label(tmp_path: Path) -> None:
 
 
 def test_run_file_round_trip(tmp_path: Path) -> None:
-    project = _stage_outbox(tmp_path)
+    project = _stage_outbox(
+        tmp_path,
+        fixture_names=[
+            "result_001.md",
+            "result_002.md",
+            "result_003.md",
+            "result_004.md",
+        ],
+    )
     run = backfill_project(project, label="x", generation="ccd_native")
     out = write_run_file(run, tmp_path / "runs")
     payload = json.loads(out.read_text(encoding="utf-8"))
@@ -381,7 +424,15 @@ def test_load_sources_config_requires_path_and_label(tmp_path: Path) -> None:
 def test_cli_main_with_source_flag_writes_run_file(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    project = _stage_outbox(tmp_path)
+    project = _stage_outbox(
+        tmp_path,
+        fixture_names=[
+            "result_001.md",
+            "result_002.md",
+            "result_003.md",
+            "result_004.md",
+        ],
+    )
     out_dir = tmp_path / "runs"
     rc = main(
         [
@@ -414,7 +465,15 @@ def test_cli_main_with_no_sources_returns_2(
 def test_cli_main_with_config(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    project = _stage_outbox(tmp_path)
+    project = _stage_outbox(
+        tmp_path,
+        fixture_names=[
+            "result_001.md",
+            "result_002.md",
+            "result_003.md",
+            "result_004.md",
+        ],
+    )
     cfg = tmp_path / "sources.json"
     cfg.write_text(
         json.dumps(
@@ -439,3 +498,104 @@ def test_cli_main_with_config(
 def test_backfill_source_dataclass_is_hashable_default_results_dir() -> None:
     s = BackfillSource(path=Path("/x"), label="a", generation="bash_prototype")
     assert s.results_dir is None
+
+
+# --------------------------------------------------------------------------- #
+# spec_009: lenient status / spec_id parsing                                  #
+# --------------------------------------------------------------------------- #
+
+
+def test_parse_recognizes_partial_status() -> None:
+    record = parse_result_file(FIXTURES / "result_010.md")
+    assert record is not None
+    assert record.spec_id == "spec_010"
+    assert record.status is DispatchStatus.PARTIAL
+
+
+def test_parse_maps_completed_synonym_to_done() -> None:
+    record = parse_result_file(FIXTURES / "result_011.md")
+    assert record is not None
+    assert record.spec_id == "spec_011"
+    assert record.status is DispatchStatus.DONE
+
+
+def test_parse_strips_emoji_prefix_and_em_dash_trail() -> None:
+    record = parse_result_file(FIXTURES / "result_012.md")
+    assert record is not None
+    assert record.status is DispatchStatus.DONE
+
+
+def test_parse_strips_parenthetical_suffix() -> None:
+    record = parse_result_file(FIXTURES / "result_013.md")
+    assert record is not None
+    assert record.status is DispatchStatus.DONE
+
+
+def test_parse_strips_full_width_parenthetical_suffix(tmp_path: Path) -> None:
+    f = tmp_path / "result_zenkaku.md"
+    f.write_text(
+        "# result_zenkaku: x\n\n"
+        "- **Spec**: spec_999\n"
+        "- **Status**: partial（コード変更・git push は完了。"
+        "clasp push のみ認証エラーで未完。再実行手順は §7 を参照）\n",
+        encoding="utf-8",
+    )
+    record = parse_result_file(f)
+    assert record is not None
+    assert record.status is DispatchStatus.PARTIAL
+
+
+def test_parse_handles_lowercase_status_with_decoration() -> None:
+    record = parse_result_file(FIXTURES / "result_014.md")
+    assert record is not None
+    assert record.status is DispatchStatus.DONE
+
+
+def test_parse_falls_back_to_status_outside_header_block() -> None:
+    record = parse_result_file(FIXTURES / "result_015.md")
+    assert record is not None
+    assert record.spec_id == "spec_015"
+    assert record.status is DispatchStatus.DONE
+
+
+def test_parse_falls_back_to_filename_for_spec_id() -> None:
+    record = parse_result_file(FIXTURES / "result_016.md")
+    assert record is not None
+    # Title uses em-dash so the title regex doesn't bind; body mentions
+    # ``spec_016`` via the branch name → that wins (filename is the last resort).
+    assert record.spec_id == "spec_016"
+    assert record.status is DispatchStatus.DONE
+
+
+def test_parse_filename_fallback_when_no_body_mention(tmp_path: Path) -> None:
+    f = tmp_path / "result_077.md"
+    f.write_text(
+        "# result_077 — title without colon and no spec mention\n\n"
+        "- **Status**: done\n",
+        encoding="utf-8",
+    )
+    record = parse_result_file(f)
+    assert record is not None
+    assert record.spec_id == "spec_077"
+
+
+def test_parse_still_skips_unknown_status(tmp_path: Path) -> None:
+    f = tmp_path / "result_x.md"
+    f.write_text(
+        "# result_x: x\n\n- **Spec**: spec_321\n- **Status**: floomp\n",
+        encoding="utf-8",
+    )
+    record = parse_result_file(f)
+    assert record is None
+
+
+def test_parse_does_not_fabricate_status_when_absent(tmp_path: Path) -> None:
+    """If the document has no status line anywhere, we must skip — never default."""
+
+    f = tmp_path / "result_nostatus.md"
+    f.write_text(
+        "# result_nostatus: x\n\n- **Spec**: spec_222\n",
+        encoding="utf-8",
+    )
+    record = parse_result_file(f)
+    assert record is None

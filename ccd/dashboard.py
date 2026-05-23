@@ -188,9 +188,19 @@ def _render_quality_note(runs: Sequence[RunFile]) -> str:
         f'<span class="chip chip-{_chip_kind(g)}">{html.escape(g)}</span>'
         for g in generations
     )
-    note = ""
+    notes: list[str] = []
+    # Survival bias is structural for any backfill from result files: a halted
+    # dispatch leaves no result file behind, so the parser cannot observe it.
+    # State this honestly instead of fabricating phantom failures.
+    notes.append(
+        '<p class="quality-note"><strong>カバレッジ注記</strong>: '
+        "集計対象は <code>result_*.md</code> を残した dispatch のみです。"
+        "途中で halt して result を残さなかった失敗は構造的に含まれません "
+        "(生存バイアス)。表示されている成功率は「result を書き残せた dispatch の中での」"
+        "成功率であり、母集団全体の成功率の上限の目安として読んでください。</p>"
+    )
     if has_backfill:
-        note = (
+        notes.append(
             '<p class="quality-note">バックフィルした run は <code>attempts=1</code> '
             "/ <code>intervention=false</code> を既定値としています。一発合格率・"
             "リトライ回復率・自律完走率はこの欠損の影響を受けるため、上限寄りの概算値です。"
@@ -201,8 +211,8 @@ def _render_quality_note(runs: Sequence[RunFile]) -> str:
     return (
         '<section class="quality" aria-label="データ品質">'
         f'<div class="chip-row" aria-label="世代">{chips}</div>'
-        f"{note}"
-        "</section>"
+        + "".join(notes)
+        + "</section>"
     )
 
 
@@ -220,12 +230,14 @@ def _chip_kind(generation: str) -> str:
 def _render_hero(report: MetricsReport, *, project_count: int) -> str:
     auto_pct = _percent(report.autonomous_completion_rate)
     duration = report.duration
+    breakdown = _outcome_breakdown(report)
     return (
         '<section class="panel hero" aria-label="主要指標">'
         '<div class="hero-primary">'
         '<div class="hero-label">自律完走率</div>'
         f'<div class="hero-value">{auto_pct}</div>'
         f'<div class="hero-sub">{_fmt_rate(report.autonomous_completion_rate)}</div>'
+        f'<div class="hero-breakdown">{breakdown}</div>'
         "</div>"
         '<div class="hero-grid">'
         + _hero_cell("dispatch 成功率", _fmt_rate(report.dispatch_success_rate))
@@ -235,13 +247,44 @@ def _render_hero(report: MetricsReport, *, project_count: int) -> str:
         + _hero_cell("総 dispatch 数", str(report.total_specs))
         + _hero_cell("プロジェクト数", str(project_count))
         + _hero_cell(
-            "所要時間 平均",
-            f"{duration.mean_seconds:.1f}秒 (n={duration.samples})",
+            "done / partial",
+            f"{report.done} done / {report.partial} partial / {report.failures} failed",
         )
-        + _hero_cell("所要時間 中央値", f"{duration.median_seconds:.1f}秒")
+        + _hero_cell(
+            "所要時間",
+            f"平均 {duration.mean_seconds:.1f}s · 中央値 {duration.median_seconds:.1f}s "
+            f"(n={duration.samples})",
+        )
         + "</div>"
         "</section>"
     )
+
+
+def _outcome_breakdown(report: MetricsReport) -> str:
+    """Render `done` / `partial` / `failed` counts as a tiny inline pill row.
+
+    Surfaced under the hero number so the dashboard never reads as "100% done"
+    when there are partials silently in the pool.
+    """
+
+    items = [
+        ("done", report.done, "outcome-done"),
+        ("partial", report.partial, "outcome-partial"),
+        ("failed", report.failures, "outcome-failed"),
+    ]
+    pills = []
+    for label, count, cls in items:
+        if count == 0:
+            continue
+        pills.append(
+            f'<span class="outcome-pill {cls}">'
+            f'<span class="outcome-count">{count}</span> '
+            f'<span class="outcome-label">{html.escape(label)}</span>'
+            "</span>"
+        )
+    if not pills:
+        return ""
+    return "".join(pills)
 
 
 def _hero_cell(label: str, value: str) -> str:
@@ -443,6 +486,7 @@ def _render_runs_table(runs: Sequence[RunFile]) -> str:
         "<thead><tr>"
         "<th>日付</th><th>プロジェクト</th><th>世代</th>"
         "<th class=\"num\">spec数</th><th class=\"num\">完了</th>"
+        "<th class=\"num\">partial</th>"
         "<th class=\"num\">失敗</th><th class=\"num\">所要時間 平均</th>"
         "</tr></thead>"
         "<tbody>"
@@ -455,7 +499,8 @@ def _render_runs_table(runs: Sequence[RunFile]) -> str:
 def _render_run_row(run: RunFile) -> str:
     records = run.records
     done = sum(1 for r in records if r.status is DispatchStatus.DONE)
-    failed = len(records) - done
+    partial = sum(1 for r in records if r.status is DispatchStatus.PARTIAL)
+    failed = len(records) - done - partial
 
     durations = [
         (r.finished_at - r.started_at).total_seconds()
@@ -480,12 +525,13 @@ def _render_run_row(run: RunFile) -> str:
         f'{html.escape(generation)}</span></td>'
         f'<td class="num">{len(records)}</td>'
         f'<td class="num">{done}</td>'
+        f'<td class="num">{partial}</td>'
         f'<td class="num">{failed}</td>'
         f'<td class="num">{html.escape(duration_str)}</td>'
         "</tr>"
     )
     detail_row = (
-        '<tr class="detail-row"><td colspan="7">'
+        '<tr class="detail-row"><td colspan="8">'
         f"{details}"
         "</td></tr>"
     )
@@ -499,11 +545,12 @@ def _render_run_details(run: RunFile) -> str:
         )
     items: list[str] = []
     for r in run.records:
-        cat = (
-            r.failure_category.value
-            if r.failure_category is not None
-            else ("—" if r.status is DispatchStatus.DONE else "不明")
-        )
+        if r.failure_category is not None:
+            cat = r.failure_category.value
+        elif r.status is DispatchStatus.DONE or r.status is DispatchStatus.PARTIAL:
+            cat = "—"
+        else:
+            cat = "不明"
         duration = (
             f"{(r.finished_at - r.started_at).total_seconds():.1f}秒"
             if r.finished_at is not None
@@ -607,6 +654,17 @@ main { max-width: 1080px; margin: 0 auto; padding: 32px 20px 64px; }
 .hero-value { font-size: 3.2rem; font-weight: 700; color: var(--success);
   line-height: 1.05; margin-top: 4px; }
 .hero-sub { color: var(--muted); margin-top: 2px; font-variant-numeric: tabular-nums; }
+.hero-breakdown { display: flex; flex-wrap: wrap; justify-content: center;
+  gap: 6px; margin-top: 10px; }
+.outcome-pill { display: inline-flex; align-items: baseline; gap: 4px;
+  padding: 2px 8px; border-radius: 999px; font-size: 0.78rem;
+  background: rgba(15,23,42,0.55); }
+.outcome-pill .outcome-count { font-weight: 700; font-variant-numeric: tabular-nums; }
+.outcome-pill .outcome-label { color: var(--muted); text-transform: uppercase;
+  letter-spacing: 0.04em; font-size: 0.7rem; }
+.outcome-done .outcome-count { color: var(--success); }
+.outcome-partial .outcome-count { color: var(--warn); }
+.outcome-failed .outcome-count { color: var(--danger); }
 .hero-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
   gap: 12px; }
 .hero-cell { background: rgba(15,23,42,0.55); border-radius: 8px;
