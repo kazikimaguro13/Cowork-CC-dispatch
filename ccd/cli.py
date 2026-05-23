@@ -29,16 +29,18 @@ from ccd import __version__
 from ccd.agent import AgentRunner, ClaudeCodeRunner
 from ccd.chain import run_chain
 from ccd.dashboard import render_to as render_dashboard_to
-from ccd.dispatch import dispatch_one
 from ccd.integrate import DEFAULT_SMOKE_COMMANDS
 from ccd.metrics import aggregate, render_report
 from ccd.models import DispatchRecord, DispatchStatus
 from ccd.protocol import parse_spec
+from ccd.retry import dispatch_with_retry
 from ccd.run_writer import (
     RunWriter,
     halted_interrupted_record,
     reconcile_path,
 )
+
+DEFAULT_CLI_MAX_ATTEMPTS = 3
 
 DEFAULT_LAST_RUN_PATH = Path("_ai_workspace") / "logs" / "last_run.json"
 DEFAULT_DASHBOARD_RUNS_PATH = Path("_ai_workspace") / "runs"
@@ -87,6 +89,18 @@ def build_parser() -> argparse.ArgumentParser:
             "Exceeding it produces a HALTED + INTERRUPTED record."
         ),
     )
+    p_dispatch.add_argument(
+        "--max-attempts",
+        dest="max_attempts",
+        type=int,
+        default=DEFAULT_CLI_MAX_ATTEMPTS,
+        help=(
+            f"Maximum dispatch attempts (default: {DEFAULT_CLI_MAX_ATTEMPTS}). "
+            "Retryable failures (smoke_failed / agent_misread / transient / "
+            "interrupted) feed a feedback file into the next attempt's "
+            "prompt. environment / merge_conflict / BLOCKED halt immediately."
+        ),
+    )
 
     p_chain = sub.add_parser(
         "chain",
@@ -116,6 +130,17 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Per-spec runner timeout in seconds (default: no timeout). "
             "Exceeding it produces a HALTED + INTERRUPTED record and halts the chain."
+        ),
+    )
+    p_chain.add_argument(
+        "--max-attempts",
+        dest="max_attempts",
+        type=int,
+        default=DEFAULT_CLI_MAX_ATTEMPTS,
+        help=(
+            f"Maximum dispatch attempts per spec (default: "
+            f"{DEFAULT_CLI_MAX_ATTEMPTS}). Same retryable / halt boundary "
+            "as `ccd dispatch --max-attempts`."
         ),
     )
 
@@ -194,7 +219,7 @@ def main(
     args = parser.parse_args(argv)
 
     if args.command == "dispatch":
-        return _cmd_dispatch(args, runner)
+        return _cmd_dispatch(args, runner, smoke_commands)
     if args.command == "chain":
         return _cmd_chain(args, runner, smoke_commands)
     if args.command == "report":
@@ -208,11 +233,17 @@ def main(
     return 0
 
 
-def _cmd_dispatch(args: argparse.Namespace, runner: AgentRunner | None) -> int:
+def _cmd_dispatch(
+    args: argparse.Namespace,
+    runner: AgentRunner | None,
+    smoke_commands: Sequence[Sequence[str]] | None,
+) -> int:
     repo = _resolve_repo(args.repo)
     spec = parse_spec(args.spec)
     timeout = getattr(args, "timeout", None)
+    max_attempts = getattr(args, "max_attempts", DEFAULT_CLI_MAX_ATTEMPTS)
     runner = runner if runner is not None else ClaudeCodeRunner(timeout=timeout)
+    smoke = smoke_commands if smoke_commands is not None else DEFAULT_SMOKE_COMMANDS
 
     save_path = _resolve_save_path(args.save, repo)
     writer = RunWriter(save_path)
@@ -221,7 +252,13 @@ def _cmd_dispatch(args: argparse.Namespace, runner: AgentRunner | None) -> int:
     started_at = _now()
     writer.start(spec.id, started_at=started_at)
     try:
-        record = dispatch_one(spec, runner, repo=repo)
+        record = dispatch_with_retry(
+            spec,
+            runner,
+            repo=repo,
+            max_attempts=max_attempts,
+            smoke_commands=smoke,
+        )
     except Exception as exc:
         record = halted_interrupted_record(spec.id, started_at=started_at)
         writer.finish(record)
@@ -245,6 +282,7 @@ def _cmd_chain(
     repo = _resolve_repo(args.repo)
     specs = [parse_spec(p) for p in args.specs]
     timeout = getattr(args, "timeout", None)
+    max_attempts = getattr(args, "max_attempts", DEFAULT_CLI_MAX_ATTEMPTS)
     runner = runner if runner is not None else ClaudeCodeRunner(timeout=timeout)
     smoke = smoke_commands if smoke_commands is not None else DEFAULT_SMOKE_COMMANDS
 
@@ -259,6 +297,7 @@ def _cmd_chain(
         smoke_commands=smoke,
         on_start=writer.start,
         on_finish=writer.finish,
+        max_attempts=max_attempts,
     )
     writer.attach_chain(result)
 

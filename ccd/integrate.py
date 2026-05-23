@@ -73,7 +73,7 @@ def integrate(
             detail=f"dispatch status was {record.status.value}",
         )
 
-    smoke = _run_smoke(repo, smoke_commands)
+    smoke = run_smoke(repo, smoke_commands)
     if not smoke.passed:
         return IntegrateResult(
             spec_id=record.spec_id,
@@ -105,7 +105,18 @@ def integrate(
     )
 
 
-def _run_smoke(repo: Path, commands: Sequence[Sequence[str]]) -> SmokeResult:
+def run_smoke(repo: Path, commands: Sequence[Sequence[str]]) -> SmokeResult:
+    """Run the smoke commands in ``repo``, stopping at the first non-zero exit.
+
+    Public alias used by `ccd/retry.py:dispatch_with_retry` so the retry loop
+    can probe a successful dispatch the same way `integrate` does before
+    deciding whether the outcome is a real DONE or a regression to feed back
+    into the next attempt's prompt. ``integrate()`` keeps calling this
+    function as its merge gate, so smoke runs twice on success — once for
+    retry-decision in `dispatch_with_retry`, once for the merge gate in
+    `integrate`. The cost (~3 s) is dwarfed by the agent invocation and the
+    two paths stay decoupled.
+    """
     results: list[CommandResult] = []
     passed = True
     for argv in commands:

@@ -36,7 +36,7 @@ def test_fake_runner_returns_configured_outcome(tmp_path: Path) -> None:
 
     assert out.exit_code == 2
     assert out.stderr == "boom"
-    assert runner.calls == [("spec_010", tmp_path)]
+    assert runner.calls == [("spec_010", tmp_path, None)]
 
 
 def test_fake_runner_default_outcome_is_success(tmp_path: Path) -> None:

@@ -79,7 +79,7 @@ def test_dispatch_success(repo: Path) -> None:
     assert record.intervention is False
     assert record.finished_at is not None
     assert record.finished_at >= record.started_at
-    assert runner.calls == [("spec_010", repo)]
+    assert runner.calls == [("spec_010", repo, None)]
 
 
 def test_dispatch_blocked_uses_reported_category(repo: Path) -> None:
