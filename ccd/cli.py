@@ -22,6 +22,7 @@ from pathlib import Path
 from ccd import __version__
 from ccd.agent import AgentRunner, ClaudeCodeRunner
 from ccd.chain import ChainResult, run_chain
+from ccd.dashboard import render_to as render_dashboard_to
 from ccd.dispatch import dispatch_one
 from ccd.integrate import DEFAULT_SMOKE_COMMANDS
 from ccd.metrics import aggregate, render_report
@@ -29,6 +30,8 @@ from ccd.models import DispatchRecord, DispatchStatus
 from ccd.protocol import parse_spec
 
 DEFAULT_LAST_RUN_PATH = Path("_ai_workspace") / "logs" / "last_run.json"
+DEFAULT_DASHBOARD_RUNS_PATH = Path("_ai_workspace") / "runs"
+DEFAULT_DASHBOARD_OUTPUT_PATH = Path("docs") / "index.html"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -104,6 +107,36 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    p_dashboard = sub.add_parser(
+        "dashboard",
+        help="Render a static HTML dashboard from accumulated run JSON files.",
+        description=(
+            "Aggregate every run JSON under --runs-dir into a single "
+            "self-contained HTML dashboard (inline SVG, no external resources)."
+        ),
+    )
+    p_dashboard.add_argument("--repo", type=Path, default=None)
+    p_dashboard.add_argument(
+        "--runs-dir",
+        dest="runs_dir",
+        type=Path,
+        default=None,
+        help=(
+            "Directory of run JSON files "
+            f"(default: <repo>/{DEFAULT_DASHBOARD_RUNS_PATH})."
+        ),
+    )
+    p_dashboard.add_argument(
+        "--output",
+        dest="output",
+        type=Path,
+        default=None,
+        help=(
+            "Output HTML path "
+            f"(default: <repo>/{DEFAULT_DASHBOARD_OUTPUT_PATH})."
+        ),
+    )
+
     return parser
 
 
@@ -122,6 +155,8 @@ def main(
         return _cmd_chain(args, runner, smoke_commands)
     if args.command == "report":
         return _cmd_report(args)
+    if args.command == "dashboard":
+        return _cmd_dashboard(args)
 
     parser.print_help()
     return 0
@@ -178,6 +213,23 @@ def _cmd_report(args: argparse.Namespace) -> int:
     report = aggregate(records)
     print(render_report(report))
     return 0
+
+
+def _cmd_dashboard(args: argparse.Namespace) -> int:
+    repo = _resolve_repo(args.repo)
+    runs_dir = _resolve_under_repo(args.runs_dir, repo, DEFAULT_DASHBOARD_RUNS_PATH)
+    output = _resolve_under_repo(args.output, repo, DEFAULT_DASHBOARD_OUTPUT_PATH)
+
+    written = render_dashboard_to(runs_dir, output)
+    print(f"wrote {written}")
+    return 0
+
+
+def _resolve_under_repo(override: Path | None, repo: Path, default_rel: Path) -> Path:
+    if override is None:
+        return repo / default_rel
+    override = Path(override)
+    return override if override.is_absolute() else repo / override
 
 
 def _resolve_repo(override: Path | None) -> Path:

@@ -1,0 +1,44 @@
+{
+  "version": 1,
+  "saved_at": "2026-02-01T00:00:00+00:00",
+  "project": "bash-prototype",
+  "generation": "bash_prototype",
+  "records": [
+    {
+      "spec_id": "spec_001",
+      "started_at": "2026-01-10T00:00:00+00:00",
+      "finished_at": "2026-01-10T00:00:00+00:00",
+      "status": "done",
+      "attempts": 1,
+      "failure_category": null,
+      "intervention": false
+    },
+    {
+      "spec_id": "spec_002",
+      "started_at": "2026-01-12T00:00:00+00:00",
+      "finished_at": "2026-01-12T00:00:00+00:00",
+      "status": "failed",
+      "attempts": 1,
+      "failure_category": "smoke_failed",
+      "intervention": false
+    },
+    {
+      "spec_id": "spec_003",
+      "started_at": "2026-01-14T00:00:00+00:00",
+      "finished_at": "2026-01-14T00:00:00+00:00",
+      "status": "done",
+      "attempts": 1,
+      "failure_category": null,
+      "intervention": false
+    },
+    {
+      "spec_id": "spec_004",
+      "started_at": "2026-01-16T00:00:00+00:00",
+      "finished_at": "2026-01-16T00:00:00+00:00",
+      "status": "blocked",
+      "attempts": 1,
+      "failure_category": "spec_unclear",
+      "intervention": false
+    }
+  ]
+}

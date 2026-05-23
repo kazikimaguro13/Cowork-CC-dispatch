@@ -1,0 +1,35 @@
+{
+  "version": 1,
+  "saved_at": "2026-03-01T10:30:00+00:00",
+  "project": "ccd-native",
+  "generation": "ccd_native",
+  "records": [
+    {
+      "spec_id": "spec_001",
+      "started_at": "2026-02-20T09:00:00+00:00",
+      "finished_at": "2026-02-20T09:12:00+00:00",
+      "status": "done",
+      "attempts": 1,
+      "failure_category": null,
+      "intervention": false
+    },
+    {
+      "spec_id": "spec_002",
+      "started_at": "2026-02-21T09:00:00+00:00",
+      "finished_at": "2026-02-21T09:20:00+00:00",
+      "status": "done",
+      "attempts": 2,
+      "failure_category": null,
+      "intervention": true
+    },
+    {
+      "spec_id": "spec_003",
+      "started_at": "2026-02-22T09:00:00+00:00",
+      "finished_at": "2026-02-22T09:05:00+00:00",
+      "status": "failed",
+      "attempts": 1,
+      "failure_category": "agent_misread",
+      "intervention": false
+    }
+  ]
+}
