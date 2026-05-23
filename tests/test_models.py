@@ -11,6 +11,7 @@ from ccd.models import (
     DispatchStatus,
     FailureCategory,
     Result,
+    RunFile,
     Spec,
 )
 
@@ -136,3 +137,25 @@ def test_dispatch_record_rejects_negative_attempts() -> None:
             status=DispatchStatus.RUNNING,
             attempts=-1,
         )
+
+
+def test_run_file_defaults() -> None:
+    run = RunFile()
+    assert run.version == 1
+    assert run.saved_at is None
+    assert run.project is None
+    assert run.generation is None
+    assert run.records == []
+
+
+def test_run_file_accepts_extra_keys() -> None:
+    run = RunFile.model_validate(
+        {
+            "version": 1,
+            "saved_at": "2026-05-22T00:00:00+00:00",
+            "records": [],
+            "chain": {"success": True, "branches": []},
+        }
+    )
+    dumped = run.model_dump(mode="json")
+    assert dumped["chain"] == {"success": True, "branches": []}
