@@ -24,14 +24,14 @@ pip install -e ".[dev]"
 動作確認:
 
 ```bash
-ccd --version          # ccd 0.1.0
+ccd --version          # ccd 0.2.0
 ruff check .
 pytest -q
 ```
 
 ## 使い方
 
-CLI は 3 つのサブコマンドからなる。それぞれが内部の関数（`dispatch_one` / `run_chain` / `aggregate` + `render_report`）を呼ぶだけの薄い層。
+CLI は 4 つのサブコマンドからなる。それぞれが内部の関数（`dispatch_one` / `run_chain` / `aggregate` + `render_report` / `dashboard.render_to`）を呼ぶだけの薄い層。
 
 ### `ccd dispatch <spec>`
 
@@ -97,20 +97,40 @@ ccd report
 - 入力 JSON のパスは `--from PATH` で上書き可。
 - 記録が無いとき: 終了コード 2、stderr に `no run record at <path>`。
 
+### `ccd dashboard`
+
+`_ai_workspace/runs/` 配下に溜まった run JSON 群（v1 の `_save_run` 経由 / v1.5 の `ccd.backfill` 経由のどちらでもよい）を 1 つの自己完結型 HTML に集計する。チャートはすべてインライン SVG、外部リソース参照ゼロ、JS 無し。
+
+```bash
+ccd dashboard
+```
+
+- 既定で `_ai_workspace/runs/*.json` を読み、`docs/index.html` に書き出す。
+- `--runs-dir PATH` / `--output PATH` で上書き可。`--repo PATH` でリポジトリルートも上書き可。
+- 4 パネル:
+  1. **ヒーロー帯** — プール集計の主指標（自律完走率を大きく、横に dispatch 成功率・一発合格率・リトライ回復率・安全停止率・総 dispatch 数・案件数・所要時間 mean/median）。
+  2. **失敗タクソノミー** — `FailureCategory` 別の横棒 SVG。
+  3. **run トレンド** — dispatch 時系列に並べた累積 dispatch 成功率 / 自律完走率 / 一発合格率の SVG 折れ線。
+  4. **run 一覧テーブル** — プロジェクト × 世代タグ × spec 数 × done/fail × 所要時間。各行は `<details>` で per-spec 明細に展開（JS 不使用）。
+- 世代タグ（`bash_prototype` / `ccd_native`）は明示表示し、バックフィル由来 (`bash_prototype`) で `attempts=1` / `intervention=false` に固定されている指標は注記で「上限見積もり」と明記する。
+- GitHub Pages を `main` / `docs` で公開すれば、`docs/index.html` がそのままポートフォリオページとして配信できる（公開設定はリポジトリ側で行う）。
+
 ## レイアウト
 
 ```
 ccd/                       # import パッケージ（配布名は cowork-cc-dispatch）
   __init__.py              # __version__
   __main__.py              # `python -m ccd` エントリ
-  cli.py                   # CLI 実装（dispatch / chain / report）
-  models.py                # Spec / DispatchRecord / Result / 各種 enum
+  cli.py                   # CLI 実装（dispatch / chain / report / dashboard）
+  models.py                # Spec / DispatchRecord / Result / RunFile / 各種 enum
   protocol.py              # spec_NNN.md / result_NNN.md の read/write
   agent.py                 # AgentRunner（ClaudeCodeRunner + FakeAgentRunner）
   dispatch.py              # 1 spec を dispatch して結果を分類
   integrate.py             # smoke + merge to main
   chain.py                 # 複数 spec を連鎖実行
   metrics.py               # 7 指標の集計と Markdown レポート
+  backfill.py              # 旧 result_NNN.md から匿名化 run JSON を生成（v1.5）
+  dashboard.py             # 静的 HTML ダッシュボード生成（v1.5）
 tests/                     # pytest
 docs/
   DESIGN.md                # 設計の正典（変更しない）
