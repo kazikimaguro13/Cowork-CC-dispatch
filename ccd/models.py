@@ -60,3 +60,20 @@ class DispatchRecord(BaseModel):
     attempts: int = Field(ge=0)
     failure_category: FailureCategory | None = None
     intervention: bool = False
+
+
+class RunFile(BaseModel):
+    """Envelope for a serialized `DispatchRecord` set.
+
+    Mirrors what `cli.py:_save_run` writes today and adds the optional
+    `project` / `generation` fields used by the v1.5 backfill output.
+    `extra="allow"` so legacy envelopes that carry a `chain` block round-trip.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    version: int = 1
+    saved_at: str | None = None
+    project: str | None = None
+    generation: str | None = None
+    records: list[DispatchRecord] = Field(default_factory=list)
