@@ -30,9 +30,9 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from .agent import AgentRunner
-from .dispatch import dispatch_one
 from .integrate import DEFAULT_SMOKE_COMMANDS, IntegrateResult, integrate
 from .models import DispatchRecord, DispatchStatus, FailureCategory, Spec
+from .retry import dispatch_with_retry
 
 
 @dataclass(frozen=True)
@@ -72,6 +72,7 @@ def run_chain(
     branch_for: Callable[[Spec], str] = default_branch_for,
     on_start: Callable[..., None] | None = None,
     on_finish: Callable[[DispatchRecord], None] | None = None,
+    max_attempts: int = 1,
 ) -> ChainResult:
     """Run specs sequentially as dispatch_one → integrate, stopping on first failure.
 
@@ -80,6 +81,10 @@ def run_chain(
     ``on_finish`` is invoked with the final ``DispatchRecord`` whether the
     spec completed normally or was wrapped in a ``HALTED + INTERRUPTED``
     record due to an unhandled exception.
+
+    ``max_attempts`` is forwarded to `dispatch_with_retry` for each spec.
+    Library default is 1 (no retry — keeps existing run_chain tests passing
+    unchanged). The CLI raises this to 3 via ``--max-attempts``.
     """
 
     repo = Path(repo)
@@ -93,7 +98,13 @@ def run_chain(
 
         try:
             _create_feature_branch(repo, branch=branch, main_branch=main_branch)
-            record = dispatch_one(spec, runner, repo=repo)
+            record = dispatch_with_retry(
+                spec,
+                runner,
+                repo=repo,
+                max_attempts=max_attempts,
+                smoke_commands=smoke_commands,
+            )
         except Exception as exc:
             record = DispatchRecord(
                 spec_id=spec.id,

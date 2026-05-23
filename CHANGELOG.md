@@ -2,6 +2,29 @@
 
 本プロジェクトの注目すべき変更を記録する。フォーマットは [Keep a Changelog](https://keepachangelog.com/) に準ずる。
 
+## [0.3.0] — 2026-05-23
+
+v1.7 — spec_011。リトライ／自己修復ループを完成させた。`DispatchRecord.attempts` と `metrics.retry_recovery_rate` は spec_002 以来「設計済みだが未配線」だったが、dispatch が失敗したら失敗内容（特に smoke = ruff/pytest の出力）を次の試行のプロンプトに食わせ、エージェント自身に直させるループを動かす。
+
+### Added
+
+- **`ccd/retry.py` 新モジュール** — `dispatch_with_retry(spec, runner, *, repo, max_attempts, smoke_commands, feedback_dir)`。`dispatch_one` を最大 `max_attempts` 回まで呼びつつ、各 DONE attempt の直後に `run_smoke` で smoke を実行し、smoke が落ちたら `smoke_failed` の失敗として扱う。retryable = `smoke_failed` / `agent_misread` / `transient` / `interrupted` / `None`（分類不能）、即 halt = `environment` / `merge_conflict` / `BLOCKED`。`subprocess.TimeoutExpired` は retryable な interrupted として捕捉してループを継続、それ以外の例外は呼び出し元（`run_chain` / `_cmd_dispatch`）へ伝播（spec_010 の `HALTED + INTERRUPTED` 経路に乗る）。
+- **フィードバックファイル** — リトライ時に `_ai_workspace/logs/spec_NNN.feedback.md` を書き、前回の試行回数 / `status` / `failure_category` / smoke 出力（ruff / pytest の stdout・stderr を head+tail で抜粋）/ 前回 `result_NNN.md` の先頭 800 文字 / 「フィーチャーブランチに残っている前回の作業を土台に原因を直して再実装すること」という指示を書き込む。
+- **`--max-attempts N` フラグ** — `ccd dispatch` / `ccd chain` 両方に追加。CLI 既定 **3**（意見を持つ）、ライブラリ既定 1（後方互換）。
+- **`AgentRunner.run` の `feedback: Path | None` 引数** — `ClaudeCodeRunner` / `FakeAgentRunner` 双方が optional 引数として受け取り、`feedback` が `None` でなければ「前回の試行は失敗しました。`<feedback path>` を読んで原因を直してから再実装してください」をプロンプト末尾に追加。`feedback=None`（初回）のプロンプトは spec_011 以前と完全に同一。
+- **`integrate.run_smoke()` 公開関数** — 旧 `_run_smoke` を公開エイリアスにリネーム。`integrate()` のロジック・返り値は無変更で、`dispatch_with_retry` が同じ smoke 実装を再利用できるようになっただけ。
+
+### Changed
+
+- **`dispatch_one(spec, runner, *, repo, feedback=None)`** — `feedback` 引数追加（optional、デフォルト `None`）。`runner.run` へ素通しするだけで、`_classify` / `attempts=1` の設定は無変更（最終的な attempts の値付けは `dispatch_with_retry` の責務）。docstring の "no retry — that's spec_005's concern" を実態に合わせて更新。
+- **`run_chain(specs, runner, ..., max_attempts=1)`** — `max_attempts` 引数追加（optional、デフォルト 1 = 既存挙動）。spec ループ内の `dispatch_one(...)` 呼び出しを `dispatch_with_retry(..., max_attempts=...)` に差し替え。spec_010 で入れた `try/except` / `on_start` / `on_finish` / 例外時の `HALTED+INTERRUPTED` 経路はそのまま維持。
+- **`FakeAgentRunner.calls`** — 3-tuple `(spec_id, workdir, feedback)` に拡張。リトライ時に feedback パスが伝播したかをテストで assert できる。既存テストの 2-tuple 比較を 3-tuple へ更新（`call[0]` での id 取り出しはそのまま）。
+- `pyproject.toml` / `ccd/__init__.py` version `0.2.2` → `0.3.0`（新機能なので minor bump）。
+
+### Fixed
+
+- **`metrics.retry_recovery_rate` が 0/0 のまま動かない** — `DispatchRecord.attempts` フィールドと `first_pass_rate` / `retry_recovery_rate` は最初から設計されていたが、`dispatch_one` が `attempts=1` をハードコードしていたため `attempts>1` のレコードが生まれず、`retry_recovery_rate` の分母は永遠に 0 だった。`dispatch_with_retry` の導入で実データが入る（`attempts==1 and DONE` → `first_pass_rate` 分子、`attempts>1 and DONE` → `retry_recovery_rate` 分子）。`metrics.py` のロジックは無変更で、入力に attempts>1 の record が混ざるだけで実値が出る。
+
 ## [0.2.2] — 2026-05-23
 
 v1.6 patch — spec_010。オーケストレータの例外で run JSON が消える穴と、プロセスが死んだとき in-flight の dispatch が失なわれる穴を塞いだ。失敗は捏造せず、観測した事実だけを `HALTED` / `INTERRUPTED` として残す。

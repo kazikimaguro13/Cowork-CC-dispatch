@@ -9,6 +9,7 @@ to support multiple agents today.
 
 from __future__ import annotations
 
+import inspect
 import subprocess
 import time
 from collections.abc import Callable
@@ -37,7 +38,13 @@ class AgentOutcome:
 
 
 class AgentRunner(Protocol):
-    def run(self, spec: Spec, *, workdir: Path) -> AgentOutcome: ...
+    def run(
+        self,
+        spec: Spec,
+        *,
+        workdir: Path,
+        feedback: Path | None = None,
+    ) -> AgentOutcome: ...
 
 
 class ClaudeCodeRunner:
@@ -54,8 +61,14 @@ class ClaudeCodeRunner:
         self._binary = binary or self.DEFAULT_BINARY
         self._timeout = timeout
 
-    def run(self, spec: Spec, *, workdir: Path) -> AgentOutcome:
-        prompt = self._build_prompt(spec, workdir=workdir)
+    def run(
+        self,
+        spec: Spec,
+        *,
+        workdir: Path,
+        feedback: Path | None = None,
+    ) -> AgentOutcome:
+        prompt = self._build_prompt(spec, workdir=workdir, feedback=feedback)
         argv = [
             self._binary,
             "--dangerously-skip-permissions",
@@ -81,17 +94,29 @@ class ClaudeCodeRunner:
         )
 
     @staticmethod
-    def _build_prompt(spec: Spec, *, workdir: Path) -> str:
+    def _build_prompt(
+        spec: Spec, *, workdir: Path, feedback: Path | None = None
+    ) -> str:
         try:
             spec_rel = spec.path.relative_to(workdir)
         except ValueError:
             spec_rel = spec.path
         result_rel = f"_ai_workspace/bridge/outbox/result_{_strip_spec_prefix(spec.id)}.md"
-        return (
+        prompt = (
             f"{spec_rel} を読んで、その指示どおりに実装してください。"
             f"完了したら {result_rel} に templates/result 構造で結果を書いてください。"
             "push やブランチ操作はしないこと。"
         )
+        if feedback is not None:
+            try:
+                feedback_rel = feedback.relative_to(workdir)
+            except ValueError:
+                feedback_rel = feedback
+            prompt += (
+                f" 前回の試行は失敗しました。{feedback_rel} を読んで原因を直してから"
+                "再実装してください。"
+            )
+        return prompt
 
 
 @dataclass
@@ -101,16 +126,35 @@ class FakeAgentRunner:
     `side_effect` runs first (so tests can simulate the agent writing a result
     file or making a commit), then `outcome` is returned. `calls` records each
     invocation so tests can assert dispatch invoked the runner exactly once.
+
+    ``calls`` records ``(spec_id, workdir, feedback)`` so tests can assert the
+    retry loop propagated the feedback path on the second-and-later attempts.
     """
 
     outcome: AgentOutcome = field(default_factory=lambda: AgentOutcome(exit_code=0))
-    side_effect: Callable[[Spec, Path], None] | None = None
-    calls: list[tuple[str, Path]] = field(default_factory=list)
+    side_effect: Callable[..., None] | None = None
+    calls: list[tuple[str, Path, Path | None]] = field(default_factory=list)
 
-    def run(self, spec: Spec, *, workdir: Path) -> AgentOutcome:
-        self.calls.append((spec.id, workdir))
+    def run(
+        self,
+        spec: Spec,
+        *,
+        workdir: Path,
+        feedback: Path | None = None,
+    ) -> AgentOutcome:
+        self.calls.append((spec.id, workdir, feedback))
         if self.side_effect is not None:
-            self.side_effect(spec, workdir)
+            # Pre-spec_011 side_effects take (spec, workdir); spec_011-aware
+            # ones can take (spec, workdir, feedback). Detect by arity so
+            # existing tests don't have to grow a third parameter.
+            try:
+                arity = len(inspect.signature(self.side_effect).parameters)
+            except (TypeError, ValueError):
+                arity = 2
+            if arity >= 3:
+                self.side_effect(spec, workdir, feedback)
+            else:
+                self.side_effect(spec, workdir)
         return self.outcome
 
 

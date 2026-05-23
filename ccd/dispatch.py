@@ -1,9 +1,11 @@
 """Single-shot dispatch: run one spec through an `AgentRunner` and classify.
 
-`dispatch_one` is the v1 entry point. It invokes the runner exactly once (no
-retry — that's spec_005's concern), then classifies the outcome by reading
-the result Markdown the agent was supposed to write and counting the commits
-the agent made between dispatch start and finish.
+`dispatch_one` is the v1 entry point. It invokes the runner exactly once
+(retry is the concern of `ccd/retry.py:dispatch_with_retry`, which wraps this
+function in a loop and supplies a feedback file to the next attempt). After
+the runner returns, dispatch classifies the outcome by reading the result
+Markdown the agent was supposed to write and counting the commits the agent
+made between dispatch start and finish.
 
 Classification trust order:
     1. Result file is present and parseable → trust its `status` /
@@ -30,14 +32,26 @@ from .protocol import parse_result
 _OUTBOX_REL = Path("_ai_workspace") / "bridge" / "outbox"
 
 
-def dispatch_one(spec: Spec, runner: AgentRunner, *, repo: Path) -> DispatchRecord:
-    """Run `runner` against `spec` once and return a classified `DispatchRecord`."""
+def dispatch_one(
+    spec: Spec,
+    runner: AgentRunner,
+    *,
+    repo: Path,
+    feedback: Path | None = None,
+) -> DispatchRecord:
+    """Run `runner` against `spec` once and return a classified `DispatchRecord`.
+
+    ``feedback`` is forwarded to the runner so the retry loop can ask the
+    agent to read a feedback file describing the previous attempt's failure
+    before starting over. ``None`` (the default) preserves the prompt's
+    pre-spec_011 wording byte-for-byte for the first attempt.
+    """
 
     repo = Path(repo)
     started_at = _now()
     base_sha = _head_sha(repo)
 
-    outcome = runner.run(spec, workdir=repo)
+    outcome = runner.run(spec, workdir=repo, feedback=feedback)
 
     finished_at = _now()
     commits_made = _count_commits_since(repo, base_sha)

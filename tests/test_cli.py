@@ -67,7 +67,11 @@ def test_dispatch_subcommand_runs_and_saves_record(
     spec_path = _write_spec(repo, "100")
     runner = FakeAgentRunner(side_effect=_good_agent)
 
-    rc = cli.main(["dispatch", str(spec_path), "--repo", str(repo)], runner=runner)
+    rc = cli.main(
+        ["dispatch", str(spec_path), "--repo", str(repo)],
+        runner=runner,
+        smoke_commands=[["true"]],
+    )
 
     assert rc == 0
     out = capsys.readouterr().out
@@ -153,7 +157,11 @@ def test_report_subcommand_renders_from_saved_run(
 ) -> None:
     spec_path = _write_spec(repo, "100")
     runner = FakeAgentRunner(side_effect=_good_agent)
-    cli.main(["dispatch", str(spec_path), "--repo", str(repo)], runner=runner)
+    cli.main(
+        ["dispatch", str(spec_path), "--repo", str(repo)],
+        runner=runner,
+        smoke_commands=[["true"]],
+    )
     capsys.readouterr()
 
     rc = cli.main(["report", "--repo", str(repo)])
@@ -183,6 +191,7 @@ def test_report_subcommand_uses_explicit_from_path(
     cli.main(
         ["dispatch", str(spec_path), "--repo", str(repo), "--save", str(custom)],
         runner=runner,
+        smoke_commands=[["true"]],
     )
     capsys.readouterr()
 
@@ -205,7 +214,13 @@ class _ExplodingRunner:
     exc: BaseException
     calls: list[tuple[str, Path]] = field(default_factory=list)
 
-    def run(self, spec: Spec, *, workdir: Path) -> AgentOutcome:  # pragma: no cover
+    def run(
+        self,
+        spec: Spec,
+        *,
+        workdir: Path,
+        feedback: Path | None = None,
+    ) -> AgentOutcome:  # pragma: no cover
         self.calls.append((spec.id, workdir))
         raise self.exc
 
@@ -260,7 +275,11 @@ def test_dispatch_writes_inflight_running_marker_before_runner_call(
         _good_agent(spec, workdir)
 
     runner = FakeAgentRunner(side_effect=side_effect)
-    cli.main(["dispatch", str(spec_path), "--repo", str(repo)], runner=runner)
+    cli.main(
+        ["dispatch", str(spec_path), "--repo", str(repo)],
+        runner=runner,
+        smoke_commands=[["true"]],
+    )
 
     records = observed["records"]
     assert isinstance(records, list)
@@ -294,13 +313,32 @@ def test_chain_runner_exception_persists_partial_progress(
     class _MixedRunner:
         calls: list[tuple[str, Path]] = field(default_factory=list)
 
-        def run(self, spec: Spec, *, workdir: Path) -> AgentOutcome:
+        def run(
+            self,
+            spec: Spec,
+            *,
+            workdir: Path,
+            feedback: Path | None = None,
+        ) -> AgentOutcome:
             self.calls.append((spec.id, workdir))
             return behaviour(spec, workdir)
 
     runner = _MixedRunner()
     rc = cli.main(
-        ["chain", str(s1), str(s2), str(s3), str(s4), "--repo", str(repo)],
+        # --max-attempts 1: this test exercises chain.py exception safety,
+        # not spec_011's retry loop (which would call spec_102's runner three
+        # times). Pin max_attempts=1 to preserve the original intent.
+        [
+            "chain",
+            str(s1),
+            str(s2),
+            str(s3),
+            str(s4),
+            "--repo",
+            str(repo),
+            "--max-attempts",
+            "1",
+        ],
         runner=runner,
         smoke_commands=[["true"]],
     )
@@ -426,7 +464,11 @@ def test_dispatch_auto_carry_forward_from_orphan_running(
 
     spec_path = _write_spec(repo, "100")
     runner = FakeAgentRunner(side_effect=_good_agent)
-    rc = cli.main(["dispatch", str(spec_path), "--repo", str(repo)], runner=runner)
+    rc = cli.main(
+        ["dispatch", str(spec_path), "--repo", str(repo)],
+        runner=runner,
+        smoke_commands=[["true"]],
+    )
     assert rc == 0
 
     err = capsys.readouterr().err
@@ -477,7 +519,11 @@ def test_dispatch_no_carry_forward_when_no_running(repo: Path) -> None:
 
     spec_path = _write_spec(repo, "100")
     runner = FakeAgentRunner(side_effect=_good_agent)
-    cli.main(["dispatch", str(spec_path), "--repo", str(repo)], runner=runner)
+    cli.main(
+        ["dispatch", str(spec_path), "--repo", str(repo)],
+        runner=runner,
+        smoke_commands=[["true"]],
+    )
 
     payload = json.loads(saved.read_text(encoding="utf-8"))
     assert [r["spec_id"] for r in payload["records"]] == ["spec_100"]
@@ -496,6 +542,7 @@ def test_dispatch_accepts_timeout_flag(repo: Path) -> None:
             "10",
         ],
         runner=runner,
+        smoke_commands=[["true"]],
     )
     assert rc == 0
 
@@ -516,3 +563,99 @@ def test_chain_accepts_timeout_flag(repo: Path) -> None:
         smoke_commands=[["true"]],
     )
     assert rc == 0
+
+
+# --------------------------------------------------------------------------- #
+# spec_011: --max-attempts flag
+# --------------------------------------------------------------------------- #
+
+
+def test_dispatch_max_attempts_flag_drives_retry_loop(repo: Path) -> None:
+    """`ccd dispatch --max-attempts 2` retries once on a retryable failure."""
+
+    spec_path = _write_spec(repo, "100")
+
+    call_log: list[Path | None] = []
+
+    @dataclass
+    class _RetryProbe:
+        def run(
+            self,
+            spec: Spec,
+            *,
+            workdir: Path,
+            feedback: Path | None = None,
+        ) -> AgentOutcome:
+            call_log.append(feedback)
+            fname = f"{spec.id}_{len(call_log)}.py"
+            (workdir / fname).write_text("x", encoding="utf-8")
+            _git("add", fname, cwd=workdir)
+            _git("commit", "-q", "-m", f"impl {len(call_log)}", cwd=workdir)
+            suffix = (
+                spec.id[len("spec_") :] if spec.id.startswith("spec_") else spec.id
+            )
+            write_result(
+                Result(spec_id=spec.id, status=DispatchStatus.DONE, body="ok"),
+                workdir / "_ai_workspace" / "bridge" / "outbox" / f"result_{suffix}.md",
+            )
+            return AgentOutcome(exit_code=0)
+
+    runner = _RetryProbe()
+    rc = cli.main(
+        [
+            "dispatch",
+            str(spec_path),
+            "--repo",
+            str(repo),
+            "--max-attempts",
+            "2",
+        ],
+        runner=runner,
+        smoke_commands=[["false"]],  # smoke always fails → retry exhausts at 2
+    )
+
+    # Smoke failed both times → FAILED + SMOKE_FAILED → exit 1.
+    assert rc == 1
+    assert len(call_log) == 2
+    assert call_log[0] is None
+    assert call_log[1] is not None  # feedback path propagated on second attempt
+
+
+def test_chain_max_attempts_flag_drives_retry_loop(repo: Path) -> None:
+    """`ccd chain --max-attempts 2` propagates to dispatch_with_retry per spec."""
+
+    s1 = _write_spec(repo, "100")
+
+    call_log: list[Path | None] = []
+
+    @dataclass
+    class _RetryProbe:
+        def run(
+            self,
+            spec: Spec,
+            *,
+            workdir: Path,
+            feedback: Path | None = None,
+        ) -> AgentOutcome:
+            call_log.append(feedback)
+            # do nothing → no commit, no result file → AGENT_MISREAD (retryable)
+            return AgentOutcome(exit_code=0)
+
+    runner = _RetryProbe()
+    rc = cli.main(
+        [
+            "chain",
+            str(s1),
+            "--repo",
+            str(repo),
+            "--max-attempts",
+            "2",
+        ],
+        runner=runner,
+        smoke_commands=[["true"]],
+    )
+
+    assert rc == 1
+    assert len(call_log) == 2
+    assert call_log[0] is None
+    assert call_log[1] is not None
