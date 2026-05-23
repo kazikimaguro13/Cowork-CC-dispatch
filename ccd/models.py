@@ -30,6 +30,7 @@ class FailureCategory(StrEnum):
     MERGE_CONFLICT = "merge_conflict"
     ENVIRONMENT = "environment"
     TRANSIENT = "transient"
+    INTERRUPTED = "interrupted"
 
 
 class Spec(BaseModel):

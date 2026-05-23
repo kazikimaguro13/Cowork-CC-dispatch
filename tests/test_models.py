@@ -36,6 +36,7 @@ def test_failure_category_values() -> None:
         "merge_conflict",
         "environment",
         "transient",
+        "interrupted",
     }
 
 

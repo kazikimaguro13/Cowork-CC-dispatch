@@ -6,6 +6,12 @@ to the existing core functions (`dispatch_one` / `run_chain` / `aggregate` +
 `ccd report` can read the most recent run, regardless of whether it came from
 `dispatch` or `chain`.
 
+spec_010 added crash-safe incremental persistence: the run JSON is updated
+*before* each runner call (in-flight `RUNNING` marker) and again on
+completion, atomically via `os.replace`. The orchestrator wraps every
+spec in `try/except` so a `TimeoutExpired`, git error, or runner crash
+becomes a `HALTED + INTERRUPTED` record on disk instead of a vanished run.
+
 The runner is injectable on `main()` so tests can pass a `FakeAgentRunner`
 without invoking the real `claude` CLI.
 """
@@ -21,13 +27,18 @@ from pathlib import Path
 
 from ccd import __version__
 from ccd.agent import AgentRunner, ClaudeCodeRunner
-from ccd.chain import ChainResult, run_chain
+from ccd.chain import run_chain
 from ccd.dashboard import render_to as render_dashboard_to
 from ccd.dispatch import dispatch_one
 from ccd.integrate import DEFAULT_SMOKE_COMMANDS
 from ccd.metrics import aggregate, render_report
 from ccd.models import DispatchRecord, DispatchStatus
 from ccd.protocol import parse_spec
+from ccd.run_writer import (
+    RunWriter,
+    halted_interrupted_record,
+    reconcile_path,
+)
 
 DEFAULT_LAST_RUN_PATH = Path("_ai_workspace") / "logs" / "last_run.json"
 DEFAULT_DASHBOARD_RUNS_PATH = Path("_ai_workspace") / "runs"
@@ -67,6 +78,15 @@ def build_parser() -> argparse.ArgumentParser:
             f"(default: <repo>/{DEFAULT_LAST_RUN_PATH})."
         ),
     )
+    p_dispatch.add_argument(
+        "--timeout",
+        type=float,
+        default=None,
+        help=(
+            "Per-spec runner timeout in seconds (default: no timeout). "
+            "Exceeding it produces a HALTED + INTERRUPTED record."
+        ),
+    )
 
     p_chain = sub.add_parser(
         "chain",
@@ -87,6 +107,15 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Where to write the run record JSON "
             f"(default: <repo>/{DEFAULT_LAST_RUN_PATH})."
+        ),
+    )
+    p_chain.add_argument(
+        "--timeout",
+        type=float,
+        default=None,
+        help=(
+            "Per-spec runner timeout in seconds (default: no timeout). "
+            "Exceeding it produces a HALTED + INTERRUPTED record and halts the chain."
         ),
     )
 
@@ -137,6 +166,21 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    p_reconcile = sub.add_parser(
+        "reconcile",
+        help="Reconcile orphan RUNNING records to HALTED + INTERRUPTED.",
+        description=(
+            "Scan one run JSON file (or every *.json under a directory) "
+            "and rewrite any 'running' record as 'halted' + 'interrupted'. "
+            "finished_at is not invented."
+        ),
+    )
+    p_reconcile.add_argument(
+        "target",
+        type=Path,
+        help="Path to a run JSON file, or a directory of *.json files.",
+    )
+
     return parser
 
 
@@ -157,6 +201,8 @@ def main(
         return _cmd_report(args)
     if args.command == "dashboard":
         return _cmd_dashboard(args)
+    if args.command == "reconcile":
+        return _cmd_reconcile(args)
 
     parser.print_help()
     return 0
@@ -165,13 +211,28 @@ def main(
 def _cmd_dispatch(args: argparse.Namespace, runner: AgentRunner | None) -> int:
     repo = _resolve_repo(args.repo)
     spec = parse_spec(args.spec)
-    runner = runner if runner is not None else ClaudeCodeRunner()
-
-    record = dispatch_one(spec, runner, repo=repo)
+    timeout = getattr(args, "timeout", None)
+    runner = runner if runner is not None else ClaudeCodeRunner(timeout=timeout)
 
     save_path = _resolve_save_path(args.save, repo)
-    _save_run(save_path, records=[record], chain=None)
+    writer = RunWriter(save_path)
+    writer.salvage_orphans()
 
+    started_at = _now()
+    writer.start(spec.id, started_at=started_at)
+    try:
+        record = dispatch_one(spec, runner, repo=repo)
+    except Exception as exc:
+        record = halted_interrupted_record(spec.id, started_at=started_at)
+        writer.finish(record)
+        print(_records_summary([record]))
+        print(
+            f"dispatch interrupted on {spec.id}: {_summarize_exception(exc)}",
+            file=sys.stderr,
+        )
+        return 1
+
+    writer.finish(record)
     print(_records_summary([record]))
     return 0 if record.status is DispatchStatus.DONE else 1
 
@@ -183,16 +244,25 @@ def _cmd_chain(
 ) -> int:
     repo = _resolve_repo(args.repo)
     specs = [parse_spec(p) for p in args.specs]
-    runner = runner if runner is not None else ClaudeCodeRunner()
+    timeout = getattr(args, "timeout", None)
+    runner = runner if runner is not None else ClaudeCodeRunner(timeout=timeout)
     smoke = smoke_commands if smoke_commands is not None else DEFAULT_SMOKE_COMMANDS
 
-    result = run_chain(specs, runner, repo=repo, smoke_commands=smoke)
-    records = [step.dispatch for step in result.steps]
-
     save_path = _resolve_save_path(args.save, repo)
-    _save_run(save_path, records=records, chain=result)
+    writer = RunWriter(save_path)
+    writer.salvage_orphans()
 
-    print(_records_summary(records))
+    result = run_chain(
+        specs,
+        runner,
+        repo=repo,
+        smoke_commands=smoke,
+        on_start=writer.start,
+        on_finish=writer.finish,
+    )
+    writer.attach_chain(result)
+
+    print(_records_summary([step.dispatch for step in result.steps]))
     if not result.success:
         reason = result.halt_reason or f"halted at {result.halted_at}"
         print(f"chain halted at {result.halted_at}: {reason}", file=sys.stderr)
@@ -225,6 +295,16 @@ def _cmd_dashboard(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_reconcile(args: argparse.Namespace) -> int:
+    target = Path(args.target)
+    if not target.exists():
+        print(f"no such file or directory: {target}", file=sys.stderr)
+        return 2
+    files, records = reconcile_path(target)
+    print(f"reconciled {records} record(s) across {files} file(s)")
+    return 0
+
+
 def _resolve_under_repo(override: Path | None, repo: Path, default_rel: Path) -> Path:
     if override is None:
         return repo / default_rel
@@ -243,26 +323,18 @@ def _resolve_save_path(override: Path | None, repo: Path) -> Path:
     return override if override.is_absolute() else repo / override
 
 
-def _save_run(
-    path: Path,
-    *,
-    records: Sequence[DispatchRecord],
-    chain: ChainResult | None,
-) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    payload: dict[str, object] = {
-        "version": 1,
-        "saved_at": datetime.now(UTC).isoformat(),
-        "records": [r.model_dump(mode="json") for r in records],
-    }
-    if chain is not None:
-        payload["chain"] = {
-            "success": chain.success,
-            "halted_at": chain.halted_at,
-            "halt_reason": chain.halt_reason,
-            "branches": [step.branch for step in chain.steps],
-        }
-    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+def _now() -> datetime:
+    return datetime.now(UTC)
+
+
+def _summarize_exception(exc: BaseException) -> str:
+    name = type(exc).__name__
+    text = str(exc).strip()
+    if not text:
+        return name
+    if len(text) > 200:
+        text = text[:200] + "…"
+    return f"{name}: {text}"
 
 
 def _load_records(path: Path) -> list[DispatchRecord]:

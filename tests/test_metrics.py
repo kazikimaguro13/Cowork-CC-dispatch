@@ -365,3 +365,90 @@ def test_render_report_surfaces_partial_count() -> None:
 
     assert "Partial: 1" in text
     assert "Done: 1" in text
+
+
+# --------------------------------------------------------------------------- #
+# spec_010: RUNNING is not a failure (and HALTED+INTERRUPTED is)              #
+# --------------------------------------------------------------------------- #
+
+
+def test_running_records_are_counted_independently() -> None:
+    records = [
+        _rec("spec_001", status=DispatchStatus.DONE),
+        _rec("spec_002", status=DispatchStatus.RUNNING, duration_s=None),
+        _rec("spec_003", status=DispatchStatus.RUNNING, duration_s=None),
+    ]
+
+    report = aggregate(records)
+
+    assert report.total_specs == 3
+    assert report.done == 1
+    assert report.running == 2
+    # RUNNING must not bleed into failures — "still in progress" is not "failed".
+    assert report.failures == 0
+    assert report.failure_taxonomy == ()
+    # Safe-halt rate denominator must not include RUNNING.
+    assert report.safe_halt_rate.denominator == 0
+
+
+def test_running_excluded_from_success_rate_denominator_is_still_total() -> None:
+    """RUNNING is counted in total_specs (it is a record) but not as success."""
+
+    records = [
+        _rec("spec_001", status=DispatchStatus.DONE),
+        _rec("spec_002", status=DispatchStatus.RUNNING, duration_s=None),
+    ]
+
+    report = aggregate(records)
+
+    # Per spec: RUNNING is reported under `running` and not bucketed elsewhere.
+    # Success rate stays honest: 1 done out of 2 records.
+    assert report.dispatch_success_rate.numerator == 1
+    assert report.dispatch_success_rate.denominator == 2
+
+
+def test_aggregate_default_running_zero_when_no_running_records() -> None:
+    records = [_rec("spec_001", status=DispatchStatus.DONE)]
+
+    report = aggregate(records)
+
+    assert report.running == 0
+
+
+def test_render_report_surfaces_running_count() -> None:
+    records = [
+        _rec("spec_001", status=DispatchStatus.DONE),
+        _rec("spec_002", status=DispatchStatus.RUNNING, duration_s=None),
+    ]
+
+    text = render_report(aggregate(records))
+
+    assert "Running: 1" in text
+
+
+def test_interrupted_appears_in_failure_taxonomy_and_is_safe_halted() -> None:
+    """HALTED + INTERRUPTED is a classified failure: it lands in the taxonomy
+    and counts toward the safe_halt_rate numerator (we know the cause)."""
+
+    records = [
+        _rec(
+            "spec_001",
+            status=DispatchStatus.HALTED,
+            duration_s=None,
+            failure_category=FailureCategory.INTERRUPTED,
+        ),
+        _rec(
+            "spec_002",
+            status=DispatchStatus.FAILED,
+            failure_category=FailureCategory.SMOKE_FAILED,
+        ),
+    ]
+
+    report = aggregate(records)
+
+    by_cat = {b.category: b for b in report.failure_taxonomy}
+    assert FailureCategory.INTERRUPTED in by_cat
+    assert by_cat[FailureCategory.INTERRUPTED].count == 1
+    # Both failures are classified → safe halt rate is 2/2.
+    assert report.safe_halt_rate.numerator == 2
+    assert report.safe_halt_rate.denominator == 2

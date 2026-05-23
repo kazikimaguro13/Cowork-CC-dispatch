@@ -411,10 +411,17 @@ def test_dashboard_renders_survival_bias_coverage_note(tmp_path: Path) -> None:
         )
     ]
     html_text = render_dashboard(runs)
+    # v1.6: coverage note now reflects that ccd records orchestrator-side
+    # interruptions as HALTED + INTERRUPTED. The two remaining structural
+    # blind spots (pre-dispatch crashes + bash bridge history) are called
+    # out explicitly.
     assert "カバレッジ注記" in html_text
-    assert "生存バイアス" in html_text
-    # The note must mention that halted-no-result dispatches are not counted.
-    assert "result を残さなかった" in html_text
+    assert "v1.6" in html_text
+    assert "INTERRUPTED" in html_text
+    assert "bash bridge" in html_text
+    assert "dispatch を開始する前" in html_text
+    # The note does not claim "complete coverage" — the dashboard stays honest.
+    assert "完全網羅" not in html_text
 
 
 def test_dashboard_breakdown_shows_done_partial_failed_separately() -> None:
