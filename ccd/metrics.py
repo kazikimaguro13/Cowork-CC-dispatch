@@ -66,6 +66,7 @@ class MetricsReport(BaseModel):
     total_specs: int = Field(ge=0)
     done: int = Field(ge=0)
     partial: int = Field(ge=0)
+    running: int = Field(ge=0)
     failures: int = Field(ge=0)
 
     dispatch_success_rate: Rate
@@ -89,21 +90,30 @@ def aggregate(source: MetricsSource) -> MetricsReport:
     from the failure denominator and the failure taxonomy). Hiding them in
     either bucket would either inflate the success rate or fake a failure
     category — both are wrong for a status that means "shipped with caveats".
+
+    ``RUNNING`` records (in-flight markers, present transiently between the
+    pre-runner write and the post-runner write, and any orphan that escaped
+    reconcile) are likewise independent: counting them as failures would
+    misclassify "still in progress" as "failed". They appear in
+    ``MetricsReport.running`` and nowhere else.
     """
 
     records = _records_of(source)
     total = len(records)
     done_records = [r for r in records if r.status is DispatchStatus.DONE]
     partial_records = [r for r in records if r.status is DispatchStatus.PARTIAL]
+    running_records = [r for r in records if r.status is DispatchStatus.RUNNING]
     fail_records = [
         r
         for r in records
         if r.status is not DispatchStatus.DONE
         and r.status is not DispatchStatus.PARTIAL
+        and r.status is not DispatchStatus.RUNNING
     ]
 
     done = len(done_records)
     partial = len(partial_records)
+    running = len(running_records)
     failures = len(fail_records)
 
     dispatch_success_rate = _rate(done, total)
@@ -134,6 +144,7 @@ def aggregate(source: MetricsSource) -> MetricsReport:
         total_specs=total,
         done=done,
         partial=partial,
+        running=running,
         failures=failures,
         dispatch_success_rate=dispatch_success_rate,
         autonomous_completion_rate=autonomous_completion_rate,
@@ -157,6 +168,7 @@ def render_report(report: MetricsReport) -> str:
         f"- Total specs: {report.total_specs}",
         f"- Done: {report.done}",
         f"- Partial: {report.partial}",
+        f"- Running: {report.running}",
         f"- Failures: {report.failures}",
         "",
         "## Scoreboard",

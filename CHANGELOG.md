@@ -2,7 +2,32 @@
 
 本プロジェクトの注目すべき変更を記録する。フォーマットは [Keep a Changelog](https://keepachangelog.com/) に準ずる。
 
-## [0.2.1] — 2026-05-23
+## [0.2.2] — 2026-05-23
+
+v1.6 patch — spec_010。オーケストレータの例外で run JSON が消える穴と、プロセスが死んだとき in-flight の dispatch が失なわれる穴を塞いだ。失敗は捏造せず、観測した事実だけを `HALTED` / `INTERRUPTED` として残す。
+
+### Added
+
+- **`FailureCategory.INTERRUPTED`** — 「`ccd` は dispatch を開始したが、オーケストレータの死／未処理例外／`--timeout` 超過により終端ステータスを観測できなかった」を表す失敗カテゴリ。末尾追加のみ、後方互換。`metrics.py:_failure_taxonomy` は `for cat in FailureCategory` で回しているので集計に自動追従。
+- **`ccd reconcile <path|dir>` サブコマンド** — 指定 run JSON ファイル、または `<dir>` 配下の `*.json` 全部の `RUNNING` record を `HALTED + INTERRUPTED` に変換。`finished_at` は `None` のまま（実際の終了時刻は不明 — 捏造した所要時間を `_duration_stats` に渡さない）。
+- **`--timeout SECONDS` フラグ** — `dispatch` / `chain` の per-spec runner timeout（既定 `None` = 無制限、現状の挙動維持）。超過は `subprocess.TimeoutExpired` として `HALTED + INTERRUPTED` の record になる。
+- **`MetricsReport.running`** — `RUNNING` record を `done` / `partial` / `failures` のどれにも入れず独立カウント。`render_report()` に `- Running: <n>` 行追加。「まだ終わってない」を「失敗した」と分類するのは spec_009 が正した不正直さと同種なので回避。
+- **`ccd/run_writer.py` 新モジュール** — `RunWriter` クラス（in-flight `RUNNING` マーカー + atomic `os.replace` でのインクリメンタル書き込み + 起動時の孤児 RUNNING 自動 reconcile + carry-forward）、`reconcile_run_file()` / `reconcile_path()` 関数、`halted_interrupted_record()` ヘルパ。
+
+### Changed
+
+- **クラッシュ安全な永続化**: `cli.py:_save_run`（末尾1回書き込み）を廃止し、`RunWriter` が runner 呼び出しの**前**に `RUNNING` マーカーを、**後**に最終 record を書く形式に。chain は spec を 1 件処理するたびに run JSON を書き直すので、途中でプロセスが死んでも完了済み step は必ずディスクに残る。書き込みはすべて同一ディレクトリの一時ファイル ＋ `os.replace()` で atomic。
+- **例外安全**: `run_chain` / `_cmd_dispatch` が `_create_feature_branch` の `RuntimeError`、runner の `subprocess.TimeoutExpired`、その他の未処理例外を spec 単位で捕捉し、`HALTED + INTERRUPTED` の record を増分 writer で確定 → chain は halt（残りの spec は実行しない、既存方針）。「例外でラン JSON が書かれない」経路をゼロに。
+- **自動 carry-forward**: `dispatch` / `chain` 起動時に `--save` 先のファイルに `RUNNING` record があれば、それを `HALTED + INTERRUPTED` に reconcile して新しいランの record リストの先頭に引き継ぐ。stderr に `salvaged N interrupted dispatch(es) from a previous run` を出す。前回ファイルに `RUNNING` が無い通常ケースでは carry-forward は起きず、挙動は現状と同一。
+- **ダッシュボードのカバレッジ注記文言を v1.6 に更新** (`_render_quality_note`)。`ccd` が中断 dispatch を `HALTED` / `INTERRUPTED` として記録するようになったこと、残る構造的死角は (a) `ccd` が開始する前に落ちたケース と (b) bash bridge 時代の履歴データ のみ、を明示。「完全網羅」とは書かない正直さは維持。`docs/data/*.json` は無変更で `docs/index.html` のみ再レンダリング。
+- `pyproject.toml` / `ccd/__init__.py` version `0.2.1` → `0.2.2`。
+
+### Fixed
+
+- **穴1 — 例外でラン全体が消える**: `subprocess.TimeoutExpired`、`_create_feature_branch` の git エラー、`FileNotFoundError` などが `dispatch_one` → `run_chain` → `_cmd_chain` の誰にも catch されず、`_save_run` に到達せずラン JSON が書かれなかった。timeout した spec も、その前に完走した spec も全部消える挙動を修正。
+- **穴2 — プロセス自体が死ぬ**: `_save_run` がラン末尾で 1 回だけ呼ばれていたため、`ccd chain` が `kill -9` / OOM / 再起動で落ちると同様にラン全体が消えていた。増分・atomic 永続化 ＋ 起動時の自動 reconcile で「`ccd` が開始した dispatch は必ず観測される」状態に。
+
+
 
 v1.5 patch — spec_009。バックフィルが書式差で取りこぼしていた result を回収し、`partial` を独立した一級ステータスとして昇格、ダッシュボードに**生存バイアス**のカバレッジ注記を追加。失敗の捏造はしない。
 

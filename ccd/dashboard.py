@@ -189,15 +189,20 @@ def _render_quality_note(runs: Sequence[RunFile]) -> str:
         for g in generations
     )
     notes: list[str] = []
-    # Survival bias is structural for any backfill from result files: a halted
-    # dispatch leaves no result file behind, so the parser cannot observe it.
-    # State this honestly instead of fabricating phantom failures.
+    # v1.6 (spec_010): ccd now records orchestrator-side interruptions
+    # (TimeoutExpired, git errors, runner crashes, process death) as
+    # HALTED + INTERRUPTED instead of silently dropping the run. The
+    # remaining structural blind spots are explicitly enumerated below so
+    # the dashboard never pretends to be a complete sample.
     notes.append(
-        '<p class="quality-note"><strong>カバレッジ注記</strong>: '
-        "集計対象は <code>result_*.md</code> を残した dispatch のみです。"
-        "途中で halt して result を残さなかった失敗は構造的に含まれません "
-        "(生存バイアス)。表示されている成功率は「result を書き残せた dispatch の中での」"
-        "成功率であり、母集団全体の成功率の上限の目安として読んでください。</p>"
+        '<p class="quality-note"><strong>カバレッジ注記</strong> (v1.6): '
+        "<code>ccd</code> は中断された dispatch (オーケストレータの死・未処理例外・"
+        "<code>--timeout</code> 超過) を <code>HALTED</code> / "
+        "<code>INTERRUPTED</code> として記録するようになりました。"
+        "残る構造的な死角は (a) <code>ccd</code> が dispatch を開始する前にプロセスが"
+        "落ちたケース と (b) bash bridge 時代の履歴データ のみです。"
+        "観測の死角は v1.5 より縮みましたが、母集団全体の上限の目安として"
+        "読んでください。</p>"
     )
     if has_backfill:
         notes.append(
