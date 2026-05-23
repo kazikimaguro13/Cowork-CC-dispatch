@@ -293,3 +293,75 @@ def test_failure_breakdown_is_frozen_pydantic_model() -> None:
     )
     assert breakdown.category is FailureCategory.TRANSIENT
     assert breakdown.count == 1
+
+
+# --------------------------------------------------------------------------- #
+# spec_009: PARTIAL counted independently (not done, not failure)             #
+# --------------------------------------------------------------------------- #
+
+
+def test_partial_records_are_counted_independently() -> None:
+    records = [
+        _rec("spec_001", status=DispatchStatus.DONE, duration_s=60.0),
+        _rec("spec_002", status=DispatchStatus.DONE, duration_s=60.0),
+        _rec("spec_003", status=DispatchStatus.PARTIAL, duration_s=60.0),
+        _rec("spec_004", status=DispatchStatus.PARTIAL, duration_s=60.0),
+        _rec(
+            "spec_005",
+            status=DispatchStatus.FAILED,
+            duration_s=10.0,
+            failure_category=FailureCategory.SMOKE_FAILED,
+        ),
+    ]
+
+    report = aggregate(records)
+
+    assert report.total_specs == 5
+    assert report.done == 2
+    assert report.partial == 2
+    assert report.failures == 1
+    # done numerator excludes PARTIAL; PARTIAL is NOT added to the success rate.
+    assert report.dispatch_success_rate.numerator == 2
+    assert report.dispatch_success_rate.denominator == 5
+    # autonomous completion likewise excludes PARTIAL (same numerator).
+    assert report.autonomous_completion_rate.numerator == 2
+    # PARTIAL is not in the failure taxonomy; only the 1 real failure counts.
+    assert sum(b.count for b in report.failure_taxonomy) == 1
+    # And safe-halt rate denominator is failures only (1), not failures + partials.
+    assert report.safe_halt_rate.denominator == 1
+
+
+def test_partial_is_not_treated_as_failure_for_safe_halt() -> None:
+    records = [
+        _rec("spec_001", status=DispatchStatus.PARTIAL, duration_s=60.0),
+        _rec("spec_002", status=DispatchStatus.PARTIAL, duration_s=60.0),
+    ]
+
+    report = aggregate(records)
+
+    assert report.partial == 2
+    assert report.failures == 0
+    # PARTIAL must not bleed into the failure taxonomy at all.
+    assert report.failure_taxonomy == ()
+    # And safe_halt_rate has no denominator (no failures).
+    assert report.safe_halt_rate.denominator == 0
+
+
+def test_aggregate_default_partial_zero_when_no_partial_records() -> None:
+    records = [_rec("spec_001", status=DispatchStatus.DONE, duration_s=60.0)]
+
+    report = aggregate(records)
+
+    assert report.partial == 0
+
+
+def test_render_report_surfaces_partial_count() -> None:
+    records = [
+        _rec("spec_001", status=DispatchStatus.DONE),
+        _rec("spec_002", status=DispatchStatus.PARTIAL),
+    ]
+
+    text = render_report(aggregate(records))
+
+    assert "Partial: 1" in text
+    assert "Done: 1" in text

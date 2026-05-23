@@ -381,6 +381,131 @@ def test_pooled_metrics_match_aggregate_independently() -> None:
     assert expected in html
 
 
+# --------------------------------------------------------------------------- #
+# spec_009: survival-bias coverage note + done/partial breakdown              #
+# --------------------------------------------------------------------------- #
+
+
+def _run_with_records(records: list[DispatchRecord], *, generation: str = "ccd_native") -> RunFile:
+    return RunFile(
+        version=1,
+        saved_at="2026-05-23T00:00:00+00:00",
+        project="example",
+        generation=generation,
+        records=records,
+    )
+
+
+def test_dashboard_renders_survival_bias_coverage_note(tmp_path: Path) -> None:
+    runs = [
+        _run_with_records(
+            [
+                DispatchRecord(
+                    spec_id="spec_001",
+                    started_at=datetime(2026, 5, 1, tzinfo=UTC),
+                    finished_at=datetime(2026, 5, 1, tzinfo=UTC),
+                    status=DispatchStatus.DONE,
+                    attempts=1,
+                )
+            ]
+        )
+    ]
+    html_text = render_dashboard(runs)
+    assert "カバレッジ注記" in html_text
+    assert "生存バイアス" in html_text
+    # The note must mention that halted-no-result dispatches are not counted.
+    assert "result を残さなかった" in html_text
+
+
+def test_dashboard_breakdown_shows_done_partial_failed_separately() -> None:
+    runs = [
+        _run_with_records(
+            [
+                DispatchRecord(
+                    spec_id="spec_001",
+                    started_at=datetime(2026, 5, 1, tzinfo=UTC),
+                    finished_at=datetime(2026, 5, 1, tzinfo=UTC),
+                    status=DispatchStatus.DONE,
+                    attempts=1,
+                ),
+                DispatchRecord(
+                    spec_id="spec_002",
+                    started_at=datetime(2026, 5, 2, tzinfo=UTC),
+                    finished_at=datetime(2026, 5, 2, tzinfo=UTC),
+                    status=DispatchStatus.PARTIAL,
+                    attempts=1,
+                ),
+                DispatchRecord(
+                    spec_id="spec_003",
+                    started_at=datetime(2026, 5, 3, tzinfo=UTC),
+                    finished_at=datetime(2026, 5, 3, tzinfo=UTC),
+                    status=DispatchStatus.FAILED,
+                    attempts=1,
+                    failure_category=FailureCategory.SMOKE_FAILED,
+                ),
+            ]
+        )
+    ]
+
+    html_text = render_dashboard(runs)
+    # done / partial / failed pills are all surfaced — the hero can no longer
+    # read as "100% done" when there are partials in the pool.
+    assert "outcome-done" in html_text
+    assert "outcome-partial" in html_text
+    assert "outcome-failed" in html_text
+    # And the runs table grew a `partial` column.
+    assert "<th class=\"num\">partial</th>" in html_text
+
+
+def test_dashboard_done_partial_breakdown_omits_zero_categories() -> None:
+    runs = [
+        _run_with_records(
+            [
+                DispatchRecord(
+                    spec_id="spec_001",
+                    started_at=datetime(2026, 5, 1, tzinfo=UTC),
+                    finished_at=datetime(2026, 5, 1, tzinfo=UTC),
+                    status=DispatchStatus.DONE,
+                    attempts=1,
+                )
+            ]
+        )
+    ]
+    html_text = render_dashboard(runs)
+    # The done pill renders; partial/failed pills don't (zero counts → omitted),
+    # even though the CSS classes themselves are present in the stylesheet.
+    assert 'class="outcome-pill outcome-done"' in html_text
+    assert 'class="outcome-pill outcome-partial"' not in html_text
+    assert 'class="outcome-pill outcome-failed"' not in html_text
+
+
+def test_dashboard_hero_not_100_percent_when_partials_present() -> None:
+    runs = [
+        _run_with_records(
+            [
+                DispatchRecord(
+                    spec_id="spec_001",
+                    started_at=datetime(2026, 5, 1, tzinfo=UTC),
+                    finished_at=datetime(2026, 5, 1, tzinfo=UTC),
+                    status=DispatchStatus.DONE,
+                    attempts=1,
+                ),
+                DispatchRecord(
+                    spec_id="spec_002",
+                    started_at=datetime(2026, 5, 2, tzinfo=UTC),
+                    finished_at=datetime(2026, 5, 2, tzinfo=UTC),
+                    status=DispatchStatus.PARTIAL,
+                    attempts=1,
+                ),
+            ]
+        )
+    ]
+    html_text = render_dashboard(runs)
+    # The hero now shows autonomous-completion = 1/2 = 50%, not 100%.
+    assert ">50.0%<" in html_text
+    assert ">100.0%<" not in html_text
+
+
 def test_run_file_round_trip_through_loader(tmp_path: Path) -> None:
     """A `RunFile` written to disk reloads cleanly via load_runs."""
 

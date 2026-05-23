@@ -47,6 +47,16 @@ _TITLE_RE = re.compile(r"^#\s+(?P<id>\S+?)\s*:\s*(?P<title>.+?)\s*$")
 _HEADER_LINE_RE = re.compile(
     r"^-\s*\*\*(?P<key>[^*]+)\*\*\s*:\s*(?P<value>.*?)\s*$"
 )
+# Status lines anywhere in the document — covers Markdown bold (`**Status**: ...`),
+# plain (`Status: ...`, `status: ...`), and YAML frontmatter (`status: done`).
+_LOOSE_STATUS_RE = re.compile(
+    r"^\s*(?:[-*]\s*)?\*{0,2}status\*{0,2}\s*:\s*(?P<value>.+?)\s*$",
+    re.IGNORECASE,
+)
+# Spec id mentioned anywhere (YAML frontmatter `spec: spec_054`, prose, branch names…).
+_LOOSE_SPEC_ID_RE = re.compile(r"\bspec_(\d{3,})\b")
+# `result_NNN.md` filename → `spec_NNN` fallback.
+_FILENAME_NUM_RE = re.compile(r"result_(\d+)")
 
 _DEFAULT_OUTBOX_REL = Path("_ai_workspace") / "bridge" / "outbox"
 _DEFAULT_OUTPUT_REL = Path("_ai_workspace") / "runs"
@@ -96,6 +106,12 @@ def parse_result_file(path: Path) -> DispatchRecord | None:
     Returns `None` (with a logged warning) when the required fields
     (``spec_id``, ``status``) are missing or unparseable. The function does
     not raise on malformed historical input — backfill must keep going.
+
+    The parser is lenient: status values are normalized (emoji / parenthetical
+    suffix / em-dash trail stripped, ``completed`` → ``done``, ``partial`` →
+    ``DispatchStatus.PARTIAL``), and if neither the header block nor the title
+    yields a spec_id / status, the entire document (and finally the filename)
+    is searched as a fallback.
     """
 
     try:
@@ -105,8 +121,13 @@ def parse_result_file(path: Path) -> DispatchRecord | None:
         return None
 
     header = _parse_header(text)
-    spec_id = _pick(header.fields, _SPEC_ID_KEYS) or header.title_id
-    status = _pick_status(header.fields)
+    spec_id = (
+        _pick(header.fields, _SPEC_ID_KEYS)
+        or header.title_id
+        or _find_spec_id_in_body(text)
+        or _spec_id_from_filename(path)
+    )
+    status = _pick_status(header.fields) or _find_status_in_body(text)
 
     if not spec_id:
         logger.warning("backfill: skipping %s (no spec_id found)", path)
@@ -179,13 +200,93 @@ def _pick(fields: dict[str, str], keys: Iterable[str]) -> str | None:
 
 
 def _pick_status(fields: dict[str, str]) -> DispatchStatus | None:
-    raw = _pick(fields, _STATUS_KEYS)
+    return _coerce_status(_pick(fields, _STATUS_KEYS))
+
+
+def _coerce_status(raw: str | None) -> DispatchStatus | None:
+    """Normalize a free-form status value and map it to a `DispatchStatus`.
+
+    Handles emoji prefixes (``✅ done``), parenthetical suffixes
+    (``done (clasp push のみ認証待ち)``, including full-width ``（）``),
+    em-dash / dash / comma trails (``done — push 済み``), and the
+    ``completed`` / ``complete`` synonyms (mapped to ``done``).
+    Unknown values return ``None`` so the caller can keep skipping
+    truly opaque files instead of fabricating data.
+    """
+
     if raw is None:
         return None
+    normalized = _normalize_status_value(raw)
+    if not normalized:
+        return None
     try:
-        return DispatchStatus(raw.lower())
+        return DispatchStatus(normalized)
     except ValueError:
         return None
+
+
+_STATUS_SYNONYMS = {
+    "completed": "done",
+    "complete": "done",
+    "完了": "done",
+}
+
+
+def _normalize_status_value(raw: str) -> str:
+    s = raw.strip()
+    if not s:
+        return ""
+    # Drop everything after a parenthetical suffix (`(...)` / `（...）`).
+    s = re.split(r"[(（]", s, maxsplit=1)[0]
+    # Drop trailing prose after an em-dash / en-dash (e.g. `done — push 済み`).
+    # Stick to those wide dashes so plausible status values containing a
+    # hyphen-minus (`in-progress`) still normalize to a single token.
+    s = re.split(r"[—–]", s, maxsplit=1)[0]
+    # Strip non-letter decoration from the edges (emoji ✅, punctuation, etc.).
+    s = re.sub(r"^[^\w]+", "", s)
+    s = re.sub(r"[^\w]+$", "", s)
+    s = s.strip().lower()
+    return _STATUS_SYNONYMS.get(s, s)
+
+
+def _find_status_in_body(text: str) -> DispatchStatus | None:
+    """Last-resort status scan over the whole document, used when the header
+    block has none. Picks the first status-shaped line that normalizes to a
+    known `DispatchStatus`; later occurrences (often inside checklists or
+    sample blocks) are ignored.
+    """
+
+    for line in text.splitlines():
+        m = _LOOSE_STATUS_RE.match(line)
+        if not m:
+            continue
+        status = _coerce_status(m.group("value"))
+        if status is not None:
+            return status
+    return None
+
+
+def _find_spec_id_in_body(text: str) -> str | None:
+    """Find a ``spec_NNN`` mention anywhere in the document.
+
+    Used when neither the header field nor the title carries one (e.g. YAML
+    frontmatter, em-dash titles like ``# result_034 — ...``). The first hit
+    wins; downstream anonymization renumbers anything weird.
+    """
+
+    m = _LOOSE_SPEC_ID_RE.search(text)
+    if m is None:
+        return None
+    return f"spec_{m.group(1)}"
+
+
+def _spec_id_from_filename(path: Path) -> str | None:
+    """Fallback ``spec_NNN`` derived from ``result_NNN.md`` filename."""
+
+    m = _FILENAME_NUM_RE.search(path.stem)
+    if m is None:
+        return None
+    return f"spec_{m.group(1)}"
 
 
 def _pick_failure_category(fields: dict[str, str]) -> FailureCategory | None:

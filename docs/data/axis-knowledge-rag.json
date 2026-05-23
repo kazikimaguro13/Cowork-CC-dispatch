@@ -1,18 +1,9 @@
 {
   "version": 1,
-  "saved_at": "2026-05-23T02:49:38.285327+00:00",
+  "saved_at": "2026-05-23T04:55:13.726616+00:00",
   "project": "axis-knowledge-rag",
   "generation": "bash_prototype",
   "records": [
-    {
-      "spec_id": "spec_056",
-      "started_at": "2026-05-12T00:00:00Z",
-      "finished_at": "2026-05-12T00:00:00Z",
-      "status": "done",
-      "attempts": 1,
-      "failure_category": null,
-      "intervention": false
-    },
     {
       "spec_id": "spec_057",
       "started_at": "2026-05-12T00:00:00Z",
@@ -26,7 +17,7 @@
       "spec_id": "spec_058",
       "started_at": "2026-05-12T00:00:00Z",
       "finished_at": "2026-05-12T00:00:00Z",
-      "status": "done",
+      "status": "partial",
       "attempts": 1,
       "failure_category": null,
       "intervention": false
@@ -42,8 +33,8 @@
     },
     {
       "spec_id": "spec_060",
-      "started_at": "2026-05-13T00:00:00Z",
-      "finished_at": null,
+      "started_at": "2026-05-12T00:00:00Z",
+      "finished_at": "2026-05-12T00:00:00Z",
       "status": "done",
       "attempts": 1,
       "failure_category": null,
@@ -51,8 +42,8 @@
     },
     {
       "spec_id": "spec_061",
-      "started_at": "2026-05-13T00:00:00Z",
-      "finished_at": "2026-05-13T00:00:00Z",
+      "started_at": "2026-05-12T00:00:00Z",
+      "finished_at": "2026-05-12T00:00:00Z",
       "status": "done",
       "attempts": 1,
       "failure_category": null,
@@ -61,7 +52,7 @@
     {
       "spec_id": "spec_062",
       "started_at": "2026-05-13T00:00:00Z",
-      "finished_at": "2026-05-13T00:00:00Z",
+      "finished_at": null,
       "status": "done",
       "attempts": 1,
       "failure_category": null,
@@ -116,7 +107,7 @@
       "spec_id": "spec_068",
       "started_at": "2026-05-13T00:00:00Z",
       "finished_at": "2026-05-13T00:00:00Z",
-      "status": "done",
+      "status": "partial",
       "attempts": 1,
       "failure_category": null,
       "intervention": false
@@ -132,6 +123,42 @@
     },
     {
       "spec_id": "spec_070",
+      "started_at": "2026-05-13T00:00:00Z",
+      "finished_at": "2026-05-13T00:00:00Z",
+      "status": "done",
+      "attempts": 1,
+      "failure_category": null,
+      "intervention": false
+    },
+    {
+      "spec_id": "spec_071",
+      "started_at": "2026-05-13T00:00:00Z",
+      "finished_at": "2026-05-13T00:00:00Z",
+      "status": "done",
+      "attempts": 1,
+      "failure_category": null,
+      "intervention": false
+    },
+    {
+      "spec_id": "spec_072",
+      "started_at": "2026-05-13T00:00:00Z",
+      "finished_at": "2026-05-13T00:00:00Z",
+      "status": "done",
+      "attempts": 1,
+      "failure_category": null,
+      "intervention": false
+    },
+    {
+      "spec_id": "spec_073",
+      "started_at": "2026-05-13T00:00:00Z",
+      "finished_at": "2026-05-13T00:00:00Z",
+      "status": "done",
+      "attempts": 1,
+      "failure_category": null,
+      "intervention": false
+    },
+    {
+      "spec_id": "spec_074",
       "started_at": "2026-05-14T00:00:00Z",
       "finished_at": "2026-05-14T00:00:00Z",
       "status": "done",
@@ -140,16 +167,70 @@
       "intervention": false
     },
     {
-      "spec_id": "spec_071",
-      "started_at": "2026-05-20T00:00:00Z",
-      "finished_at": "2026-05-20T00:00:00Z",
+      "spec_id": "spec_075",
+      "started_at": "2026-05-14T00:00:00Z",
+      "finished_at": "2026-05-14T00:00:00Z",
+      "status": "partial",
+      "attempts": 1,
+      "failure_category": null,
+      "intervention": false
+    },
+    {
+      "spec_id": "spec_076",
+      "started_at": "2026-05-14T00:00:00Z",
+      "finished_at": "2026-05-14T00:00:00Z",
       "status": "done",
       "attempts": 1,
       "failure_category": null,
       "intervention": false
     },
     {
-      "spec_id": "spec_072",
+      "spec_id": "spec_032",
+      "started_at": "2026-05-14T00:00:00Z",
+      "finished_at": null,
+      "status": "done",
+      "attempts": 1,
+      "failure_category": null,
+      "intervention": false
+    },
+    {
+      "spec_id": "spec_034",
+      "started_at": "2026-05-14T00:00:00Z",
+      "finished_at": null,
+      "status": "done",
+      "attempts": 1,
+      "failure_category": null,
+      "intervention": false
+    },
+    {
+      "spec_id": "spec_036",
+      "started_at": "2026-05-14T00:00:00Z",
+      "finished_at": null,
+      "status": "done",
+      "attempts": 1,
+      "failure_category": null,
+      "intervention": false
+    },
+    {
+      "spec_id": "spec_037",
+      "started_at": "2026-05-14T00:00:00Z",
+      "finished_at": null,
+      "status": "done",
+      "attempts": 1,
+      "failure_category": null,
+      "intervention": false
+    },
+    {
+      "spec_id": "spec_077",
+      "started_at": "2026-05-14T00:00:00Z",
+      "finished_at": null,
+      "status": "done",
+      "attempts": 1,
+      "failure_category": null,
+      "intervention": false
+    },
+    {
+      "spec_id": "spec_046",
       "started_at": "2026-05-20T00:00:00Z",
       "finished_at": null,
       "status": "done",
@@ -158,7 +239,61 @@
       "intervention": false
     },
     {
+      "spec_id": "spec_078",
+      "started_at": "2026-05-20T00:00:00Z",
+      "finished_at": "2026-05-20T00:00:00Z",
+      "status": "done",
+      "attempts": 1,
+      "failure_category": null,
+      "intervention": false
+    },
+    {
+      "spec_id": "spec_049",
+      "started_at": "2026-05-20T00:00:00Z",
+      "finished_at": null,
+      "status": "done",
+      "attempts": 1,
+      "failure_category": null,
+      "intervention": false
+    },
+    {
+      "spec_id": "spec_051",
+      "started_at": "2026-05-20T00:00:00Z",
+      "finished_at": null,
+      "status": "done",
+      "attempts": 1,
+      "failure_category": null,
+      "intervention": false
+    },
+    {
+      "spec_id": "spec_079",
+      "started_at": "2026-05-20T00:00:00Z",
+      "finished_at": null,
+      "status": "done",
+      "attempts": 1,
+      "failure_category": null,
+      "intervention": false
+    },
+    {
+      "spec_id": "spec_054",
+      "started_at": "2026-05-21T00:00:00Z",
+      "finished_at": null,
+      "status": "done",
+      "attempts": 1,
+      "failure_category": null,
+      "intervention": false
+    },
+    {
       "spec_id": "spec_055",
+      "started_at": "2026-05-21T00:00:00Z",
+      "finished_at": null,
+      "status": "done",
+      "attempts": 1,
+      "failure_category": null,
+      "intervention": false
+    },
+    {
+      "spec_id": "spec_056",
       "started_at": "2026-05-21T00:00:00Z",
       "finished_at": null,
       "status": "done",
