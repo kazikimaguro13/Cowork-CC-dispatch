@@ -430,7 +430,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 def _collect_sources(args: argparse.Namespace) -> list[BackfillSource]:
     sources: list[BackfillSource] = []
     config_path = args.config
-    if config_path is None and _DEFAULT_CONFIG_REL.exists():
+    if config_path is None and not args.source and _DEFAULT_CONFIG_REL.exists():
         config_path = _DEFAULT_CONFIG_REL
     if config_path is not None:
         sources.extend(load_sources_config(config_path))

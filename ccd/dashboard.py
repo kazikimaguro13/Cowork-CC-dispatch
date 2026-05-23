@@ -173,14 +173,14 @@ def _render_header(generated_at: datetime, *, total_runs: int, total_records: in
     return (
         '<header class="page-header">'
         "<h1>ccd dashboard</h1>"
-        f'<p class="subtitle">{total_runs} run file(s) · {total_records} dispatch(es) · '
-        f"generated {html.escape(generated_at.isoformat(timespec='seconds'))}</p>"
+        f'<p class="subtitle">run {total_runs} 件 · dispatch {total_records} 件 · '
+        f"生成 {html.escape(generated_at.isoformat(timespec='seconds'))}</p>"
         "</header>"
     )
 
 
 def _render_quality_note(runs: Sequence[RunFile]) -> str:
-    generations = sorted({(r.generation or "(unspecified)") for r in runs})
+    generations = sorted({(r.generation or "(未指定)") for r in runs})
     has_backfill = any(
         (r.generation or "") in _BACKFILLED_GENERATIONS for r in runs
     )
@@ -191,16 +191,16 @@ def _render_quality_note(runs: Sequence[RunFile]) -> str:
     note = ""
     if has_backfill:
         note = (
-            '<p class="quality-note">Backfilled runs default <code>attempts=1</code> '
-            "and <code>intervention=false</code>. First-pass, retry-recovery and "
-            "autonomous-completion rates for those rows are upper-bound estimates — "
-            "the source <code>result_*.md</code> files did not carry these fields. "
-            "Treat numbers as floors for <em>safe halt rate</em> and ceilings for "
-            "first-pass / retry / autonomous metrics.</p>"
+            '<p class="quality-note">バックフィルした run は <code>attempts=1</code> '
+            "/ <code>intervention=false</code> を既定値としています。一発合格率・"
+            "リトライ回復率・自律完走率はこの欠損の影響を受けるため、上限寄りの概算値です。"
+            "元の <code>result_*.md</code> がこれらのフィールドを持たないためです。"
+            "安全停止率は下限、一発合格率・リトライ・自律完走の各指標は"
+            "上限の目安として読んでください。</p>"
         )
     return (
-        '<section class="quality" aria-label="Data quality">'
-        f'<div class="chip-row" aria-label="Generations">{chips}</div>'
+        '<section class="quality" aria-label="データ品質">'
+        f'<div class="chip-row" aria-label="世代">{chips}</div>'
         f"{note}"
         "</section>"
     )
@@ -221,24 +221,24 @@ def _render_hero(report: MetricsReport, *, project_count: int) -> str:
     auto_pct = _percent(report.autonomous_completion_rate)
     duration = report.duration
     return (
-        '<section class="panel hero" aria-label="Headline metrics">'
+        '<section class="panel hero" aria-label="主要指標">'
         '<div class="hero-primary">'
-        '<div class="hero-label">Autonomous completion rate</div>'
+        '<div class="hero-label">自律完走率</div>'
         f'<div class="hero-value">{auto_pct}</div>'
         f'<div class="hero-sub">{_fmt_rate(report.autonomous_completion_rate)}</div>'
         "</div>"
         '<div class="hero-grid">'
-        + _hero_cell("Dispatch success rate", _fmt_rate(report.dispatch_success_rate))
-        + _hero_cell("First-pass rate", _fmt_rate(report.first_pass_rate))
-        + _hero_cell("Retry recovery rate", _fmt_rate(report.retry_recovery_rate))
-        + _hero_cell("Safe halt rate", _fmt_rate(report.safe_halt_rate))
-        + _hero_cell("Total dispatches", str(report.total_specs))
-        + _hero_cell("Projects (runs)", str(project_count))
+        + _hero_cell("dispatch 成功率", _fmt_rate(report.dispatch_success_rate))
+        + _hero_cell("一発合格率", _fmt_rate(report.first_pass_rate))
+        + _hero_cell("リトライ回復率", _fmt_rate(report.retry_recovery_rate))
+        + _hero_cell("安全停止率", _fmt_rate(report.safe_halt_rate))
+        + _hero_cell("総 dispatch 数", str(report.total_specs))
+        + _hero_cell("プロジェクト数", str(project_count))
         + _hero_cell(
-            "Duration mean",
-            f"{duration.mean_seconds:.1f}s (n={duration.samples})",
+            "所要時間 平均",
+            f"{duration.mean_seconds:.1f}秒 (n={duration.samples})",
         )
-        + _hero_cell("Duration median", f"{duration.median_seconds:.1f}s")
+        + _hero_cell("所要時間 中央値", f"{duration.median_seconds:.1f}秒")
         + "</div>"
         "</section>"
     )
@@ -260,9 +260,9 @@ def _render_failure_taxonomy(report: MetricsReport) -> str:
     items = report.failure_taxonomy
     if not items:
         return (
-            '<section class="panel" aria-label="Failure taxonomy">'
-            "<h2>Failure taxonomy</h2>"
-            '<p class="empty">No failures recorded.</p>'
+            '<section class="panel" aria-label="失敗カテゴリ">'
+            "<h2>失敗カテゴリ</h2>"
+            '<p class="empty">失敗の記録はありません。</p>'
             "</section>"
         )
 
@@ -282,7 +282,7 @@ def _render_failure_taxonomy(report: MetricsReport) -> str:
     for i, item in enumerate(items):
         y = pad_top + i * (bar_h + gap)
         bar_w = (item.share / max_share) * chart_w
-        label = item.category.value if item.category is not None else "unknown"
+        label = item.category.value if item.category is not None else "不明"
         pct = f"{item.share * 100:.1f}%"
         count = f"{item.count} ({pct})"
         bars.append(
@@ -299,13 +299,13 @@ def _render_failure_taxonomy(report: MetricsReport) -> str:
     svg = (
         f'<svg viewBox="0 0 {width} {height}" '
         f'width="100%" preserveAspectRatio="xMinYMin meet" '
-        'role="img" aria-label="Failure category share">'
+        'role="img" aria-label="失敗カテゴリの割合">'
         + "".join(bars)
         + "</svg>"
     )
     return (
-        '<section class="panel" aria-label="Failure taxonomy">'
-        "<h2>Failure taxonomy</h2>"
+        '<section class="panel" aria-label="失敗カテゴリ">'
+        "<h2>失敗カテゴリ</h2>"
         f"{svg}"
         "</section>"
     )
@@ -317,10 +317,10 @@ def _render_failure_taxonomy(report: MetricsReport) -> str:
 def _render_trend(points: Sequence[TrendPoint]) -> str:
     if not points:
         return (
-            '<section class="panel" aria-label="Run trend">'
-            "<h2>Run trend</h2>"
-            '<p class="empty">No dispatch records yet — trend will populate '
-            "as runs accumulate.</p>"
+            '<section class="panel" aria-label="推移">'
+            "<h2>推移</h2>"
+            '<p class="empty">dispatch の記録がまだありません。'
+            "run が蓄積されると表示されます。</p>"
             "</section>"
         )
 
@@ -376,9 +376,9 @@ def _render_trend(points: Sequence[TrendPoint]) -> str:
         )
 
     lines = [
-        ("dispatch_success", "trend-success", lambda p: p.dispatch_success_rate),
-        ("autonomous_completion", "trend-auto", lambda p: p.autonomous_completion_rate),
-        ("first_pass", "trend-first", lambda p: p.first_pass_rate),
+        ("dispatch成功率", "trend-success", lambda p: p.dispatch_success_rate),
+        ("自律完走率", "trend-auto", lambda p: p.autonomous_completion_rate),
+        ("一発合格率", "trend-first", lambda p: p.first_pass_rate),
     ]
     polylines = "".join(
         f'<polyline class="{cls}" fill="none" points="{polyline(extract)}"/>'
@@ -396,7 +396,7 @@ def _render_trend(points: Sequence[TrendPoint]) -> str:
         )
     legend = (
         '<svg viewBox="0 0 760 18" width="100%" preserveAspectRatio="xMinYMin meet" '
-        'role="img" aria-label="Trend legend">'
+        'role="img" aria-label="凡例">'
         + "".join(legend_items)
         + "</svg>"
     )
@@ -404,17 +404,17 @@ def _render_trend(points: Sequence[TrendPoint]) -> str:
     svg = (
         f'<svg viewBox="0 0 {width} {height}" '
         'width="100%" preserveAspectRatio="xMinYMin meet" '
-        'role="img" aria-label="Cumulative rates across dispatch sequence">'
+        'role="img" aria-label="dispatch 系列の累積率">'
         + "".join(grid_lines)
         + "".join(x_ticks)
         + polylines
         + "</svg>"
     )
     return (
-        '<section class="panel" aria-label="Run trend">'
-        "<h2>Run trend</h2>"
-        '<p class="caption">Cumulative rates across the time-ordered '
-        "dispatch sequence (oldest → newest).</p>"
+        '<section class="panel" aria-label="推移">'
+        "<h2>推移</h2>"
+        '<p class="caption">dispatch を時系列順（古い → 新しい）に'
+        "並べた累積率です。</p>"
         f"{legend}{svg}"
         "</section>"
     )
@@ -426,9 +426,9 @@ def _render_trend(points: Sequence[TrendPoint]) -> str:
 def _render_runs_table(runs: Sequence[RunFile]) -> str:
     if not runs:
         return (
-            '<section class="panel" aria-label="Run list">'
-            "<h2>Runs</h2>"
-            '<p class="empty">No run files found.</p>'
+            '<section class="panel" aria-label="run 一覧">'
+            "<h2>run 一覧</h2>"
+            '<p class="empty">run ファイルがありません。</p>'
             "</section>"
         )
 
@@ -437,13 +437,13 @@ def _render_runs_table(runs: Sequence[RunFile]) -> str:
         rows.append(_render_run_row(run))
 
     return (
-        '<section class="panel" aria-label="Run list">'
-        "<h2>Runs</h2>"
+        '<section class="panel" aria-label="run 一覧">'
+        "<h2>run 一覧</h2>"
         '<table class="runs">'
         "<thead><tr>"
-        "<th>Date</th><th>Project</th><th>Generation</th>"
-        "<th class=\"num\">Specs</th><th class=\"num\">Done</th>"
-        "<th class=\"num\">Failed</th><th class=\"num\">Duration mean</th>"
+        "<th>日付</th><th>プロジェクト</th><th>世代</th>"
+        "<th class=\"num\">spec数</th><th class=\"num\">完了</th>"
+        "<th class=\"num\">失敗</th><th class=\"num\">所要時間 平均</th>"
         "</tr></thead>"
         "<tbody>"
         + "".join(rows)
@@ -463,12 +463,12 @@ def _render_run_row(run: RunFile) -> str:
         if r.finished_at is not None
     ]
     duration_str = (
-        f"{statistics.fmean(durations):.1f}s" if durations else "—"
+        f"{statistics.fmean(durations):.1f}秒" if durations else "—"
     )
 
     date_str = _representative_date(run, records)
-    project = run.project or "(unspecified)"
-    generation = run.generation or "(unspecified)"
+    project = run.project or "(未指定)"
+    generation = run.generation or "(未指定)"
 
     details = _render_run_details(run)
 
@@ -495,17 +495,17 @@ def _render_run_row(run: RunFile) -> str:
 def _render_run_details(run: RunFile) -> str:
     if not run.records:
         return (
-            "<details><summary>No dispatch records</summary></details>"
+            "<details><summary>dispatch 記録なし</summary></details>"
         )
     items: list[str] = []
     for r in run.records:
         cat = (
             r.failure_category.value
             if r.failure_category is not None
-            else ("—" if r.status is DispatchStatus.DONE else "unknown")
+            else ("—" if r.status is DispatchStatus.DONE else "不明")
         )
         duration = (
-            f"{(r.finished_at - r.started_at).total_seconds():.1f}s"
+            f"{(r.finished_at - r.started_at).total_seconds():.1f}秒"
             if r.finished_at is not None
             else "—"
         )
@@ -518,11 +518,11 @@ def _render_run_details(run: RunFile) -> str:
             "</tr>"
         )
     return (
-        "<details><summary>Per-spec detail</summary>"
+        "<details><summary>spec 別の明細</summary>"
         '<table class="specs">'
         "<thead><tr>"
-        "<th>spec_id</th><th>status</th><th>failure_category</th>"
-        '<th class="num">duration</th>'
+        "<th>spec_id</th><th>ステータス</th><th>失敗カテゴリ</th>"
+        '<th class="num">所要時間</th>'
         "</tr></thead>"
         "<tbody>"
         + "".join(items)
@@ -644,7 +644,7 @@ table.specs { margin-top: 6px; background: rgba(15,23,42,0.4);
 """
 
 _HTML_DOCUMENT = """<!doctype html>
-<html lang="en">
+<html lang="ja">
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1"/>

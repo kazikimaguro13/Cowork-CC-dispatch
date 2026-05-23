@@ -123,22 +123,22 @@ def test_render_dashboard_contains_four_panels() -> None:
     html = render_dashboard(runs, generated_at=datetime(2026, 5, 23, tzinfo=UTC))
 
     # Hero band
-    assert "Autonomous completion rate" in html
-    assert "Dispatch success rate" in html
-    assert "First-pass rate" in html
-    assert "Retry recovery rate" in html
-    assert "Safe halt rate" in html
-    assert "Total dispatches" in html
-    assert "Duration mean" in html
+    assert "自律完走率" in html
+    assert "dispatch 成功率" in html
+    assert "一発合格率" in html
+    assert "リトライ回復率" in html
+    assert "安全停止率" in html
+    assert "総 dispatch 数" in html
+    assert "所要時間 平均" in html
 
-    # Failure taxonomy panel
-    assert "Failure taxonomy" in html
+    # 失敗カテゴリ panel
+    assert "失敗カテゴリ" in html
 
     # Trend panel
-    assert "Run trend" in html
+    assert "推移" in html
 
     # Run table
-    assert "Runs" in html
+    assert "run 一覧" in html
     assert "bash-prototype" in html
     assert "ccd-native" in html
 
@@ -177,12 +177,12 @@ def test_render_dashboard_shows_correct_aggregate_numbers() -> None:
 
     html = render_dashboard(runs, generated_at=datetime(2026, 5, 23, tzinfo=UTC))
 
-    # Total dispatches surfaced as the hero "Total dispatches" cell.
+    # 総 dispatch 数 surfaced as the hero "総 dispatch 数" cell.
     assert f">{total}<" in html
-    # Dispatch success rate "<done>/<total>" appears verbatim.
+    # dispatch 成功率 "<done>/<total>" appears verbatim.
     assert f"{done}/{total}" in html
-    # Safe halt rate denominator must equal the failure count.
-    assert re.search(rf"Safe halt rate.*?\d+/{failures}", html, flags=re.DOTALL)
+    # 安全停止率 denominator must equal the failure count.
+    assert re.search(rf"安全停止率.*?\d+/{failures}", html, flags=re.DOTALL)
 
 
 def test_render_dashboard_shows_failure_categories() -> None:
@@ -201,7 +201,7 @@ def test_render_dashboard_shows_generation_chips_and_quality_note() -> None:
     assert "bash_prototype" in html
     assert "ccd_native" in html
     # Data-quality candor note about backfill defaults.
-    assert "upper-bound" in html or "Backfilled" in html
+    assert "概算値" in html
 
 
 def test_render_dashboard_handles_empty_runs() -> None:
@@ -236,7 +236,7 @@ def test_render_to_writes_file_and_creates_parents(tmp_path: Path) -> None:
     assert output.exists()
     text = output.read_text(encoding="utf-8")
     assert "<html" in text
-    assert "Run trend" in text
+    assert "推移" in text
 
 
 def test_module_main_writes_to_default_output_under_repo(
@@ -267,7 +267,7 @@ def test_module_main_with_missing_runs_dir_still_succeeds(
     assert rc == 0
     assert output.exists()
     text = output.read_text(encoding="utf-8")
-    assert "No run files found" in text
+    assert "run ファイルがありません" in text
 
 
 # --------------------------------------------------------------------------- #
@@ -360,7 +360,7 @@ def test_unspecified_generation_falls_back_to_placeholder(tmp_path: Path) -> Non
     runs = load_runs(tmp_path)
     assert len(runs) == 1
     html = render_dashboard(runs, generated_at=datetime(2026, 5, 23, tzinfo=UTC))
-    assert "(unspecified)" in html
+    assert "(未指定)" in html
 
 
 def test_pooled_metrics_match_aggregate_independently() -> None:
