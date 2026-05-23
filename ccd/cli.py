@@ -33,6 +33,8 @@ from ccd.integrate import DEFAULT_SMOKE_COMMANDS
 from ccd.metrics import aggregate, render_report
 from ccd.models import DispatchRecord, DispatchStatus
 from ccd.protocol import parse_spec
+from ccd.retrospect import DEFAULT_LIMIT as DEFAULT_RETROSPECT_LIMIT
+from ccd.retrospect import run_retrospect
 from ccd.retry import dispatch_with_retry
 from ccd.run_writer import (
     RunWriter,
@@ -191,6 +193,43 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    p_retrospect = sub.add_parser(
+        "retrospect",
+        help=(
+            "Run a ccd self-retrospective — analyze dispatch history and "
+            "emit improvement-proposal seeds (human-in-the-loop)."
+        ),
+        description=(
+            "Gather run JSON / result_*.md / recent git history into a "
+            "review-task spec, dispatch it through the same AgentRunner "
+            "used for normal dispatches, and verify the agent produced "
+            "_ai_workspace/retro/retro_NNN.md + proposals/*.md. The "
+            "proposals are seeds — they are not auto-promoted to "
+            "_ai_workspace/bridge/inbox/ and not auto-dispatched."
+        ),
+    )
+    p_retrospect.add_argument("--repo", type=Path, default=None)
+    p_retrospect.add_argument(
+        "--runs-dir",
+        dest="runs_dir",
+        type=Path,
+        default=None,
+        help=(
+            "Directory of run JSON files to scan "
+            f"(default: <repo>/{DEFAULT_DASHBOARD_RUNS_PATH}). "
+            "Legacy <repo>/_ai_workspace/logs/*_run.json are also picked up."
+        ),
+    )
+    p_retrospect.add_argument(
+        "--limit",
+        type=int,
+        default=DEFAULT_RETROSPECT_LIMIT,
+        help=(
+            f"Max recent commits to include in the evidence bundle "
+            f"(default: {DEFAULT_RETROSPECT_LIMIT})."
+        ),
+    )
+
     p_reconcile = sub.add_parser(
         "reconcile",
         help="Reconcile orphan RUNNING records to HALTED + INTERRUPTED.",
@@ -226,6 +265,8 @@ def main(
         return _cmd_report(args)
     if args.command == "dashboard":
         return _cmd_dashboard(args)
+    if args.command == "retrospect":
+        return _cmd_retrospect(args, runner)
     if args.command == "reconcile":
         return _cmd_reconcile(args)
 
@@ -331,6 +372,43 @@ def _cmd_dashboard(args: argparse.Namespace) -> int:
 
     written = render_dashboard_to(runs_dir, output)
     print(f"wrote {written}")
+    return 0
+
+
+def _cmd_retrospect(
+    args: argparse.Namespace,
+    runner: AgentRunner | None,
+) -> int:
+    repo = _resolve_repo(args.repo)
+    runs_dir = args.runs_dir
+    if runs_dir is not None and not Path(runs_dir).is_absolute():
+        runs_dir = repo / runs_dir
+    limit = getattr(args, "limit", DEFAULT_RETROSPECT_LIMIT)
+    runner = runner if runner is not None else ClaudeCodeRunner()
+
+    result = run_retrospect(
+        runner,
+        repo=repo,
+        runs_dir=runs_dir,
+        limit=limit,
+    )
+
+    print(f"review spec: {result.review_spec_path}")
+    print(
+        "factual summary: "
+        f"runs={result.summary.runs_scanned} "
+        f"records={result.summary.records_total} "
+        f"results={result.summary.result_files} "
+        f"commits={result.summary.recent_commits}"
+    )
+    if result.retro_path is not None:
+        print(f"retrospective: {result.retro_path}")
+    for pp in result.proposal_paths:
+        print(f"proposal: {pp}")
+
+    if not result.success:
+        print(f"retrospect halted: {result.halt_reason}", file=sys.stderr)
+        return 1
     return 0
 
 

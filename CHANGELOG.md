@@ -2,6 +2,25 @@
 
 本プロジェクトの注目すべき変更を記録する。フォーマットは [Keep a Changelog](https://keepachangelog.com/) に準ずる。
 
+## [0.4.0] — 2026-05-24
+
+v1.8 — spec_012。`ccd retrospect` を追加。`ccd` の dispatch 履歴・`result_*.md`・直近 git 履歴をエージェントに読ませ、「spec → dispatch → fix ループのどこが非効率か」を**定性的に分析**させ、改善提案を `_ai_workspace/retro/proposals/<slug>.md` に 1 ファイルずつ出力する最初のフィードバック経路。集計データを「読み返す」経路を作り、`ccd` 自身の改善ループの種にする。提案の自動 spec 化・自動 dispatch はしない (human-in-the-loop)。
+
+### Added
+
+- **`ccd/retrospect.py` 新モジュール** — `run_retrospect(runner, *, repo, runs_dir, limit, retro_dir)`。証拠収集 (`collect_evidence` → run JSON 群 + `result_*.md` + `git log --oneline -N` & 直近 `--stat`) → 決定的な事実サマリ算出 (`FactualSummary`: dispatch 総数・status 内訳・failure_category 内訳・result ファイル数・直近 commit 数) → レビュー用 spec 生成 (`_ai_workspace/retro/retro_spec.md`) → `AgentRunner.run` 経由でエージェントに分析させる → エージェントが書いた `_ai_workspace/retro/retro_NNN.md` と `_ai_workspace/retro/proposals/*.md` の有無で成否を判定。`retro_NNN.md` の番号は既存ファイルの最大値+1 で自動採番。
+- **`ccd retrospect` サブコマンド (6 つ目)** — `--repo` / `--runs-dir` / `--limit N`。`main()` への runner 注入は既存 dispatch/chain と同じ形 (テストで `FakeAgentRunner` を渡せる)。生成された review spec / retro 本体 / 各 proposal のパスを stdout に表示する。
+- **`tests/test_retrospect.py` — 13 件** — 証拠収集 / レガシー `logs/*_run.json` 対応 / 事実サマリの決定性 / 生成された review spec の内容 (証拠パス + §3 制約文 + 出力先) / エージェントが retro+proposals を書いたとき success=True / proposals 複数ファイル対応 / `retro_NNN` 自動採番 / **履歴ゼロでも graceful (runner を呼ばず success=False + halt_reason)** / 失敗ケース (retro 不在 / proposal 不在) / CLI 経由の end-to-end / `--runs-dir` / `--limit` フラグ。
+
+### Changed
+
+- `pyproject.toml` / `ccd/__init__.py` version `0.3.0` → `0.4.0`（新機能 = minor bump）。
+- `tests/test_smoke.py::test_version_is_030` → `test_version_is_040`、`__version__ == "0.4.0"` を assert。
+
+### Constraints (spec §3)
+
+retrospect は提案を出すだけ。`_ai_workspace/bridge/inbox/` への自動投入も自動 dispatch も**しない**。生成される提案は spec の "種" (フル spec は書かない、grill-me 規律を保つ)。すべての指摘は特定の run/result/commit を証拠として引用させる (生成された review spec に「証拠アンカー必須」「捏造しない」を明記)。コアロジック (`ccd/{models,protocol,dispatch,chain,integrate,metrics,dashboard,run_writer,retry,backfill}.py`) は再利用のみで無変更 — `AgentRunner` 抽象を再利用し、retrospect は薄いオーケストレーション層に留めた。
+
 ## [0.3.0] — 2026-05-23
 
 v1.7 — spec_011。リトライ／自己修復ループを完成させた。`DispatchRecord.attempts` と `metrics.retry_recovery_rate` は spec_002 以来「設計済みだが未配線」だったが、dispatch が失敗したら失敗内容（特に smoke = ruff/pytest の出力）を次の試行のプロンプトに食わせ、エージェント自身に直させるループを動かす。
