@@ -29,6 +29,7 @@ from ccd import __version__
 from ccd.agent import AgentRunner, ClaudeCodeRunner
 from ccd.chain import run_chain
 from ccd.dashboard import render_to as render_dashboard_to
+from ccd.discover import MutationRunner, MutmutRunner, run_discovery
 from ccd.integrate import DEFAULT_SMOKE_COMMANDS
 from ccd.metrics import aggregate, render_report
 from ccd.models import DispatchRecord, DispatchStatus
@@ -230,6 +231,33 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    p_discover = sub.add_parser(
+        "discover",
+        help=(
+            "Run a mutation-testing discovery batch against ccd's code "
+            "(v2 Phase 1, human-triggered)."
+        ),
+        description=(
+            "Invoke the mutation tool (mutmut by default), normalize its "
+            "raw output into stable Mutant records, compute a deterministic "
+            "factual summary, split survivors against "
+            "_ai_workspace/discover/blocklist.txt, and write a discovery "
+            "report (_ai_workspace/discover/discover_NNN.md + .json). "
+            "Phase 1 only — no auto-fix, no scheduler. The report surfaces "
+            "test gaps for a human to read."
+        ),
+    )
+    p_discover.add_argument("--repo", type=Path, default=None)
+    p_discover.add_argument(
+        "--paths",
+        nargs="+",
+        default=None,
+        help=(
+            "Paths to mutate (default: ccd). Passed through to the mutation "
+            "tool — use to narrow a discovery batch onto one module."
+        ),
+    )
+
     p_reconcile = sub.add_parser(
         "reconcile",
         help="Reconcile orphan RUNNING records to HALTED + INTERRUPTED.",
@@ -252,6 +280,7 @@ def main(
     argv: Sequence[str] | None = None,
     *,
     runner: AgentRunner | None = None,
+    mutation_runner: MutationRunner | None = None,
     smoke_commands: Sequence[Sequence[str]] | None = None,
 ) -> int:
     parser = build_parser()
@@ -267,6 +296,8 @@ def main(
         return _cmd_dashboard(args)
     if args.command == "retrospect":
         return _cmd_retrospect(args, runner)
+    if args.command == "discover":
+        return _cmd_discover(args, mutation_runner)
     if args.command == "reconcile":
         return _cmd_reconcile(args)
 
@@ -409,6 +440,37 @@ def _cmd_retrospect(
     if not result.success:
         print(f"retrospect halted: {result.halt_reason}", file=sys.stderr)
         return 1
+    return 0
+
+
+def _cmd_discover(
+    args: argparse.Namespace,
+    runner: MutationRunner | None,
+) -> int:
+    repo = _resolve_repo(args.repo)
+    paths = list(args.paths) if args.paths else None
+    runner = runner if runner is not None else MutmutRunner()
+
+    result = run_discovery(runner, repo=repo, paths=paths)
+
+    if not result.success:
+        print(f"discovery halted: {result.halt_reason}", file=sys.stderr)
+        return 1
+
+    assert result.report_md_path is not None
+    assert result.report_json_path is not None
+    print(f"discovery report: {result.report_md_path}")
+    print(f"discovery json:   {result.report_json_path}")
+    summary = result.summary
+    print(
+        "factual summary: "
+        f"mutants={summary.mutants_total} "
+        f"survived={summary.survived_total} "
+        f"actionable={summary.actionable_total} "
+        f"blocklisted={summary.blocklisted_total}"
+    )
+    for m in result.actionable_mutants:
+        print(f"actionable: {m.file}:{m.line} — {m.mutation}")
     return 0
 
 
