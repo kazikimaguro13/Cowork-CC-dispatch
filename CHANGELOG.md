@@ -2,6 +2,27 @@
 
 本プロジェクトの注目すべき変更を記録する。フォーマットは [Keep a Changelog](https://keepachangelog.com/) に準ずる。
 
+## [0.5.0] — 2026-05-24
+
+v2 Phase 1 第一弾 — spec_013。**ミューテーションテスト・チャンネルを `ccd discover` サブコマンド**として実装。`ccd` 自身のコードに小さな改変 (mutant) を仕込み、テストが捕まえるか試す。生き残った改変 = テストの隙間を、**安定な署名 (`file:line:mutation`) 付き**で発見レポートに列挙する。スケジューラ・他チャンネル (敵対的入力／AI推論)・自律修正は含まない (後続 spec / Phase 2)。手で叩いて発見の信号対雑音比を実データで見るための最小スライス。
+
+### Added
+
+- **`ccd/discover.py` 新モジュール** — `run_discovery(runner, *, repo, paths, discover_dir) -> DiscoveryResult`。注入された `MutationRunner` でミューテーションツールを起動 → `Mutant` リストに正規化 → 決定的な事実サマリ算出 (`DiscoverySummary`: mutant 総数 / status 内訳 / 生存数 / ファイル別生存数 / blocklist 内訳 / actionable 内訳) → `_ai_workspace/discover/blocklist.txt` で actionable / blocklisted に分割 → 発見レポート (`_ai_workspace/discover/discover_NNN.md` + `.json`) を書き出す。
+- **`MutationRunner` プロトコル + `MutmutRunner` (subprocess) + `FakeMutationRunner` (テスト用)** — `AgentRunner` と同型の差し替え可能境界。`MutmutRunner` は `mutmut run` → `mutmut results` → 各 ID に対して `mutmut show <id>` でファイル・行・改変内容を抽出し、`(file, line, mutation)` の**安定署名**を持つ `Mutant` を返す。mutmut 不在・タイムアウト・パース失敗は `MutationRunOutcome.error` を立てて graceful (`run_discovery` 側でクラッシュなく halt)。
+- **`ccd discover` サブコマンド (7 つ目)** — `--repo` / `--paths`。`main()` への mutation_runner 注入は dispatch/chain/retrospect と同じ形 (テストで `FakeMutationRunner` を渡せる)。生成された discover_NNN.md / .json のパス、事実サマリの要点、actionable mutant の `file:line` 一覧を stdout に表示。
+- **`tests/test_discover.py` — 19 件** — 発見レポート生成 / 事実サマリの決定性 / actionable リスト出力 / **blocklist 適用 (signature マッチで actionable から blocklisted に移る)** / blocklist 不在の graceful 処理 / `discover_NNN` 自動採番 (既存ファイル温存) / discover ディレクトリ自動作成 / mutant ゼロ / 生存ゼロ / **mutation tool 失敗の graceful halt** / `--paths` フラグ配線 / CLI 経由 end-to-end / mutmut 出力パーサ (results・show、ID リスト・範囲・unified diff)。
+- **`[project.optional-dependencies] maintain`** — `mutmut>=2.4,<3` を新規依存グループとして追加。dev (ruff/pytest) と分けた。`pip install -e ".[maintain]"` で実行可能 (`ccd discover` 実行時のみ必要、コード import・`pytest` は mutmut 無しで通る)。
+
+### Changed
+
+- `pyproject.toml` / `ccd/__init__.py` version `0.4.0` → `0.5.0` (新機能 = minor bump)。
+- `tests/test_smoke.py::test_version_is_040` → `test_version_is_050`、`__version__ == "0.5.0"` を assert。
+
+### Constraints (spec §3)
+
+`ccd discover` は発見のみ。**自律修正は一切しない** (Phase 2)。スケジューラ・他チャンネル (敵対的入力／AI推論) も含まない (後続 spec)。生成される actionable リストは「テストの隙間の候補」であり、blocklist への追記は **人手** (エージェントによるトリアージ・自動追記は Phase 2)。mutmut 不在・実行失敗・パース失敗は graceful (クラッシュ・トレースバック禁止)。コアロジック (`ccd/{models,protocol,dispatch,chain,integrate,metrics,dashboard,run_writer,retry,backfill,agent,retrospect}.py`) は再利用のみで無変更 — discover は薄いオーケストレーション + 注入可能 runner で完結。
+
 ## [0.4.0] — 2026-05-24
 
 v1.8 — spec_012。`ccd retrospect` を追加。`ccd` の dispatch 履歴・`result_*.md`・直近 git 履歴をエージェントに読ませ、「spec → dispatch → fix ループのどこが非効率か」を**定性的に分析**させ、改善提案を `_ai_workspace/retro/proposals/<slug>.md` に 1 ファイルずつ出力する最初のフィードバック経路。集計データを「読み返す」経路を作り、`ccd` 自身の改善ループの種にする。提案の自動 spec 化・自動 dispatch はしない (human-in-the-loop)。

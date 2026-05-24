@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cowork-cc-dispatch"
-version = "0.4.0"
+version = "0.5.0"
 description = "Orchestration substrate for one AI agent to dispatch work to another (Cowork → Claude Code)."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -18,6 +18,12 @@ dependencies = [
 dev = [
   "ruff>=0.5",
   "pytest>=8",
+]
+maintain = [
+  # `ccd discover` shells out to mutmut (v2 Phase 1 — spec_013). Pinned to
+  # 2.x because mutmut 3.x rewrote the CLI shape; `MutmutRunner._show`
+  # parses 2.x's `mutmut show` unified-diff output.
+  "mutmut>=2.4,<3",
 ]
 
 [project.scripts]
