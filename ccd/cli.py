@@ -261,7 +261,9 @@ def build_parser() -> argparse.ArgumentParser:
             f"Discovery channel (default: {DEFAULT_CHANNEL}). "
             "`mutation` runs mutmut against ccd's tests (spec_013). "
             "`adversarial` feeds CCD's parsers a curated catalog of broken "
-            "inputs and reports any ungraceful crash (spec_015)."
+            "inputs and reports any ungraceful crash (spec_015). "
+            "`ai` asks an AI agent to read ccd/ and surface semantic concerns "
+            "(spec_016, report-only — claims, not verified facts)."
         ),
     )
     p_discover.add_argument(
@@ -313,7 +315,7 @@ def main(
     if args.command == "retrospect":
         return _cmd_retrospect(args, runner)
     if args.command == "discover":
-        return _cmd_discover(args, mutation_runner)
+        return _cmd_discover(args, mutation_runner, runner)
     if args.command == "reconcile":
         return _cmd_reconcile(args)
 
@@ -461,7 +463,8 @@ def _cmd_retrospect(
 
 def _cmd_discover(
     args: argparse.Namespace,
-    runner: MutationRunner | None,
+    mutation_runner: MutationRunner | None,
+    agent_runner: AgentRunner | None,
 ) -> int:
     repo = _resolve_repo(args.repo)
     channel = getattr(args, "channel", DEFAULT_CHANNEL)
@@ -471,7 +474,8 @@ def _cmd_discover(
         channel,
         repo=repo,
         paths=paths,
-        mutation_runner=runner,
+        mutation_runner=mutation_runner,
+        agent_runner=agent_runner,
     )
 
     if not result.success:
@@ -496,21 +500,34 @@ def _cmd_discover(
             print(f"actionable: {m.file}:{m.line} — {m.mutation}")
         return 0
 
-    # adversarial channel
+    if channel == "adversarial":
+        summary = result.summary
+        print(
+            "factual summary: "
+            f"parsers={len(summary.parsers)} "
+            f"cases={summary.cases_total} "
+            f"evaluations={summary.evaluations_total} "
+            f"graceful={summary.graceful_total} "
+            f"ungraceful={summary.ungraceful_total}"
+        )
+        for f in result.findings:
+            print(
+                f"ungraceful: {f.parser} × {f.case_name} — "
+                f"{f.exception_type}: {f.exception_message}"
+            )
+        return 0
+
+    # ai channel (spec_016) — report-only, claims not facts.
     summary = result.summary
+    print("note: ai channel is report-only — findings are claims, not verified facts")
     print(
         "factual summary: "
-        f"parsers={len(summary.parsers)} "
-        f"cases={summary.cases_total} "
-        f"evaluations={summary.evaluations_total} "
-        f"graceful={summary.graceful_total} "
-        f"ungraceful={summary.ungraceful_total}"
+        f"target={summary.target_package} "
+        f"files={summary.files_total} "
+        f"findings={summary.findings_total} (non-deterministic)"
     )
     for f in result.findings:
-        print(
-            f"ungraceful: {f.parser} × {f.case_name} — "
-            f"{f.exception_type}: {f.exception_message}"
-        )
+        print(f"finding: {f.location} — {f.concern}")
     return 0
 
 

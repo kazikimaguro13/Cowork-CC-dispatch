@@ -2,6 +2,35 @@
 
 本プロジェクトの注目すべき変更を記録する。フォーマットは [Keep a Changelog](https://keepachangelog.com/) に準ずる。
 
+## [0.7.0] — 2026-05-24
+
+v2 Phase 1 第三（最後）の発見チャンネル — spec_016。spec_013/014 のミューテーション・チャンネル（緑のテストが見ていない隙間を出す）、spec_015 の敵対的入力チャンネル（壊れた入力での例外漏洩を出す）に続き、**AI推論による発見チャンネル**を `ccd discover --channel ai` として追加。エージェントに `ccd/` のソースを読ませ、「ここ危なくない？」「このエラー処理抜けてない？」「関数名と実装が乖離してない？」といった**意味的・意図的な懸念**を所見として挙げさせる。機械的な道具が原理的に見つけられない種類のバグを拾える。
+
+**ただし論点3で確定したとおり、AI推論の出力は主張でありオラクルを持たない**（再現性がなく、機械的にバグと証明できない）。よって **自律ループの引き金にはしない・報告専用チャンネル**とする。所見は人間が判断する。ミューテーション／敵対的入力が「事実→自律ループ」なのに対し、AI推論は「主張→人間判断」。信頼度で経路を分けるのが本チャンネルの設計思想。`docs/DESIGN.md §9.4` の発見3チャンネル構成の完結。
+
+### Added
+
+- **`ccd/ai_review.py` 新モジュール** — `run_ai_review(runner, *, repo, discover_dir) -> AIReviewResult`。`ccd/retrospect.py` と同型の構造を踏襲: (1) `ccd/*.py` を決定的に列挙（事実アンカー）、(2) `discover_NNN` 採番を取得（mutation/adversarial と共有）、(3) 自己完結したレビュー用 spec を生成（§2-3 の制約全部入り）、(4) `AgentRunner.run` を直接呼ぶ（`dispatch_one` の分類は通さない — `retrospect.py` 流、commit が無い分析タスクなので）、(5) 所見ファイル群 (`*.md`) を glob → パース → 集約、(6) `discover_NNN.md` + `.json` を書く。`FakeAgentRunner` でテスト可能、実 `claude` を呼ばない。
+- **データクラス** — `AIReviewFinding(slug, location, concern, why_risky, source_file)` / `AIReviewSummary(target_package, files_reviewed, files_total, findings_total)` / `AIReviewResult(success, report_md_path, report_json_path, summary, findings, review_spec_path, findings_dir, halt_reason, runner_invoked, raw_finding_paths)`。フィールド名は spec_013 の `DiscoveryResult` / spec_015 の `AdversarialResult` と共通の `success` / `report_md_path` / `report_json_path` / `halt_reason` を揃え、CLI が 3 チャンネルを一様に扱える形に。
+- **所見ファイル受け渡し方式** — エージェントが `_ai_workspace/discover/ai_review/findings_{NNN}/<slug>.md` に **1 所見 = 1 ファイル**で書く（`retrospect` の `proposals/` と同じ発想）。各ファイルは `- **Location**: \`ccd/<file>.py:<line>\`` / `- **Concern**: ...` / `- **Why risky**: ...` の bullet 形式。CCD 側は line-by-line regex で 3 フィールドを抽出。Location 欠落の所見は **落とさず `(unspecified)` で surfacing** — レビュー用 spec が「証拠アンカー必須」と命じても、エージェントが破った時は人間に見せて判断させるのが正直。
+- **レビュー用 spec の制約 (spec_016 §2-3)** — エージェントへの指示に「**証拠アンカー必須**（`ccd/<file>.py:<line>` 引用、汎用アドバイス禁止）」「**捏造しない**（実在するコードだけを根拠）」「**報告のみ**（コード修正・テスト追加・spec 化禁止）」「**触れてよい範囲**（読むのは `ccd/`、書くのは `findings_dir/` だけ）」を全部本文に含める。spec body は dispatch プロンプトでそのまま回せる自己完結形式。
+- **レポートでの視覚的区別 (spec_016 §2-2)** — `discover_NNN.md` 冒頭に `> ⚠️ **報告専用チャンネル**` の引用ブロック、§1 で `非決定的` を明示、§3 に「他チャンネルとの違い」セクション（mutation = 事実→自律修正可、adversarial = 事実→自律修正可、ai = 主張→人間判断）を含めて、朝レポートで開いた人間が一目で区別できる形に。
+- **決定性についての正直さ (spec_016 §2-4)** — 対象パッケージ（`ccd`）/ ファイル一覧 / ファイル数は **決定的に Python で算出**し事実サマリに記載。所見件数は記録するが「非決定的・再実行で変わりうる」と明示。捏造しない — ゼロ件は捏造で埋めない。
+- **`ccd discover --channel ai`** — `ccd/cli.py` の `discover` サブパーサに `ai` を選択肢として追加（既定 `mutation` 不変、`adversarial` も不変）。`run_channel` に `agent_runner: AgentRunner | None = None` パラメータを追加して AI チャンネル経路で注入できるように。`cli.main()` が `runner`（既存の `AgentRunner`）を `_cmd_discover` 経由で `run_channel` に渡す。
+- **`ccd/discover.py:CHANNEL_AI`** 定数追加、`SUPPORTED_CHANNELS` を `(mutation, adversarial, ai)` に拡張。
+- **`tests/test_ai_review.py`** — 22 件のテスト。レビュー用 spec が §2-3 制約全部入り（証拠アンカー / 捏造禁止 / 報告のみ）であること、ファイル一覧が spec body に埋め込まれること、`FakeAgentRunner` で end-to-end 動作、所見が `(location, slug)` で決定的にソートされること、所見ゼロ件 / エージェントが何も書かなかった場合の graceful、`ccd/` が無い repo での graceful halt、Location 欠落所見の `(unspecified)` surfacing、複数行 `Why risky` の保存、`discover_NNN` 採番が他チャンネルと共有、findings dir が `_ai_workspace/discover/ai_review/findings_NNN/` 配下、CLI `--channel ai` end-to-end、`--channel mutation`（既定）と `--channel adversarial` が不変、不正 `--channel` 拒否、`--paths` が ai では silently 無視、dataclass frozen。
+
+### Changed
+
+- `pyproject.toml` / `ccd/__init__.py` version `0.6.0` → `0.7.0`（**新チャンネル = minor bump**、spec §2-7）。
+- `tests/test_smoke.py::test_version_is_060` → `test_version_is_070`、`__version__ == "0.7.0"` を assert。
+- **`ccd/discover.py:run_channel`** — `agent_runner` パラメータを追加、`channel == "ai"` 経路を追加（lazy import で `ccd.ai_review.run_ai_review` を呼ぶ）。既存の `mutation` / `adversarial` 経路は完全に不変。
+- **`ccd/cli.py:_cmd_discover`** — シグネチャ `(args, runner)` → `(args, mutation_runner, agent_runner)` に変更（内部関数なので外部影響なし）、`run_channel` に `agent_runner` を渡す、表示分岐に `ai` チャンネル節を追加（`target=` / `files=` / `findings= (non-deterministic)` ＋ 各 finding の `location — concern`）。spec_013 / 015 の mutation / adversarial 経路の stdout フォーマットは**完全に保持**。`--channel` の help string に `ai` 説明を追記。
+
+### Constraints (spec §3)
+
+`ccd discover --channel ai` は**報告専用**。発見されたクラッシュ・隙間とは違い、AI 推論の所見は**自律修正の引き金にしない**（人間判断必須）。`_ai_workspace/bridge/inbox/` への自動投入、自動 spec 化、自動 dispatch は**一切しない**（`ccd retrospect` の human-in-the-loop 規律と同じ）。spec_013 / 014 / 015 のミューテーション・敵対的入力チャンネルの挙動・出力・既存テストは全件 green を維持。`AgentRunner` 抽象は再利用するだけで変更しない（`FakeAgentRunner` でテスト、実 `claude` は呼ばない）。レビュー用 spec が課す制約（証拠アンカー必須 / 捏造禁止 / コード修正禁止）はプロンプト本文に明示的に含まれる。すべて追加のみ — 既存サブコマンド・関数の挙動は不変。
+
 ## [0.6.0] — 2026-05-24
 
 v2 Phase 1 第二の発見チャンネル — spec_015。spec_013 / 014 で実装した**ミューテーション・チャンネル**（緑のテストが見ていない隙間を出す）に並べて、**敵対的入力チャンネル**を `ccd discover --channel adversarial` として追加。「現実に起きうる壊れた入力で CCD のパーサが無様にクラッシュする」箇所を発見する（`docs/DESIGN.md §9.4`）。CCD は spec / result / run JSON を大量に読むのでパース境界が広く、緑のテストでは観測しにくい頑健性バグを、**吟味済み固定リスト**を本物のパーサに食わせて炙り出す。自律修正は Phase 2 — 本 spec は発見のみ。
