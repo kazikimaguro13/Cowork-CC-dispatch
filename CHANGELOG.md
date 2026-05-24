@@ -2,6 +2,37 @@
 
 本プロジェクトの注目すべき変更を記録する。フォーマットは [Keep a Changelog](https://keepachangelog.com/) に準ずる。
 
+## [0.8.0] — 2026-05-24
+
+v2 Phase 1 の人間向け成果物 — spec_017。spec_013/014（ミューテーション）/ spec_015（敵対的入力）/ spec_016（AI推論）の発見3チャンネルが個別に出す `_ai_workspace/discover/discover_NNN.{md,json}` を **1枚の朝レポート**に集約するレンダラ `ccd brief` を追加。`docs/DESIGN.md §9.6` の朝レポート構造を Phase 1（発見のみ・自律修正なし、§9.7）に適応した6セクション (A〜F) の Markdown を `_ai_workspace/nightly/report_YYYY-MM-DD.md` に出す。
+
+**本サブコマンドは純粋なレンダラ** — 発見チャンネル自体は走らせない（フル・ミューテーションの数時間を朝レポート生成に焼き込まない；チャンネルを走らせて朝レポートを生成する一連の自動化はスケジューラ spec_019 の責務）。集約・要約・描画のみを行い、Phase 1 不変条件「**自律修正していない**」をレポート §F に明示する。機械的発見（事実）と AI推論の所見（主張）は §B / §C で視覚的に明確に区別。
+
+### Added
+
+- **`ccd/brief.py` 新モジュール** — `run_brief(*, repo, inputs, brief_dir, discover_dir, today) -> BriefResult`。(1) `_ai_workspace/discover/` を走査して各チャンネル (`mutation` / `adversarial` / `ai`) の **最新の `discover_NNN.json`** を 1 件ずつ拾う（`inputs` でテスト用に明示注入も可）、(2) 拾ったペイロード群からチャンネル横断の決定的サマリ (`BriefSummary`) を Python で算出、(3) `_ai_workspace/nightly/report_YYYY-MM-DD.md` に 6 セクションの朝レポートを書く、(4) `BriefResult(success, report_path, summary, channels, halt_reason)` を返す。
+- **データクラス** — `BriefResult` / `BriefSummary` / `ChannelReport`。`BriefSummary` は `channels_picked` / `channels_missing` / `mutation_actionable` / `adversarial_ungraceful` / `ai_findings` / `mechanical_findings_total` の 6 フィールド — 機械的発見（事実）と AI 所見（主張）を**別フィールドに分離**して、サマリ計算でうっかり主張を事実に混ぜないようにしている。
+- **朝レポートの 6 セクション (spec_017 §2-2、Phase 1 適応版)**:
+  - **A. 一行判定** — 機械的発見 N 件、AI 所見 M 件（報告専用）、一部チャンネル未実行の旨を 1 行で。
+  - **B. 機械的チャンネルの発見** — `file:line` 形式の actionable mutation + パーサ × ケースの ungraceful 例外漏洩を**事実**として列挙。
+  - **C. AI推論の所見 (報告専用)** — 冒頭 `> ⚠️` 引用ブロックで「主張 / 検証済み事実ではない / 非決定的 / 人間判断必須 / 自律修正の引き金にしない」を明示。§B と視覚的に明確に区別。
+  - **D. halt・スキップ項目** — 未実行のチャンネル、`halt_reason` を持つチャンネル。**中身がある時だけ現れる**。
+  - **E. バックログ・推移** — 機械的発見の合計件数と AI 所見数（参考）、採用した `discover_NNN.json` パス一覧。
+  - **F. 起きなかったこと (正直さの節)** — **「Phase 1 は自律修正していない」を常に明示**。AI 所見を引き金にしないこと、`bridge/inbox/` への自動投入をしないこと、brief 生成では発見チャンネル自体を走らせていないことを明文化。
+- **チャンネル属性の検出** — `adversarial` / `ai` の `discover_NNN.json` は top-level `"channel"` キーを持つ（spec_015 / 016 の実装）。`mutation` チャンネル (spec_013) は **`channel` キーを持たない**ので、`summary.tool` ＋ `actionable: list` の組み合わせで shape 検出。spec_017 §3「`ccd/{discover,adversarial,ai_review}.py` のコアロジックを変更しない」を守るため、JSON 側にフィールドを足すのではなく brief 側で属性を補う方針。
+- **`ccd brief` サブコマンド (8 つ目)** — `--repo`（既定 cwd、`_resolve_repo`）/ `--inputs`（任意、明示する `discover_NNN.json` パス群）。stdout に `morning report: <path>` / `factual summary: mechanical=N (mutation=A, adversarial=B) ai=M (report-only)` / 未実行チャンネルがあれば `channels not yet executed: ...` を出す。サブコマンド名は `report` が `ccd report`（メトリクス）で使用済みのため `brief` に。
+- **`tests/test_brief.py`** — `BriefResult` 戻り値 / 6 セクション A〜F 全部が含まれる / 機械的発見が `file:line` で列挙される / AI 所見が「報告専用・主張」を明示して §B と区別される / §F に「Phase 1 は自律修正していない」が含まれる / 同じ入力で `BriefSummary` が決定的 / `today` 注入で出力ファイル名が `report_YYYY-MM-DD.md` / 一部チャンネル未実行が graceful / 全チャンネル未実行も graceful / ゼロ件発見でも簡潔に出る / mutation channel が `channel` キー無しでも shape 検出される / 同じチャンネルで複数 seq がある場合は最新だけが採用される / `inputs=` 引数で明示注入できる / `ccd brief` CLI が end-to-end 動作 / `--inputs` フラグ動作。
+
+### Changed
+
+- `pyproject.toml` / `ccd/__init__.py` version `0.7.0` → `0.8.0`（**新サブコマンド = minor bump**、spec §2-5）。
+- `tests/test_smoke.py::test_version_is_070` → `test_version_is_080`、`__version__ == "0.8.0"` を assert。
+- **`ccd/cli.py`** — `brief` サブパーサ追加（`--repo` / `--inputs`）、`main()` のディスパッチに `if args.command == "brief":` 分岐、`_cmd_brief` ハンドラを追加。既存サブコマンド (`dispatch` / `chain` / `report` / `dashboard` / `retrospect` / `discover` / `reconcile`) の挙動・引数・stdout は完全に保持。
+
+### Constraints (spec §3)
+
+`ccd brief` は**純粋なレンダラ** — 発見チャンネル (`ccd discover`) を**走らせない**。`mutmut` / `git` / `subprocess` を使わない。`discover_NNN.{md,json}` を**読むだけ**で、`ccd/{discover,adversarial,ai_review}.py` を含むコアロジックには 1 行も触らない（spec §3）。`_ai_workspace/bridge/inbox/` への自動投入も、自動 spec 化も、自動 dispatch もしない。Phase 1 不変条件「**発見のみ・自律修正なし**」を §F で明示。既存サブコマンドの挙動は不変。
+
 ## [0.7.0] — 2026-05-24
 
 v2 Phase 1 第三（最後）の発見チャンネル — spec_016。spec_013/014 のミューテーション・チャンネル（緑のテストが見ていない隙間を出す）、spec_015 の敵対的入力チャンネル（壊れた入力での例外漏洩を出す）に続き、**AI推論による発見チャンネル**を `ccd discover --channel ai` として追加。エージェントに `ccd/` のソースを読ませ、「ここ危なくない？」「このエラー処理抜けてない？」「関数名と実装が乖離してない？」といった**意味的・意図的な懸念**を所見として挙げさせる。機械的な道具が原理的に見つけられない種類のバグを拾える。
