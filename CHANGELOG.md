@@ -2,6 +2,52 @@
 
 本プロジェクトの注目すべき変更を記録する。フォーマットは [Keep a Changelog](https://keepachangelog.com/) に準ずる。
 
+## [0.9.1] — 2026-05-25
+
+`ccd discover --channel mutation` の **0-killed 偽 survivor 問題**を修正 — spec_019。`ccd/` 全体に対するフル・ミューテーション実走で 1274 mutant 中 killed=0 / survived=1273 / suspicious=1 という結果が出ていた。309 件のテストが通っているコードベースで撃破率0%は原理的にありえず、1273件の "actionable survivor" は本物のテスト隙間ではなくツール統合のアーティファクトで、**発見レポートは丸ごと信用できない**状態だった。
+
+### 根本原因 (PEP 660 editable install + mutmut の出力仕様の2つが噛み合った)
+
+1. **PEP 660 editable install の MetaPathFinder** — `.venv/lib/python3.12/site-packages/__editable___cowork_cc_dispatch_0_5_0_finder.py` が `sys.meta_path` に居座り、`MAPPING = {'ccd': '/home/.../Cowork-CC-dispatch/ccd'}` で**ライブ・リポジトリの `ccd/`** を指していた。spec_014 の `_isolated_clone` ＋ `PYTHONPATH` 先頭詰めでは、PYTHONPATH ベースの `PathFinder` 解決より MetaPathFinder が優先される場面があるため、mutmut が clone 側に書いたミューテーションをテストが一切観測しない。
+2. **`mutmut results` は killed mutant を出力しない** — actionable な survivor / timeout のみ列挙する仕様。spec_014 の `_parse_mutmut_results` テキストパーサは killed セクションが存在しないため `killed=0` を返してしまい、たとえ実際にはテストが多数 mutant を撃破していても CCD は「全部 survived」と報告する経路があった (`mutmut results` だけを信じるとそうなる)。
+
+### Fixed
+
+- **`ccd/discover.py:_provision_iso_venv` 新ヘルパ** — clone の中に専用 venv (`.ccd-iso-venv`) を `python -m venv` で建て、`pip install -e <clone> mutmut pytest` で **clone 自身** を PEP 660 editable install + mutmut/pytest を投入する。これによって iso-venv 内で `import ccd` を解決するとき、新しい editable finder の MAPPING が clone の `ccd/` を指す ── mutmut/pytest がこの iso-venv の Python で走れば、テストは clone 側のミューテーションされた `ccd` を import する (ライブ・リポジトリの finder と競合せず一意に解決される)。`--system-site-packages` は採用せず — このフラグは「親 venv ではなくシステム Python」の site-packages を継承するため mutmut/pytest が iso-venv で見つからなくなる (`pip` の wheel キャッシュが効くので再インストールのコストは数秒〜十数秒で、数時間の discover バッチに対して許容範囲)。
+- **`ccd/discover.py:MutmutRunner._resolve_binary`** — iso-venv 内の `mutmut` スクリプト (`<clone>/.ccd-iso-venv/bin/mutmut`) を優先解決し、親 venv の `mutmut` (= ライブ・リポジトリの Python に繋がる) を絶対に踏まない。フォールバックは `shutil.which` で従来挙動を保つ。
+- **`ccd/discover.py:_workspace_env(iso_venv_bin=...)`** — mutmut の既定ランナー `python -m pytest -x --assert=plain` は `python` を `$PATH` で解決する。iso-venv の `bin/` を先頭詰めし、`VIRTUAL_ENV` も合わせて差し替えることで、サブプロセスの `python` が iso-venv の Python に確実に解決される。
+- **`ccd/discover.py:_collect_killed_mutants_from_cache`** — `mutmut results` テキストパース後に **mutmut の SQLite キャッシュ `.mutmut-cache`** から `ok_killed` ステータスの mutant 全件を `SourceFile` / `Line` テーブルと join して直接読み、`Mutant(status="killed")` レコードとして mutant リストに追加する。これで `status_breakdown` に正しい killed 数が乗り、カナリア検知が真の 0-killed 状態だけに反応する。
+- **`ccd/discover.py:_detect_broken_mutation_setup` カナリア検知 (spec_019 §2-2)** — `run_discovery` が summary を組み立てた後、**mutants_total ≥ 5 かつ killed_total == 0 なら halt** する。`success=False` / `halt_reason="mutation setup is broken: canary mutant survived — 0 killed out of N mutants ..."` を返し、**discover_NNN.md / .json は書かない** (0-killed の無意味な発見レポートは下流の brief / dashboard / 将来の auto-fix loop に渡してはいけない)。309 件のテストが通っているコードベースで「5+ mutant 全部 survived」は構造的に不可能 — 「偶然 0-killed」が起こり得ない閾値で偽陽性を抑え、spec_019 の再発を機械的に防ぐ。
+- **再実走確認** — `ccd discover --paths ccd/protocol.py` をフル実走し、mutmut が **131 mutant 中 killed=106 / survived=25 / timeout=0** を出すこと (撃破率 **~81%**) を確認。spec_019 以前の「kill=0 / survived=N」状態から完全に脱した (`_ai_workspace/discover/discover_003.{md,json}` に証跡)。
+
+### Changed
+
+- `pyproject.toml` / `ccd/__init__.py` version `0.9.0` → `0.9.1` (**バグ修正 = patch bump**、spec §2-4)。
+- `tests/test_smoke.py::test_version_is_090` → `test_version_is_091`、`__version__ == "0.9.1"` を assert。
+- **`ccd/discover.py:_ISOLATION_IGNORE`** に `_ISO_VENV_DIR_NAME` (= `.ccd-iso-venv`) を追加 — 万一 clone が clone 内に nested される運用が将来生まれた時に古い iso-venv が複製されないための防御 (現状は無害)。
+
+### Tests added (spec_019)
+
+- `test_canary_halts_when_many_mutants_but_zero_killed` ── 1273/0 シナリオを再現し、`success=False` / `halt_reason` に `"mutation setup is broken"` ＋ `"0 killed out of 1273"`、md/json が書かれていないことを assert。
+- `test_canary_passes_when_at_least_one_killed` ── 1 件でも killed があればカナリアは反応しない (撃破率0%が **構造的** な場合だけ halt)。
+- `test_canary_does_not_fire_below_threshold` ── `CANARY_MIN_MUTANTS_FOR_HALT` 未満の小さい run は素直に report を出す (ごく少数 mutant が等価変換で全て survived するケースを潰さない)。
+- `test_canary_does_not_fire_for_zero_mutants` ── そもそも mutant が出なかった graceful run は halt しない。
+- `test_detect_broken_mutation_setup_pure_function` ── カナリア述語の閾値挙動を直接 unit-test (閾値が将来ズレないよう assertion で固定)。
+- `test_cli_canary_halt_surfaces_through_discover` ── CLI で `rc=1` / stderr に `discovery halted` ＋ `mutation setup is broken` が出ることを end-to-end で証明。
+- `test_workspace_env_prepends_iso_venv_bin_to_path` / `test_workspace_env_without_iso_venv_does_not_touch_path` ── `$PATH` 先頭詰めの挙動を pin。
+- `test_provision_iso_venv_creates_clone_local_python` ── 統合テスト: 実際に `python -m venv` ＋ `pip install -e .` を走らせ、iso-venv の Python が clone の `ccd` を import することを確認 (PEP 660 finder 競合の回帰防止)。
+- `test_provision_iso_venv_wraps_venv_failure` / `test_mutmut_runner_returns_error_when_iso_venv_provisioning_fails` ── provisioning 失敗時に `IsoVenvProvisioningError` → `MutationRunOutcome.error` → `run_discovery` halt の経路を pin。
+- `test_collect_killed_mutants_from_cache_reads_killed_rows` / `test_collect_killed_mutants_from_cache_missing_returns_empty` / `test_collect_killed_mutants_from_cache_bad_schema_returns_empty` ── SQLite キャッシュリーダの3経路 (正常 / キャッシュ無し / 壊れたファイル) を pin。
+- 既存の `test_mutmut_runner_subprocess_targets_isolated_clone_not_live_repo` / `test_mutmut_runner_isolation_survives_real_git_writes_to_workspace` は `_provision_iso_venv` を monkeypatch するよう更新 (実 venv を作らず offline でテスト)。
+
+### Constraints (spec §3)
+
+- spec_014 の git 隔離テスト (`test_isolated_clone_simulated_mutmut_leak_does_not_pollute_live_repo` 等) は**そのまま green** — git 汚染防止は 1 mm も触っていない (clone 内 venv を建てても `.git` の隔離は変わらない、remote stripping も変わらない、try/finally による破棄も変わらない)。
+- spec_013/015/016 の `--channel mutation/adversarial/ai` の挙動・出力フォーマットは**不変** — 修正は `MutmutRunner` の内部実装と `run_discovery` の追加 halt 経路 (カナリア) のみで、`run_channel` ディスパッチ / `DiscoveryResult` shape / `discover_NNN.md` テンプレートは変えていない。
+- spec_017/018 の brief / profile は**完全に不変** — `ccd brief` は `discover_NNN.json` を読むだけ、`ccd profile` は profile TOML だけ。
+- テストで実 mutmut を走らせない方針は維持 (`FakeMutationRunner` ベース)。§2-3 の再実走確認は実 mutmut で行い、結果は本 CHANGELOG エントリと `result_019.md` に記載。
+- 触ってよい範囲: `ccd/discover.py` / `tests/test_discover.py` / `CHANGELOG.md` / `pyproject.toml` / `ccd/__init__.py` / `tests/test_smoke.py`。コアモジュール (`models` / `protocol` / `dispatch` / `chain` / `integrate` / `metrics` / `dashboard` / `run_writer` / `retry` / `backfill` / `agent` / `retrospect` / `adversarial` / `ai_review` / `brief` / `profile`) は **1 行も触っていない**。`docs/` / `docs/data/*.json` も触らない。
+
 ## [0.9.0] — 2026-05-24
 
 v2 Phase 1 のプロファイル基盤 — spec_018。`docs/DESIGN.md §9.3` の論点1で確定したとおり、v2 のループは**初日からプロファイル駆動で設計する**。プロファイル = 対象リポジトリ・発見戦略・スケジュール、といった設定一式で、「CCD 自己保守」は「プロファイル1個のループ」、将来クライアントリポジトリを足すのは「プロファイルを足す設定作業」に落ちる。spec_018 はそのモデルとローダを `ccd/profile.py` に追加し、`ccd profile` サブコマンド (9 つ目) で実効プロファイルを表示・検証できるようにする。
