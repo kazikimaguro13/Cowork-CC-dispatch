@@ -2,6 +2,44 @@
 
 本プロジェクトの注目すべき変更を記録する。フォーマットは [Keep a Changelog](https://keepachangelog.com/) に準ずる。
 
+## [0.10.0] — 2026-05-25
+
+v2 Phase 1 の**最後の spec** — spec_020。発見3チャンネル（spec_013/014/019 ミューテーション、spec_015 敵対的入力、spec_016 AI推論）・朝レポート（spec_017 `ccd brief`）・プロファイル基盤（spec_018 `ccd profile`）が揃った状態で、残る「**スケジューラ骨格**」を追加。`ccd nightly` サブコマンド（10個目）と Windows タスクスケジューラ登録スクリプト・テンプレートを実装し、夜間に無人でプロファイルの有効発見チャンネルを順に走らせ、朝レポートを描画して Windows 側からも読めるパスにミラーコピーする線形オーケストレーションを完成させる。これで v2 Phase 1（発見のみ・自律修正なし）が完成する。
+
+論点7 の完全な tick-controller 状態機械（`idle → discovering → translating → patching → ... → done_tonight`）は修正ループの多段ステージが必要で、Phase 2 の話。**Phase 1 はその線形な骨格だけ**を作る ── pre-flight 確認 → 発見チャンネル実行 → 朝レポート描画 → Windows ミラー、を `run_nightly` 1 関数で完結。発見チャンネル・brief・profile のロジックは**1 行も触らず**、`run_channel` / `run_brief` / `load_profile` を再利用するだけの組み合わせ層。
+
+### Added
+
+- **`ccd/nightly.py` 新モジュール** — Phase 1 の線形夜間オーケストレータ。
+  - **`run_nightly(*, repo, profile=None, profile_path=None, channel_runner=None, brief_runner=None, windows_mirror=None, today=None) -> NightlyResult`** — エントリ関数。(1) プロファイル読み込み（注入 or `load_profile`）、(2) 軽 pre-flight、(3) `profile.discovery.channels` 順に `channel_runner` 呼び出し（mutation だけ `mutation_paths` を渡す、他は `paths=None`）、(4) `brief_runner` で朝レポート描画、(5) `windows_mirror` で Windows 側にコピー、(6) `NightlyResult` を返す。
+  - **`NightlyResult` dataclass** — `success` / `profile` / `channels_run` (tuple[ChannelOutcome, ...]) / `brief_report_wsl` / `brief_report_windows` / `halt_reason` / `.channels_executed` property（実行した channel 名 tuple）。`success` は pre-flight + brief が成功した時のみ True ── 個別 channel halt（spec_019 のカナリア halt 等）は `success` を倒さない（operator は他チャンネルの発見と朝レポートを依然受け取れるべき）。
+  - **`ChannelOutcome` dataclass** — `channel` / `success` / `halt_reason` / `report_md_path` / `report_json_path` の 5 フィールド。3 種の channel result（`DiscoveryResult` / `AdversarialResult` / `AIReviewResult`）から共通する 4 フィールドを抽出。
+  - **`_pre_flight(repo) -> str`** — Phase 1 用の軽量 pre-flight。`repo` が存在しディレクトリであること、`<repo>/_ai_workspace/` を作成/書き込み可能であることのみを確認。論点7 の本格的 pre-flight（HEAD=main / クリーン / 未push バックログ閾値）は Phase 2 の責務 ── Phase 1 は発見のみで（mutation は spec_014 隔離内、adversarial は in-process tmp dir、ai は read-only、`ccd brief` は gitignore 下の `_ai_workspace/nightly/`）live リポジトリを汚さないので軽い確認で十分。docstring に Phase 2 で何を足すかを明記。
+  - **`_default_mirror(report_md_path) -> Path | None`** — 既定の Windows ミラー。`$CCD_WINDOWS_MIRROR_ROOT` 環境変数 → `/mnt/c/Users/$WIN_USER/ccd-nightly/` → `/mnt/c/Users/$USER/ccd-nightly/` の順で解決、`/mnt/c` 不在なら `None`（ソフトフェイル ── WSL コピーが真）。`shutil.copy2` で markdown レポートを一個コピー。
+  - **チャンネル例外の捕捉** — 1 つのチャンネルが mid-run で raise しても他チャンネル・朝レポートが止まらないよう、`_run_channels` は `except Exception` で `ChannelOutcome(success=False, halt_reason=<exc class+msg>)` に変換して続行。
+- **`ccd nightly` サブコマンド（10 個目）** — `--repo`（既定 cwd）/ `--profile`（任意、TOML パス明示）。stdout に `channels executed: ...` / 各チャンネルの ok/halted 1 行 / `morning report (wsl): ...` / `morning report (windows): ...`（ミラー declined なら `(mirror declined — /mnt/c unavailable)`）。pre-flight halt または brief halt で stderr に `nightly halted: ...` + 非ゼロ終了。`cli.main(channel_runner=..., brief_runner=..., windows_mirror=...)` で 3 つの注入 seam を expose（テストで実 mutmut/実 claude/実 `/mnt/c` を踏まない）。
+- **`_ai_workspace/register_nightly.ps1` Windows タスク登録テンプレート** — 論点7 確定設定:
+  - タスク名 `CcdNightlyMaintenance`（既存 `AxisKnowledgeRagAutoDispatch` と別、共存可能）。
+  - 毎日 `$NightlyAt`（既定 02:00、profile の `schedule.nightly_at` に揃える前提）。
+  - `wsl.exe -d Ubuntu-24.04 -- bash -c "..."` で `cd <repo> && nohup setsid bash -c '. .venv/bin/activate; ccd nightly --repo <repo> >> logs/nightly_task.log 2>&1' < /dev/null > /dev/null 2>&1 &` ── **デタッチ起動**（既存 `auto_dispatch_controller.sh` のパターン、ミューテーションは数時間走るので同期実行しない）。
+  - `WakeToRun` / `StartWhenAvailable` / `MultipleInstances IgnoreNew` / `AllowStartIfOnBatteries` / `DontStopIfGoingOnBatteries` / `ExecutionTimeLimit 6h`。
+  - 環境依存のテンプレート（`$TaskName` / `$ProjectDir` / `$WslDistro` / `$NightlyAt` がユーザ編集ポイント）。実際の登録は人間が走らせる。
+- **`tests/test_nightly.py`** — 16 テスト: 有効チャンネルだけ実行 / mutation のみ `mutation_paths` を受け取る / 全 3 チャンネル既定で動く / pre-flight halt（repo 不在 / ディレクトリでない）でチャンネル未実行 / 朝レポート描画 + Windows ミラー / ミラー `None` 返却で success 維持 / ミラー OSError swallowed / チャンネル halt が他チャンネル・brief を止めない / チャンネル例外が halt 化されて続行 / brief halt → overall halt / 決定性（同じ入力で同じ channels_executed）/ `profile_path` 指定でディスクからロード / CLI end-to-end / CLI pre-flight halt で rc=1 / CLI `--profile` フラグ honor / 実 `run_brief` を fake channel runner と組み合わせた integration / `ChannelOutcome` フィールド保持。すべて **fake runner で完結、実 mutmut/実 claude/実 `/mnt/c` を呼ばない**。
+
+### Changed
+
+- `pyproject.toml` / `ccd/__init__.py` version `0.9.1` → `0.10.0`（**新機能 = minor bump**、spec §2-5）。
+- `tests/test_smoke.py::test_version_is_091` → `test_version_is_0100`、`__version__ == "0.10.0"` を assert。
+- **`ccd/cli.py`** — `nightly` サブパーサ追加（`--repo` / `--profile`）、`main()` のディスパッチに `if args.command == "nightly":` 分岐、`_cmd_nightly` ハンドラ追加。`main()` シグネチャに `channel_runner` / `brief_runner` / `windows_mirror` の 3 つの注入引数を追加（既存テスト互換、すべて kw-only & 既定 None）。既存サブコマンド（dispatch / chain / report / dashboard / retrospect / discover / brief / profile / reconcile）の挙動・引数・stdout は**完全に保持**。
+
+### Constraints (spec §3)
+
+- **触ってよい**: `ccd/nightly.py`（新規）、`ccd/cli.py`（`nightly` サブコマンド + 注入 seam）、`_ai_workspace/register_nightly.ps1`（新規テンプレート）、`tests/test_nightly.py`、`CHANGELOG.md`、`pyproject.toml`、`ccd/__init__.py`、`tests/test_smoke.py`。
+- **触っていない**: `ccd/{models,protocol,dispatch,chain,integrate,metrics,dashboard,run_writer,retry,backfill,agent,retrospect,discover,adversarial,ai_review,brief,profile}.py` のコアロジックは **1 行も変更していない** — `run_channel` / `run_brief` / `load_profile` は import & 再利用するだけ。`docs/` / `docs/data/*.json` も触らない。
+- 既存サブコマンド（9 つ）の挙動・引数・stdout は不変 — `cli.main()` シグネチャに追加した kw-only 注入引数は既定 None なので、既存呼び出しは無修正で動く。
+- テストで実 mutmut・実 claude・実 git・実 `/mnt/c` を走らせない — `channel_runner` / `brief_runner` / `windows_mirror` の 3 注入 seam ですべてオフライン化。
+- すべて**追加のみ**。**push しない／ブランチ操作・merge しない**（spec §3）。
+
 ## [0.9.1] — 2026-05-25
 
 `ccd discover --channel mutation` の **0-killed 偽 survivor 問題**を修正 — spec_019。`ccd/` 全体に対するフル・ミューテーション実走で 1274 mutant 中 killed=0 / survived=1273 / suspicious=1 という結果が出ていた。309 件のテストが通っているコードベースで撃破率0%は原理的にありえず、1273件の "actionable survivor" は本物のテスト隙間ではなくツール統合のアーティファクトで、**発見レポートは丸ごと信用できない**状態だった。

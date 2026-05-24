@@ -39,6 +39,7 @@ from ccd.discover import (
 from ccd.integrate import DEFAULT_SMOKE_COMMANDS
 from ccd.metrics import aggregate, render_report
 from ccd.models import DispatchRecord, DispatchStatus
+from ccd.nightly import BriefRunner, ChannelRunner, WindowsMirror, run_nightly
 from ccd.profile import load_profile_with_source, render_profile
 from ccd.protocol import parse_spec
 from ccd.retrospect import DEFAULT_LIMIT as DEFAULT_RETROSPECT_LIMIT
@@ -336,6 +337,37 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    p_nightly = sub.add_parser(
+        "nightly",
+        help=(
+            "Run the Phase-1 nightly orchestration: discovery channels + "
+            "morning report + Windows mirror (spec_020)."
+        ),
+        description=(
+            "Linear orchestrator that drives the profile's enabled "
+            "discovery channels (mutation / adversarial / ai) in order, "
+            "then renders the morning report (ccd brief) and mirrors it to "
+            "a Windows-visible path so the operator can read it without "
+            "entering WSL. Phase 1 is discovery-only — nightly does NOT "
+            "merge, push, or rewrite history; pre-flight is intentionally "
+            "light (the full HEAD/clean checks belong in Phase 2 where "
+            "auto-fix writes to the live repo)."
+        ),
+    )
+    p_nightly.add_argument("--repo", type=Path, default=None)
+    p_nightly.add_argument(
+        "--profile",
+        dest="profile_path",
+        type=Path,
+        default=None,
+        help=(
+            "Explicit profile TOML path. When omitted, the loader looks "
+            "at <repo>/_ai_workspace/ccd_profile.toml; if that's absent "
+            "too, the all-defaults profile (mutation + adversarial + ai) "
+            "is used."
+        ),
+    )
+
     p_reconcile = sub.add_parser(
         "reconcile",
         help="Reconcile orphan RUNNING records to HALTED + INTERRUPTED.",
@@ -360,6 +392,9 @@ def main(
     runner: AgentRunner | None = None,
     mutation_runner: MutationRunner | None = None,
     smoke_commands: Sequence[Sequence[str]] | None = None,
+    channel_runner: ChannelRunner | None = None,
+    brief_runner: BriefRunner | None = None,
+    windows_mirror: WindowsMirror | None = None,
 ) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -380,6 +415,13 @@ def main(
         return _cmd_brief(args)
     if args.command == "profile":
         return _cmd_profile(args)
+    if args.command == "nightly":
+        return _cmd_nightly(
+            args,
+            channel_runner=channel_runner,
+            brief_runner=brief_runner,
+            windows_mirror=windows_mirror,
+        )
     if args.command == "reconcile":
         return _cmd_reconcile(args)
 
@@ -630,6 +672,42 @@ def _cmd_profile(args: argparse.Namespace) -> int:
         print(f"profile error: {exc}", file=sys.stderr)
         return 1
     print(render_profile(result))
+    return 0
+
+
+def _cmd_nightly(
+    args: argparse.Namespace,
+    *,
+    channel_runner: ChannelRunner | None,
+    brief_runner: BriefRunner | None,
+    windows_mirror: WindowsMirror | None,
+) -> int:
+    repo = _resolve_repo(args.repo)
+    profile_path = getattr(args, "profile_path", None)
+
+    result = run_nightly(
+        repo=repo,
+        profile_path=profile_path,
+        channel_runner=channel_runner,
+        brief_runner=brief_runner,
+        windows_mirror=windows_mirror,
+    )
+
+    print("channels executed: " + (", ".join(result.channels_executed) or "(none)"))
+    for co in result.channels_run:
+        status = "ok" if co.success else f"halted ({co.halt_reason or 'no reason'})"
+        print(f"  - {co.channel}: {status}")
+
+    if result.brief_report_wsl is not None:
+        print(f"morning report (wsl):     {result.brief_report_wsl}")
+    if result.brief_report_windows is not None:
+        print(f"morning report (windows): {result.brief_report_windows}")
+    elif result.brief_report_wsl is not None:
+        print("morning report (windows): (mirror declined — /mnt/c unavailable)")
+
+    if not result.success:
+        print(f"nightly halted: {result.halt_reason}", file=sys.stderr)
+        return 1
     return 0
 
 
