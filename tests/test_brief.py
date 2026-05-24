@@ -1,0 +1,525 @@
+"""Tests for ``ccd/brief.py:run_brief`` and the ``ccd brief`` CLI.
+
+spec_017 ships the morning-report renderer for v2 Phase 1. The brief
+reads completed ``discover_NNN.json`` (one latest per channel) and
+writes a 6-section markdown report. The renderer does not execute any
+discovery channel; tests assert this by handing it pre-baked JSON
+inputs and verifying nothing else fires.
+"""
+
+from __future__ import annotations
+
+import json
+from datetime import date
+from pathlib import Path
+
+import pytest
+
+from ccd import cli
+from ccd.brief import (
+    CHANNEL_ADVERSARIAL,
+    CHANNEL_AI,
+    CHANNEL_MUTATION,
+    BriefResult,
+    BriefSummary,
+    run_brief,
+)
+
+# --------------------------------------------------------------------------- #
+# Fixture-writing helpers — build representative discover_NNN.json payloads.
+# --------------------------------------------------------------------------- #
+
+
+def _write_mutation(
+    discover_dir: Path,
+    *,
+    seq: int,
+    actionable: tuple[tuple[str, int, str], ...] = (
+        ("ccd/dispatch.py", 125, "check=False, → check=True,"),
+        ("ccd/dispatch.py", 145, "return 0 → return 1"),
+    ),
+) -> Path:
+    """Write a mutation-channel discover_NNN.json (and a tiny md)."""
+
+    discover_dir.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "summary": {
+            "tool": "mutmut",
+            "target_paths": ["ccd"],
+            "mutants_total": 4,
+            "status_breakdown": {"survived": len(actionable), "killed": 2},
+            "survived_total": len(actionable),
+            "survived_by_file": {"ccd/dispatch.py": len(actionable)},
+            "blocklisted_total": 0,
+            "actionable_total": len(actionable),
+        },
+        "actionable": [
+            {
+                "file": f,
+                "line": ln,
+                "mutation": m,
+                "status": "survived",
+                "signature": f"{f}:{ln}:{m}",
+            }
+            for f, ln, m in actionable
+        ],
+        "blocklisted": [],
+    }
+    json_path = discover_dir / f"discover_{seq:03d}.json"
+    json_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    (discover_dir / f"discover_{seq:03d}.md").write_text(
+        f"# discover_{seq:03d} — mutation\n", encoding="utf-8"
+    )
+    return json_path
+
+
+def _write_adversarial(
+    discover_dir: Path,
+    *,
+    seq: int,
+    findings: tuple[tuple[str, str, str, str], ...] = (
+        (
+            "ccd.protocol.parse_spec",
+            "05_invalid_utf8_bytes",
+            "UnicodeDecodeError",
+            "'utf-8' codec can't decode byte 0xff in position 19",
+        ),
+    ),
+) -> Path:
+    """Write an adversarial-channel discover_NNN.json."""
+
+    discover_dir.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "channel": "adversarial",
+        "summary": {
+            "parsers": ["ccd.protocol.parse_spec"],
+            "cases_total": 18,
+            "evaluations_total": 72,
+            "graceful_total": 71,
+            "ungraceful_total": len(findings),
+            "graceful_by_parser": {"ccd.protocol.parse_spec": 17},
+            "ungraceful_by_parser": {"ccd.protocol.parse_spec": len(findings)},
+            "ungraceful_by_exception_type": {"UnicodeDecodeError": len(findings)},
+        },
+        "findings": [
+            {
+                "parser": parser,
+                "case": case,
+                "exception_type": exc_type,
+                "exception_message": exc_msg,
+            }
+            for parser, case, exc_type, exc_msg in findings
+        ],
+        "cases": [],
+    }
+    json_path = discover_dir / f"discover_{seq:03d}.json"
+    json_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    (discover_dir / f"discover_{seq:03d}.md").write_text(
+        f"# discover_{seq:03d} — adversarial\n", encoding="utf-8"
+    )
+    return json_path
+
+
+def _write_ai(
+    discover_dir: Path,
+    *,
+    seq: int,
+    findings: tuple[tuple[str, str, str, str], ...] = (
+        (
+            "dispatch-unchecked-cwd",
+            "ccd/dispatch.py:42",
+            "The cwd argument is taken on trust from the caller",
+            "If a caller passes a relative cwd the subprocess sees the wrong dir.",
+        ),
+    ),
+) -> Path:
+    """Write an AI-channel discover_NNN.json."""
+
+    discover_dir.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "channel": "ai",
+        "report_only": True,
+        "non_deterministic": True,
+        "summary": {
+            "target_package": "ccd",
+            "files_reviewed": ["ccd/dispatch.py", "ccd/cli.py"],
+            "files_total": 2,
+            "findings_total": len(findings),
+        },
+        "findings": [
+            {
+                "slug": slug,
+                "location": location,
+                "concern": concern,
+                "why_risky": why,
+                "source_file": f"_ai_workspace/discover/ai_review/findings_{seq:03d}/{slug}.md",
+            }
+            for slug, location, concern, why in findings
+        ],
+    }
+    json_path = discover_dir / f"discover_{seq:03d}.json"
+    json_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    (discover_dir / f"discover_{seq:03d}.md").write_text(
+        f"# discover_{seq:03d} — ai\n", encoding="utf-8"
+    )
+    return json_path
+
+
+@pytest.fixture
+def repo_with_all_three(tmp_path: Path) -> Path:
+    """A repo whose _ai_workspace/discover/ has one report per channel."""
+
+    discover = tmp_path / "_ai_workspace" / "discover"
+    _write_mutation(discover, seq=1)
+    _write_adversarial(discover, seq=2)
+    _write_ai(discover, seq=3)
+    return tmp_path
+
+
+# --------------------------------------------------------------------------- #
+# Core: run_brief renders the 6 sections from all three channels.
+# --------------------------------------------------------------------------- #
+
+
+def test_run_brief_returns_result_with_report_path(repo_with_all_three: Path) -> None:
+    result = run_brief(
+        repo=repo_with_all_three,
+        today=date(2026, 5, 24),
+    )
+
+    assert isinstance(result, BriefResult)
+    assert result.success is True
+    assert result.report_path is not None
+    assert result.report_path.name == "report_2026-05-24.md"
+    assert result.report_path.parent.name == "nightly"
+
+
+def test_report_contains_all_six_sections(repo_with_all_three: Path) -> None:
+    """spec_017 §2-2 — sections A〜F must all be present."""
+
+    result = run_brief(
+        repo=repo_with_all_three,
+        today=date(2026, 5, 24),
+    )
+
+    md = result.report_path.read_text(encoding="utf-8")
+    assert "## A. 一行判定" in md
+    assert "## B. 機械的チャンネルの発見" in md
+    assert "## C. AI推論の所見" in md
+    # D may or may not appear depending on content; here all channels
+    # present + no halt_reason → D should be absent. Section E is always
+    # present, section F is always present.
+    assert "## E. バックログ・推移" in md
+    assert "## F. 起きなかったこと" in md
+
+
+def test_report_mechanical_findings_are_listed_with_location(
+    repo_with_all_three: Path,
+) -> None:
+    """spec_017 §2-2 §B — actionable mutation lines and adversarial
+    ungraceful pairs must surface with file:line / parser × case."""
+
+    result = run_brief(
+        repo=repo_with_all_three,
+        today=date(2026, 5, 24),
+    )
+
+    md = result.report_path.read_text(encoding="utf-8")
+    # Mutation actionable: file:line — mutation description.
+    assert "ccd/dispatch.py:125" in md
+    assert "check=False, → check=True," in md
+    # Adversarial ungraceful: parser × case — exception type + message.
+    assert "ccd.protocol.parse_spec" in md
+    assert "05_invalid_utf8_bytes" in md
+    assert "UnicodeDecodeError" in md
+
+
+def test_report_ai_section_marks_report_only_and_distinguishes_from_b(
+    repo_with_all_three: Path,
+) -> None:
+    """spec_017 §2-2 — §C must visually distinguish itself from §B and
+    explicitly say "報告専用" / "主張" / "事実ではない"."""
+
+    result = run_brief(
+        repo=repo_with_all_three,
+        today=date(2026, 5, 24),
+    )
+
+    md = result.report_path.read_text(encoding="utf-8")
+    # Split by section headings; check the AI section.
+    pre_c, _, rest = md.partition("## C. AI推論の所見")
+    assert "報告専用" in rest.split("## ", 1)[0]
+    assert "主張" in rest.split("## ", 1)[0]
+    # The AI finding itself shows up in C.
+    assert "dispatch-unchecked-cwd" in rest
+    # Mechanical findings sit in B (before C).
+    assert "ccd/dispatch.py:125" in pre_c
+    # AI section explicitly says "人間判断" and "自律修正の引き金にはしない".
+    assert "人間判断" in rest.split("## ", 1)[0]
+    assert "自律修正の引き金にはしない" in rest.split("## ", 1)[0]
+
+
+def test_report_section_f_states_phase_1_does_not_auto_fix(
+    repo_with_all_three: Path,
+) -> None:
+    """spec_017 §2-2 §F — Phase 1 honesty: no autonomous fixes ever ran."""
+
+    result = run_brief(
+        repo=repo_with_all_three,
+        today=date(2026, 5, 24),
+    )
+
+    md = result.report_path.read_text(encoding="utf-8")
+    _, _, after_f = md.partition("## F. 起きなかったこと")
+    assert "Phase 1 は自律修正していない" in after_f
+
+
+# --------------------------------------------------------------------------- #
+# Determinism + summary.
+# --------------------------------------------------------------------------- #
+
+
+def test_summary_is_deterministic(repo_with_all_three: Path) -> None:
+    """Same inputs → same BriefSummary numbers (spec_017 §2-4 spirit)."""
+
+    r1 = run_brief(repo=repo_with_all_three, today=date(2026, 5, 24))
+    r2 = run_brief(repo=repo_with_all_three, today=date(2026, 5, 24))
+
+    assert isinstance(r1.summary, BriefSummary)
+    assert r1.summary == r2.summary
+    assert r1.summary.mutation_actionable == 2
+    assert r1.summary.adversarial_ungraceful == 1
+    assert r1.summary.ai_findings == 1
+    assert r1.summary.mechanical_findings_total == 3
+    assert r1.summary.channels_picked == (
+        CHANNEL_MUTATION,
+        CHANNEL_ADVERSARIAL,
+        CHANNEL_AI,
+    )
+    assert r1.summary.channels_missing == ()
+
+
+def test_report_filename_uses_today_argument(tmp_path: Path) -> None:
+    """The `today` injection makes the filename deterministic."""
+
+    repo = tmp_path
+    (repo / "_ai_workspace" / "discover").mkdir(parents=True)
+    result = run_brief(repo=repo, today=date(2027, 1, 1))
+    assert result.report_path.name == "report_2027-01-01.md"
+
+
+# --------------------------------------------------------------------------- #
+# Graceful: missing channels, zero findings.
+# --------------------------------------------------------------------------- #
+
+
+def test_missing_channels_are_graceful(tmp_path: Path) -> None:
+    """spec_017 §2-1 — a channel with no report is recorded as 未実行,
+    not a crash."""
+
+    discover = tmp_path / "_ai_workspace" / "discover"
+    _write_mutation(discover, seq=1)
+    # No adversarial or ai report — only mutation present.
+
+    result = run_brief(repo=tmp_path, today=date(2026, 5, 24))
+
+    assert result.success is True
+    assert set(result.summary.channels_picked) == {CHANNEL_MUTATION}
+    assert set(result.summary.channels_missing) == {
+        CHANNEL_ADVERSARIAL,
+        CHANNEL_AI,
+    }
+    md = result.report_path.read_text(encoding="utf-8")
+    # Missing channels should surface in §D (halt / skip) AND in §F honesty.
+    assert "## D. halt・スキップ項目" in md
+    assert "未実行" in md
+    # The honesty section still anchors the Phase-1 invariant.
+    assert "Phase 1 は自律修正していない" in md
+
+
+def test_all_channels_missing_is_graceful(tmp_path: Path) -> None:
+    """Even with zero discover_NNN files, the brief renders something
+    honest rather than crashing."""
+
+    (tmp_path / "_ai_workspace" / "discover").mkdir(parents=True)
+
+    result = run_brief(repo=tmp_path, today=date(2026, 5, 24))
+
+    assert result.success is True
+    assert result.summary.channels_picked == ()
+    assert result.summary.channels_missing == (
+        CHANNEL_MUTATION,
+        CHANNEL_ADVERSARIAL,
+        CHANNEL_AI,
+    )
+    md = result.report_path.read_text(encoding="utf-8")
+    # Section A says "発見なし" or equivalent.
+    assert "発見なし" in md or "未実行" in md
+    # F still anchors the Phase-1 invariant.
+    assert "Phase 1 は自律修正していない" in md
+
+
+def test_zero_findings_per_channel_is_concise(tmp_path: Path) -> None:
+    """All channels ran but each surfaced zero findings — report stays
+    concise and admits the empty result honestly (spec_017 §2-4)."""
+
+    discover = tmp_path / "_ai_workspace" / "discover"
+    _write_mutation(discover, seq=1, actionable=())
+    _write_adversarial(discover, seq=2, findings=())
+    _write_ai(discover, seq=3, findings=())
+
+    result = run_brief(repo=tmp_path, today=date(2026, 5, 24))
+
+    assert result.summary.mechanical_findings_total == 0
+    assert result.summary.ai_findings == 0
+    md = result.report_path.read_text(encoding="utf-8")
+    # Three "ゼロ件 / 発見なし" markers — one per channel — appear in B/C.
+    assert md.count("発見なし") + md.count("ゼロ件") >= 2
+
+
+# --------------------------------------------------------------------------- #
+# Channel attribution (mutation has no `channel` key — detect by shape).
+# --------------------------------------------------------------------------- #
+
+
+def test_mutation_channel_detected_without_channel_field(tmp_path: Path) -> None:
+    """spec_013's discover_NNN.json predates the explicit `channel` field;
+    the brief still attributes it correctly by shape."""
+
+    discover = tmp_path / "_ai_workspace" / "discover"
+    _write_mutation(discover, seq=1)
+
+    result = run_brief(repo=tmp_path, today=date(2026, 5, 24))
+
+    assert result.summary.channels_picked == (CHANNEL_MUTATION,)
+
+
+def test_latest_per_channel_is_picked(tmp_path: Path) -> None:
+    """When multiple reports exist for the same channel, only the
+    highest-seq one is consumed (spec_017 §2-1)."""
+
+    discover = tmp_path / "_ai_workspace" / "discover"
+    _write_mutation(
+        discover,
+        seq=1,
+        actionable=(("ccd/old.py", 10, "old → mutation"),),
+    )
+    _write_mutation(
+        discover,
+        seq=4,
+        actionable=(("ccd/new.py", 99, "new → mutation"),),
+    )
+
+    result = run_brief(repo=tmp_path, today=date(2026, 5, 24))
+
+    md = result.report_path.read_text(encoding="utf-8")
+    assert "ccd/new.py:99" in md
+    assert "ccd/old.py:10" not in md
+    # Only the latest is in the picked channel list, with seq=4.
+    picked_seqs = [c.seq for c in result.channels]
+    assert picked_seqs == [4]
+
+
+# --------------------------------------------------------------------------- #
+# Explicit `inputs` argument (test seam).
+# --------------------------------------------------------------------------- #
+
+
+def test_explicit_inputs_override_auto_collection(tmp_path: Path) -> None:
+    """``inputs=`` lets tests pass pre-baked JSON paths bypassing the
+    discover/ scan."""
+
+    # Build two discover JSONs in a sibling directory the auto-collector
+    # would never see (no _ai_workspace/discover/ at all).
+    sandbox = tmp_path / "elsewhere"
+    sandbox.mkdir()
+    mut = _write_mutation(sandbox, seq=7)
+    ai = _write_ai(sandbox, seq=9)
+
+    # Empty real discover dir — auto-collection would pick nothing up.
+    (tmp_path / "_ai_workspace" / "discover").mkdir(parents=True)
+
+    result = run_brief(
+        repo=tmp_path,
+        inputs=[mut, ai],
+        today=date(2026, 5, 24),
+    )
+
+    assert set(c.channel for c in result.channels) == {
+        CHANNEL_MUTATION,
+        CHANNEL_AI,
+    }
+    assert CHANNEL_ADVERSARIAL in result.summary.channels_missing
+
+
+# --------------------------------------------------------------------------- #
+# CLI end-to-end.
+# --------------------------------------------------------------------------- #
+
+
+def test_cli_brief_end_to_end(
+    repo_with_all_three: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """`ccd brief --repo <repo>` writes the morning report and prints the
+    factual summary."""
+
+    rc = cli.main(["brief", "--repo", str(repo_with_all_three)])
+
+    assert rc == 0
+    captured = capsys.readouterr()
+    assert "morning report:" in captured.out
+    assert "factual summary:" in captured.out
+    assert "mechanical=3" in captured.out
+    assert "mutation=2" in captured.out
+    assert "adversarial=1" in captured.out
+    assert "ai=1" in captured.out
+    # The report file was actually written.
+    report = repo_with_all_three / "_ai_workspace" / "nightly"
+    assert any(p.name.startswith("report_") for p in report.iterdir())
+
+
+def test_cli_brief_with_missing_channels(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    discover = tmp_path / "_ai_workspace" / "discover"
+    _write_mutation(discover, seq=1)
+
+    rc = cli.main(["brief", "--repo", str(tmp_path)])
+
+    assert rc == 0
+    captured = capsys.readouterr()
+    assert "channels not yet executed:" in captured.out
+    assert "adversarial" in captured.out
+    assert "ai" in captured.out
+
+
+def test_cli_brief_inputs_flag(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """`ccd brief --inputs <json>...` accepts explicit JSON paths."""
+
+    sandbox = tmp_path / "elsewhere"
+    sandbox.mkdir()
+    mut = _write_mutation(sandbox, seq=1)
+    adv = _write_adversarial(sandbox, seq=2)
+
+    rc = cli.main(
+        [
+            "brief",
+            "--repo",
+            str(tmp_path),
+            "--inputs",
+            str(mut),
+            str(adv),
+        ]
+    )
+
+    assert rc == 0
+    captured = capsys.readouterr()
+    assert "morning report:" in captured.out
+    # ai missing because we didn't pass it.
+    assert "channels not yet executed:" in captured.out
+    assert "ai" in captured.out

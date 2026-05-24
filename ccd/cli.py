@@ -27,6 +27,7 @@ from pathlib import Path
 
 from ccd import __version__
 from ccd.agent import AgentRunner, ClaudeCodeRunner
+from ccd.brief import run_brief
 from ccd.chain import run_chain
 from ccd.dashboard import render_to as render_dashboard_to
 from ccd.discover import (
@@ -276,6 +277,36 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    p_brief = sub.add_parser(
+        "brief",
+        help=(
+            "Render the Phase-1 morning report from accumulated discover_NNN "
+            "JSON files (spec_017)."
+        ),
+        description=(
+            "Pure renderer (no channel execution): collect the latest "
+            "discover_NNN.json per channel (mutation / adversarial / ai), "
+            "compute a deterministic cross-channel summary, and write a "
+            "6-section morning report to "
+            "_ai_workspace/nightly/report_YYYY-MM-DD.md. "
+            "Mechanical findings (facts) and AI-inference findings (claims) "
+            "are visually separated; the report states explicitly that "
+            "Phase 1 performs no autonomous fixes."
+        ),
+    )
+    p_brief.add_argument("--repo", type=Path, default=None)
+    p_brief.add_argument(
+        "--inputs",
+        nargs="+",
+        type=Path,
+        default=None,
+        help=(
+            "Explicit discover_NNN.json paths (one or more). When omitted, "
+            "the brief auto-discovers the latest report per channel under "
+            "<repo>/_ai_workspace/discover/."
+        ),
+    )
+
     p_reconcile = sub.add_parser(
         "reconcile",
         help="Reconcile orphan RUNNING records to HALTED + INTERRUPTED.",
@@ -316,6 +347,8 @@ def main(
         return _cmd_retrospect(args, runner)
     if args.command == "discover":
         return _cmd_discover(args, mutation_runner, runner)
+    if args.command == "brief":
+        return _cmd_brief(args)
     if args.command == "reconcile":
         return _cmd_reconcile(args)
 
@@ -528,6 +561,32 @@ def _cmd_discover(
     )
     for f in result.findings:
         print(f"finding: {f.location} — {f.concern}")
+    return 0
+
+
+def _cmd_brief(args: argparse.Namespace) -> int:
+    repo = _resolve_repo(args.repo)
+    inputs = list(args.inputs) if args.inputs else None
+
+    result = run_brief(repo=repo, inputs=inputs)
+
+    if not result.success:
+        print(f"brief halted: {result.halt_reason}", file=sys.stderr)
+        return 1
+
+    assert result.report_path is not None
+    print(f"morning report: {result.report_path}")
+    summary = result.summary
+    print(
+        "factual summary: "
+        f"mechanical={summary.mechanical_findings_total} "
+        f"(mutation={summary.mutation_actionable}, "
+        f"adversarial={summary.adversarial_ungraceful}) "
+        f"ai={summary.ai_findings} (report-only)"
+    )
+    if summary.channels_missing:
+        missing = ", ".join(summary.channels_missing)
+        print(f"channels not yet executed: {missing}")
     return 0
 
 
