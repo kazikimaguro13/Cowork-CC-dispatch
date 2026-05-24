@@ -45,6 +45,11 @@ DEFAULT_DISCOVER_DIR_REL = Path("_ai_workspace") / "discover"
 DEFAULT_BLOCKLIST_FILENAME = "blocklist.txt"
 DEFAULT_MUTATION_TARGETS: tuple[str, ...] = ("ccd",)
 
+CHANNEL_MUTATION = "mutation"
+CHANNEL_ADVERSARIAL = "adversarial"
+DEFAULT_CHANNEL = CHANNEL_MUTATION
+SUPPORTED_CHANNELS: tuple[str, ...] = (CHANNEL_MUTATION, CHANNEL_ADVERSARIAL)
+
 STATUS_SURVIVED = "survived"
 STATUS_KILLED = "killed"
 STATUS_TIMEOUT = "timeout"
@@ -224,6 +229,55 @@ def run_discovery(
         actionable_mutants=actionable,
         blocklisted_mutants=blocklisted,
         raw_output=outcome.raw_output,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Channel dispatch (spec_015)
+# --------------------------------------------------------------------------- #
+
+
+def run_channel(
+    channel: str,
+    *,
+    repo: Path,
+    paths: list[str] | None = None,
+    mutation_runner: MutationRunner | None = None,
+    discover_dir: Path | None = None,
+):
+    """Dispatch one ``ccd discover --channel <channel>`` invocation.
+
+    The two channels surface *different classes of bug*:
+
+    - ``mutation`` (spec_013, default) — gaps in CCD's own tests, via
+      mutmut. Returns a :class:`DiscoveryResult`.
+    - ``adversarial`` (spec_015) — places where CCD's parsers crash on
+      realistic broken inputs. Returns an :class:`AdversarialResult`.
+
+    Each result type is shaped to its own channel. cli.py picks the
+    display path from the channel name. ``paths`` / ``mutation_runner``
+    are silently ignored for non-mutation channels — they are mutation-
+    specific tuning knobs.
+    """
+
+    if channel == CHANNEL_MUTATION:
+        runner = mutation_runner if mutation_runner is not None else MutmutRunner()
+        return run_discovery(
+            runner,
+            repo=repo,
+            paths=paths,
+            discover_dir=discover_dir,
+        )
+    if channel == CHANNEL_ADVERSARIAL:
+        # Lazy import: adversarial.py imports ``DEFAULT_DISCOVER_DIR_REL``
+        # from this module, so a top-level import here would create a
+        # circular load order on first use.
+        from ccd.adversarial import run_adversarial
+
+        return run_adversarial(repo=repo, discover_dir=discover_dir)
+    raise ValueError(
+        f"unknown discover channel: {channel!r} "
+        f"(supported: {', '.join(SUPPORTED_CHANNELS)})"
     )
 
 

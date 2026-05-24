@@ -29,7 +29,12 @@ from ccd import __version__
 from ccd.agent import AgentRunner, ClaudeCodeRunner
 from ccd.chain import run_chain
 from ccd.dashboard import render_to as render_dashboard_to
-from ccd.discover import MutationRunner, MutmutRunner, run_discovery
+from ccd.discover import (
+    DEFAULT_CHANNEL,
+    SUPPORTED_CHANNELS,
+    MutationRunner,
+    run_channel,
+)
 from ccd.integrate import DEFAULT_SMOKE_COMMANDS
 from ccd.metrics import aggregate, render_report
 from ccd.models import DispatchRecord, DispatchStatus
@@ -249,12 +254,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_discover.add_argument("--repo", type=Path, default=None)
     p_discover.add_argument(
+        "--channel",
+        choices=SUPPORTED_CHANNELS,
+        default=DEFAULT_CHANNEL,
+        help=(
+            f"Discovery channel (default: {DEFAULT_CHANNEL}). "
+            "`mutation` runs mutmut against ccd's tests (spec_013). "
+            "`adversarial` feeds CCD's parsers a curated catalog of broken "
+            "inputs and reports any ungraceful crash (spec_015)."
+        ),
+    )
+    p_discover.add_argument(
         "--paths",
         nargs="+",
         default=None,
         help=(
-            "Paths to mutate (default: ccd). Passed through to the mutation "
-            "tool — use to narrow a discovery batch onto one module."
+            "Paths to mutate (default: ccd). Mutation channel only — "
+            "ignored for `--channel adversarial`."
         ),
     )
 
@@ -448,10 +464,15 @@ def _cmd_discover(
     runner: MutationRunner | None,
 ) -> int:
     repo = _resolve_repo(args.repo)
+    channel = getattr(args, "channel", DEFAULT_CHANNEL)
     paths = list(args.paths) if args.paths else None
-    runner = runner if runner is not None else MutmutRunner()
 
-    result = run_discovery(runner, repo=repo, paths=paths)
+    result = run_channel(
+        channel,
+        repo=repo,
+        paths=paths,
+        mutation_runner=runner,
+    )
 
     if not result.success:
         print(f"discovery halted: {result.halt_reason}", file=sys.stderr)
@@ -461,16 +482,35 @@ def _cmd_discover(
     assert result.report_json_path is not None
     print(f"discovery report: {result.report_md_path}")
     print(f"discovery json:   {result.report_json_path}")
+
+    if channel == "mutation":
+        summary = result.summary
+        print(
+            "factual summary: "
+            f"mutants={summary.mutants_total} "
+            f"survived={summary.survived_total} "
+            f"actionable={summary.actionable_total} "
+            f"blocklisted={summary.blocklisted_total}"
+        )
+        for m in result.actionable_mutants:
+            print(f"actionable: {m.file}:{m.line} — {m.mutation}")
+        return 0
+
+    # adversarial channel
     summary = result.summary
     print(
         "factual summary: "
-        f"mutants={summary.mutants_total} "
-        f"survived={summary.survived_total} "
-        f"actionable={summary.actionable_total} "
-        f"blocklisted={summary.blocklisted_total}"
+        f"parsers={len(summary.parsers)} "
+        f"cases={summary.cases_total} "
+        f"evaluations={summary.evaluations_total} "
+        f"graceful={summary.graceful_total} "
+        f"ungraceful={summary.ungraceful_total}"
     )
-    for m in result.actionable_mutants:
-        print(f"actionable: {m.file}:{m.line} — {m.mutation}")
+    for f in result.findings:
+        print(
+            f"ungraceful: {f.parser} × {f.case_name} — "
+            f"{f.exception_type}: {f.exception_message}"
+        )
     return 0
 
 
