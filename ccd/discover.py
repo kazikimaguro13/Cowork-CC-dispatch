@@ -47,8 +47,13 @@ DEFAULT_MUTATION_TARGETS: tuple[str, ...] = ("ccd",)
 
 CHANNEL_MUTATION = "mutation"
 CHANNEL_ADVERSARIAL = "adversarial"
+CHANNEL_AI = "ai"
 DEFAULT_CHANNEL = CHANNEL_MUTATION
-SUPPORTED_CHANNELS: tuple[str, ...] = (CHANNEL_MUTATION, CHANNEL_ADVERSARIAL)
+SUPPORTED_CHANNELS: tuple[str, ...] = (
+    CHANNEL_MUTATION,
+    CHANNEL_ADVERSARIAL,
+    CHANNEL_AI,
+)
 
 STATUS_SURVIVED = "survived"
 STATUS_KILLED = "killed"
@@ -243,21 +248,27 @@ def run_channel(
     repo: Path,
     paths: list[str] | None = None,
     mutation_runner: MutationRunner | None = None,
+    agent_runner=None,
     discover_dir: Path | None = None,
 ):
     """Dispatch one ``ccd discover --channel <channel>`` invocation.
 
-    The two channels surface *different classes of bug*:
+    The three channels surface *different classes of bug*:
 
     - ``mutation`` (spec_013, default) — gaps in CCD's own tests, via
       mutmut. Returns a :class:`DiscoveryResult`.
     - ``adversarial`` (spec_015) — places where CCD's parsers crash on
       realistic broken inputs. Returns an :class:`AdversarialResult`.
+    - ``ai`` (spec_016) — semantic / intent concerns surfaced by an
+      agent reading the code. **Report-only** — does not feed an
+      autonomous fix loop. Returns an :class:`AIReviewResult`.
 
     Each result type is shaped to its own channel. cli.py picks the
     display path from the channel name. ``paths`` / ``mutation_runner``
-    are silently ignored for non-mutation channels — they are mutation-
-    specific tuning knobs.
+    are mutation-specific tuning knobs and silently ignored for the
+    other channels; ``agent_runner`` is the AI channel's seam (the same
+    ``AgentRunner`` abstraction ``dispatch`` / ``retrospect`` use) and
+    is ignored for the mutation / adversarial channels.
     """
 
     if channel == CHANNEL_MUTATION:
@@ -275,6 +286,13 @@ def run_channel(
         from ccd.adversarial import run_adversarial
 
         return run_adversarial(repo=repo, discover_dir=discover_dir)
+    if channel == CHANNEL_AI:
+        # Same lazy-import rationale as the adversarial channel.
+        from ccd.agent import ClaudeCodeRunner
+        from ccd.ai_review import run_ai_review
+
+        runner = agent_runner if agent_runner is not None else ClaudeCodeRunner()
+        return run_ai_review(runner, repo=repo, discover_dir=discover_dir)
     raise ValueError(
         f"unknown discover channel: {channel!r} "
         f"(supported: {', '.join(SUPPORTED_CHANNELS)})"
