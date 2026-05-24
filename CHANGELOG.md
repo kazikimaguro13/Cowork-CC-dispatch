@@ -2,6 +2,49 @@
 
 本プロジェクトの注目すべき変更を記録する。フォーマットは [Keep a Changelog](https://keepachangelog.com/) に準ずる。
 
+## [0.6.0] — 2026-05-24
+
+v2 Phase 1 第二の発見チャンネル — spec_015。spec_013 / 014 で実装した**ミューテーション・チャンネル**（緑のテストが見ていない隙間を出す）に並べて、**敵対的入力チャンネル**を `ccd discover --channel adversarial` として追加。「現実に起きうる壊れた入力で CCD のパーサが無様にクラッシュする」箇所を発見する（`docs/DESIGN.md §9.4`）。CCD は spec / result / run JSON を大量に読むのでパース境界が広く、緑のテストでは観測しにくい頑健性バグを、**吟味済み固定リスト**を本物のパーサに食わせて炙り出す。自律修正は Phase 2 — 本 spec は発見のみ。
+
+### Added
+
+- **`ccd/adversarial.py` 新モジュール** — `run_adversarial(*, repo, discover_dir, parsers, cases) -> AdversarialResult`。固定 18 ケース × CCD 本物のパーサ 4 系統を in-process で評価し、各（パーサ × ケース）を **graceful**（許可リスト例外でクリーンに拒絶 or 成功）/ **ungraceful**（許可リスト外の例外漏洩 = 発見）に決定的に分類、発見レポート (`_ai_workspace/discover/discover_NNN.md` + `.json`) を書き出す。一時ファイルは `tempfile.TemporaryDirectory(prefix="ccd_adversarial_")` 内に閉じ、live リポジトリには discover_NNN レポートのみが残る。
+- **対象パーサ 4 系統** — `ccd.protocol.parse_spec` / `ccd.protocol.parse_result` / `ccd.run_writer.load_records` / `ccd.run_writer.reconcile_run_file`。これらは**再利用・観察するだけで変更しない**（spec §3 — 発見クラッシュの修正は Phase 2）。`reconcile_run_file` は読み取り後に書き戻すパスを含むが、一時ファイルに食わせるので live 側への書き戻しは構造的に発生しない。
+- **吟味済み固定 18 ケース** — 現実に起きうる壊れ方の curated set:
+  1. `01_empty_file` — 0 バイト
+  2. `02_whitespace_only` — 空白だけ
+  3. `03_truncated_spec_mid_body` — spec が途中で切れた
+  4. `04_truncated_json_mid_value` — JSON が値の途中で切れた
+  5. `05_invalid_utf8_bytes` — 不正 UTF-8 バイト列
+  6. `06_utf8_bom_prefix` — UTF-8 BOM 先頭
+  7. `07_null_bytes_in_middle` — 途中に null バイト
+  8. `08_spec_missing_title_heading` — タイトル見出し無し
+  9. `09_result_missing_status_header` — Status 行無し
+  10. `10_result_invalid_status_value` — 未知の Status enum 値
+  11. `11_json_trailing_garbage` — JSON 末尾にゴミ
+  12. `12_json_unclosed_brace` — 閉じ括弧無し
+  13. `13_json_records_not_a_list` — `records` が文字列
+  14. `14_json_record_field_type_mismatch` — record の `started_at` が数値
+  15. `15_yaml_like_frontmatter_garbage` — `---` 風 frontmatter が壊れた YAML
+  16. `16_extremely_long_field_value` — 1 フィールドに ~256 KiB
+  17. `17_png_bytes_as_spec` — PNG ヘッダバイト
+  18. `18_unknown_future_schema_version` — 未知の `version` 番号
+- **graceful 許可リスト** — `ValueError` / `pydantic.ValidationError` / `json.JSONDecodeError`（`ValueError` 派生）/ `FileNotFoundError`。CCD の既存パーサが構造エラーを表現する型に一致。それ以外の例外漏洩は ungraceful = 発見扱い。
+- **`ccd discover --channel {mutation,adversarial}`** — `ccd/cli.py` の `discover` サブパーサに `--channel` 引数を追加。既定 `mutation`（**spec_013 挙動 完全不変**）、`--channel adversarial` で敵対的入力チャンネルを実行。チャンネルの振り分けは `ccd/discover.py:run_channel` に集約（mutation は `run_discovery`、adversarial は `run_adversarial` をディスパッチ）。
+- **`ccd/discover.py` の channel 定数** — `CHANNEL_MUTATION` / `CHANNEL_ADVERSARIAL` / `DEFAULT_CHANNEL` / `SUPPORTED_CHANNELS`。argparse の `choices` と `--channel` 既定値、`run_channel` のディスパッチで共有して typo 防御。
+- **`tests/test_adversarial.py` — 27 件** — 固定リストの吟味（18 ケース、unique、stable order、各「壊れ方」が網羅されている）/ 対象パーサ 4 系統の確認 / **graceful 分類**（`ValueError` / `JSONDecodeError` / `pydantic.ValidationError` / 成功）/ **ungraceful 分類**（`AttributeError` / `KeyError` / `IndexError` / `TypeError` / `RecursionError` / `UnicodeDecodeError`、パラメタライズで 5 件）/ 許可リストが spec の §2-2 と一致 / 本物パーサ統合（固定リスト × 4 パーサ、`UnicodeDecodeError` が全パーサで PNG / invalid_utf8 ケースで発見される）/ 事実サマリ決定性（同じ入力で同じ数値、findings 順序も決定的）/ 発見レポート md / json の内容 / discover_NNN 採番が mutation チャンネルと共有 / **一時ファイルが live リポジトリに書かれない**（live 配下の追加ファイルは `discover_NNN.{md,json}` 限定、`.bin` リーク無し）/ tmp ディレクトリが終了時に掃除される / CLI 既定が `mutation`（spec_013 挙動 不変）/ `--channel mutation` 明示 / `--channel adversarial` end-to-end / 不正な `--channel` を argparse `choices` で拒否 / `--paths` は adversarial では無視される。
+
+### Changed
+
+- `pyproject.toml` / `ccd/__init__.py` version `0.5.1` → `0.6.0`（**新チャンネル = minor bump**、spec §2-6）。
+- `tests/test_smoke.py::test_version_is_051` → `test_version_is_060`、`__version__ == "0.6.0"` を assert。
+- **`ccd/cli.py:_cmd_discover`** — channel スイッチを追加。`run_channel(channel, repo, paths, mutation_runner)` を呼び、結果型でディスプレイを分岐（mutation は mutmut 系の `mutants=` / `actionable:` 出力、adversarial は `parsers=` / `cases=` / `evaluations=` / `ungraceful:` 出力）。spec_013 のテストが期待する mutation 経路の stdout フォーマットは**完全に保持**。`--paths` は mutation 専用（adversarial では `run_channel` で破棄される）。
+- **`ccd/discover.py`** — 新規定数 `CHANNEL_MUTATION` / `CHANNEL_ADVERSARIAL` / `DEFAULT_CHANNEL` / `SUPPORTED_CHANNELS`、新規エントリ関数 `run_channel`。既存の `run_discovery` / `MutmutRunner` / `MutationRunner` / `FakeMutationRunner` のシグネチャ・挙動は無変更（spec_013 / 014 の既存テストは全件 green を維持）。
+
+### Constraints (spec §3)
+
+`ccd discover --channel adversarial` は**発見のみ**。発見されたクラッシュの修正は Phase 2（Phase 1 ではコアパーサ `ccd/protocol.py` / `ccd/run_writer.py` / `ccd/models.py` には触らない）。固定リストは**吟味済み・現実に起きうる壊れ方**を満たす curated set で、ランダムファズではない（同じ入力で同じ findings、再現可能）。一時ファイルは `tempfile.TemporaryDirectory` に閉じ、live リポジトリには discover_NNN レポートのみが書かれる。ハング検出は対象外 — in-process でタイムアウトを設けず、例外漏洩のみを観測する（spec §6、無限ループ系の壊れ入力は本 spec の対象外）。`mutation` チャンネルの挙動・出力・既存 CLI は完全に不変（既定 `--channel mutation` で spec_013 挙動を保つ）。
+
 ## [0.5.1] — 2026-05-24
 
 v2 Phase 1 安全性修正 — spec_014。spec_013 で実装した `ccd discover` を `ccd/` 全体でフル実走したところ、mutmut の in-place 改変が CCD のテスト隔離を破り、git 操作が**実 CCD リポジトリに漏れ出して `main` に迷子コミット (`impl spec_100`) を作る**事故が発生した（push はされず、復旧済み）。発見ステップは副作用ゼロでなければならない。`MutmutRunner` が mutmut を**隔離された使い捨てコピー**上で実行するよう修正し、実リポジトリ・その `.git`・ブランチ・`origin` リモートが**構造的に影響を受け得ない**状態にする。発見レポートは引き続き実リポジトリの `_ai_workspace/discover/` に書く（隔離されるのは mutmut の実行だけ）。「live モード」オプションは設けない（footgun）。
