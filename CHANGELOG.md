@@ -2,6 +2,40 @@
 
 本プロジェクトの注目すべき変更を記録する。フォーマットは [Keep a Changelog](https://keepachangelog.com/) に準ずる。
 
+## [0.5.1] — 2026-05-24
+
+v2 Phase 1 安全性修正 — spec_014。spec_013 で実装した `ccd discover` を `ccd/` 全体でフル実走したところ、mutmut の in-place 改変が CCD のテスト隔離を破り、git 操作が**実 CCD リポジトリに漏れ出して `main` に迷子コミット (`impl spec_100`) を作る**事故が発生した（push はされず、復旧済み）。発見ステップは副作用ゼロでなければならない。`MutmutRunner` が mutmut を**隔離された使い捨てコピー**上で実行するよう修正し、実リポジトリ・その `.git`・ブランチ・`origin` リモートが**構造的に影響を受け得ない**状態にする。発見レポートは引き続き実リポジトリの `_ai_workspace/discover/` に書く（隔離されるのは mutmut の実行だけ）。「live モード」オプションは設けない（footgun）。
+
+### Fixed
+
+- **発見ステップの隔離欠陥（spec_014）** — `MutmutRunner.run` は mutmut の subprocess 呼び出し（`mutmut run` / `mutmut results` / `mutmut show <id>`）を**全て**新規追加した `_isolated_clone(repo)` コンテキスト内で実行するようになった。隔離環境は tmp 配下に `shutil.copytree` で作る独立した使い捨てコピーで、(a) live の `ccd/` が in-place 改変されない、(b) 改変がテスト隔離を破って git 書き込み（commit/branch/checkout/push）が漏れても、コピー側の独立した `.git`（remote 全削除済み）に閉じ込められて実リポジトリに到達しない、(c) 終了時（成功・失敗・例外）に try/finally で確実に破棄される、(d) `PYTHONPATH` を隔離コピーで先頭詰めにして pytest が必ずコピー側の `ccd/` を import する（editable install が live を指していてもコピー優先）、の 4 条件を満たす。
+
+### Added
+
+- **`_isolated_clone(src) -> Path`** — `@contextmanager`。`tempfile.mkdtemp` で作った tmp ルート配下に `shutil.copytree` で src を複製し、`_strip_git_remotes` で全リモートを削除して yield、終了時に tmp ルートごと `shutil.rmtree(..., ignore_errors=True)`。除外パターン (`_ai_workspace`, `__pycache__`, `.pytest_cache`, `.ruff_cache`, `.mutmut-cache`, `.venv`, `venv`, `build`, `dist`, `*.egg-info`, `node_modules`) で重い／不要な階層をスキップ。`git clone --local` ではなく `copytree` を選んだのは「ディスク上の現状（未コミット編集を含む）に対する mutation testing」を保つため。
+- **`_strip_git_remotes(clone)`** — clone 配下に `.git` がなければ no-op、あれば `git -C <clone> remote` で列挙して 1 つずつ `remote remove`。git 不在は `FileNotFoundError` で握りつぶし（gracefully no-op）。
+- **`_workspace_env(workspace) -> dict[str, str]`** — `os.environ.copy()` に `PYTHONPATH=<workspace>(:<orig>)` を頭詰めで返す。mutmut が走らせる pytest が必ず**コピー側の** `ccd/` を import するようにする継ぎ目（spec_014 §2-1 (d) — editable install が live を指していてもコピー優先）。
+- **隔離証明テスト 9 件 — `tests/test_discover.py`**:
+  - `test_isolated_clone_simulated_mutmut_leak_does_not_pollute_live_repo` — **spec §2-4 のコア証明**。tmp 配下に実 git リポジトリを作り、`_isolated_clone` の中で実際の `git commit` / `git branch` を**漏らす操作**を実行し、その後 live 側の HEAD・log・ブランチ・remote が**バイト一致で不変**であることを assert。
+  - `test_isolated_clone_strips_origin_remote_so_push_has_no_target` — clone 側の remote が空集合になる。
+  - `test_isolated_clone_cleans_up_on_exception` — with ブロック内で例外を投げても workspace が削除される（try/finally）。
+  - `test_isolated_clone_excludes_heavy_or_unsafe_dirs` — `_ai_workspace` / `.venv` / `__pycache__` / `*.egg-info` / `.mutmut-cache` が clone に含まれない。
+  - `test_isolated_clone_captures_uncommitted_edits` — copytree なので未コミット編集も clone に乗る（git clone --local 不採用の根拠）。
+  - `test_strip_git_remotes_is_a_noop_without_dot_git` — `.git` 無しでもクラッシュしない。
+  - `test_workspace_env_prepends_pythonpath` / `test_workspace_env_works_when_pythonpath_unset` — `PYTHONPATH` の先頭詰め＆既存パスの保持。
+  - `test_mutmut_runner_subprocess_targets_isolated_clone_not_live_repo` — `subprocess.run` をモンキーパッチして、`MutmutRunner.run` が mutmut binary を呼ぶ全 subprocess の `cwd` が live ではなく `ccd_discover_iso_*` 配下であること＋`PYTHONPATH` が workspace 詰めであることを検証。
+  - `test_mutmut_runner_isolation_survives_real_git_writes_to_workspace` — `MutmutRunner` レベルでの **§2-4 端末証明**。モンキーパッチした「悪意ある mutmut」が cwd で実際に `git commit` するシナリオで live 側不変を assert。
+
+### Changed
+
+- **`MutmutRunner.run`** — mutmut の 3 つの subprocess (`run` / `results` / `show <id>`) を全て `with _isolated_clone(repo) as workspace` の中で実行。`cwd` を `workspace` に固定、`env` を `_workspace_env(workspace)` で構築（`PYTHONPATH` 先頭詰め）。`_show` のシグネチャは `(binary, repo, mid)` → `(binary, workspace, env, mid)` に変更（内部メソッド、外部影響なし）。
+- `pyproject.toml` / `ccd/__init__.py` version `0.5.0` → `0.5.1`（安全性 patch bump）。
+- `tests/test_smoke.py::test_version_is_050` → `test_version_is_051`、`__version__ == "0.5.1"` を assert。
+
+### Constraints (spec §2-3, §3)
+
+`ccd discover` は**常に**隔離環境で実行する。「live のワーキングツリーで走らせる」オプションは設けない（footgun）。CLI 引数 (`--repo` / `--paths`) と出力フォーマット (`_ai_workspace/discover/discover_NNN.md` + `.json`) は spec_013 と完全に不変 — 挙動（隔離）の修正のみで、API/出力は無変更。`FakeMutationRunner` ベースの spec_013 既存 22 テストは引き続き green（fake は実際の mutation を行わないので隔離不要・無関係に動く）。コアロジック (`ccd/{models,protocol,dispatch,chain,integrate,metrics,dashboard,run_writer,retry,backfill,agent,retrospect}.py`) と `ccd/cli.py` は無変更。実 `mutmut` も隔離機構の subprocess (git) もテストでは tmp_path に閉じる（spec §3）。
+
 ## [0.5.0] — 2026-05-24
 
 v2 Phase 1 第一弾 — spec_013。**ミューテーションテスト・チャンネルを `ccd discover` サブコマンド**として実装。`ccd` 自身のコードに小さな改変 (mutant) を仕込み、テストが捕まえるか試す。生き残った改変 = テストの隙間を、**安定な署名 (`file:line:mutation`) 付き**で発見レポートに列挙する。スケジューラ・他チャンネル (敵対的入力／AI推論)・自律修正は含まない (後続 spec / Phase 2)。手で叩いて発見の信号対雑音比を実データで見るための最小スライス。

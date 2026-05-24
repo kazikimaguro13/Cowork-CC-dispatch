@@ -17,15 +17,26 @@ discovery channels (adversarial-input / AI-inference), no auto-fix. The whole
 point is to verify that mutation discovery produces useful gaps for CCD's own
 code, surfaced manually via `ccd discover`. Triage / auto-blocklist
 maintenance are Phase 2.
+
+spec_014: `MutmutRunner` now runs mutmut inside a disposable isolated copy
+of the live repo (`_isolated_clone`), not against the live working tree. The
+live `ccd/` is therefore never in-place-mutated, and any runaway git write
+that a mutation might trigger inside CCD's own test suite hits the isolated
+copy's `.git` (with all remotes stripped) instead of the real repo. The
+discovery report itself is still written to the live repo's
+`_ai_workspace/discover/` — only mutation *execution* is isolated.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import subprocess
-from collections.abc import Iterable
+import tempfile
+from collections.abc import Iterable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
@@ -453,6 +464,123 @@ def _mutant_to_dict(m: Mutant) -> dict:
 
 
 # --------------------------------------------------------------------------- #
+# Isolation (spec_014) — mutmut runs in a disposable copy of the live repo
+# --------------------------------------------------------------------------- #
+
+# Directories/files excluded from the isolated copy. Two reasons:
+# (1) safety — `_ai_workspace/` belongs to the live repo (discovery reports go
+#     there, not the clone), and copying it back would create a hall of mirrors
+#     plus risk overwriting accumulated logs;
+# (2) speed — caches, build artifacts, vendored deps are huge and irrelevant
+#     to mutation testing of `ccd/`.
+_ISOLATION_IGNORE: tuple[str, ...] = (
+    "_ai_workspace",
+    "__pycache__",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".mutmut-cache",
+    ".venv",
+    "venv",
+    "build",
+    "dist",
+    "*.egg-info",
+    "node_modules",
+)
+
+
+@contextmanager
+def _isolated_clone(src: Path) -> Iterator[Path]:
+    """Yield a disposable, fully isolated copy of ``src``.
+
+    Guarantees (spec_014 §2-1):
+
+    (a) The live source tree is never touched — the clone is a separate
+        directory under a fresh ``tempfile.mkdtemp`` root, so mutmut's
+        in-place rewrites land in the copy.
+    (b) Any git write inside the clone (commit / branch / checkout / push)
+        cannot reach the real repo — the clone has its own ``.git`` (copied,
+        not hardlinked) and *every* git remote is stripped so push has no
+        target.
+    (c) The temporary tree is removed on success, failure, *and* exception
+        via try/finally.
+
+    We use ``shutil.copytree`` (not ``git clone --local``) deliberately:
+    mutation testing should reflect what's actually on disk now, including
+    uncommitted edits — ``git clone --local`` would silently skip them.
+    """
+
+    src = Path(src).resolve()
+    tmp_root = Path(tempfile.mkdtemp(prefix="ccd_discover_iso_"))
+    clone = tmp_root / src.name
+    try:
+        shutil.copytree(
+            src,
+            clone,
+            ignore=shutil.ignore_patterns(*_ISOLATION_IGNORE),
+            symlinks=False,
+            ignore_dangling_symlinks=True,
+        )
+        _strip_git_remotes(clone)
+        yield clone
+    finally:
+        # Use the temp ROOT (not `clone`) so we wipe partial copies too.
+        shutil.rmtree(tmp_root, ignore_errors=True)
+
+
+def _strip_git_remotes(clone: Path) -> None:
+    """Remove every git remote from the clone so push has no target.
+
+    No-ops if the clone has no ``.git`` directory or if ``git`` isn't on
+    PATH. The clone's ``.git`` is already a copied, independent directory
+    (no hardlinks), so commits/branches/refs are isolated by construction;
+    stripping remotes closes the one remaining escape hatch (a stray
+    ``git push origin``).
+    """
+
+    if not (clone / ".git").is_dir():
+        return
+    try:
+        listed = subprocess.run(
+            ["git", "-C", str(clone), "remote"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except (FileNotFoundError, OSError):
+        return
+    for name in (listed.stdout or "").split():
+        name = name.strip()
+        if not name:
+            continue
+        try:
+            subprocess.run(
+                ["git", "-C", str(clone), "remote", "remove", name],
+                capture_output=True,
+                check=False,
+            )
+        except (FileNotFoundError, OSError):
+            return
+
+
+def _workspace_env(workspace: Path) -> dict[str, str]:
+    """Build the env mutmut subprocesses run with.
+
+    Prepends the isolated workspace to ``PYTHONPATH`` so that when mutmut
+    invokes pytest, ``import ccd`` resolves to the *isolated copy's* ``ccd/``
+    — not whatever an editable install in the parent venv points at. Without
+    this, mutmut would mutate the copy but tests would import the live
+    source, making mutation testing silently no-op (spec_014 §2-1 (d)).
+    """
+
+    env = os.environ.copy()
+    existing = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = (
+        str(workspace) + (os.pathsep + existing if existing else "")
+    )
+    return env
+
+
+# --------------------------------------------------------------------------- #
 # MutmutRunner — subprocess wrapper (production)
 # --------------------------------------------------------------------------- #
 
@@ -466,6 +594,12 @@ class MutmutRunner:
     triple. If any step fails it returns an ``error``-bearing
     ``MutationRunOutcome`` — ``run_discovery`` then halts gracefully without
     a crash or traceback.
+
+    spec_014 — every mutmut subprocess is invoked inside ``_isolated_clone``
+    of the live repo, never against the live working tree. mutmut's in-place
+    file rewrites land in the disposable copy; any runaway git write a broken
+    mutation might trigger inside CCD's own test suite hits the copy's
+    remoteless ``.git`` instead of the real repo / origin.
     """
 
     DEFAULT_BINARY = "mutmut"
@@ -488,87 +622,99 @@ class MutmutRunner:
         binary = shutil.which(self._binary) or self._binary
         paths_arg = ",".join(paths) if paths else "."
 
-        try:
-            run_proc = subprocess.run(
-                [binary, "run", "--paths-to-mutate", paths_arg],
-                cwd=str(repo),
-                capture_output=True,
-                text=True,
-                timeout=self._timeout,
-                check=False,
-            )
-        except FileNotFoundError as exc:
-            return MutationRunOutcome(
-                mutants=[],
-                tool="mutmut",
-                error=f"mutmut binary not found ({exc.filename or self._binary})",
-            )
-        except subprocess.TimeoutExpired:
-            return MutationRunOutcome(
-                mutants=[],
-                tool="mutmut",
-                error=f"mutmut run timed out after {self._timeout}s",
-            )
+        with _isolated_clone(Path(repo)) as workspace:
+            env = _workspace_env(workspace)
 
-        # mutmut returns non-zero when any mutants survived — that is the
-        # *successful* path here (we want survivors). Only treat the run as
-        # failed when it explicitly says it couldn't start.
-        run_raw = (run_proc.stdout or "") + (run_proc.stderr or "")
-        if run_proc.returncode not in (0, 1, 2) and not run_raw.strip():
-            return MutationRunOutcome(
-                mutants=[],
-                tool="mutmut",
-                raw_output=run_raw,
-                error=(
-                    f"mutmut run exited {run_proc.returncode} with no output"
-                ),
-            )
+            try:
+                run_proc = subprocess.run(
+                    [binary, "run", "--paths-to-mutate", paths_arg],
+                    cwd=str(workspace),
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    timeout=self._timeout,
+                    check=False,
+                )
+            except FileNotFoundError as exc:
+                return MutationRunOutcome(
+                    mutants=[],
+                    tool="mutmut",
+                    error=f"mutmut binary not found ({exc.filename or self._binary})",
+                )
+            except subprocess.TimeoutExpired:
+                return MutationRunOutcome(
+                    mutants=[],
+                    tool="mutmut",
+                    error=f"mutmut run timed out after {self._timeout}s",
+                )
 
-        try:
-            results_proc = subprocess.run(
-                [binary, "results"],
-                cwd=str(repo),
-                capture_output=True,
-                text=True,
-                timeout=self._timeout,
-                check=False,
-            )
-        except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
-            return MutationRunOutcome(
-                mutants=[],
-                tool="mutmut",
-                raw_output=run_raw,
-                error=f"mutmut results failed: {exc}",
-            )
+            # mutmut returns non-zero when any mutants survived — that is the
+            # *successful* path here (we want survivors). Only treat the run as
+            # failed when it explicitly says it couldn't start.
+            run_raw = (run_proc.stdout or "") + (run_proc.stderr or "")
+            if run_proc.returncode not in (0, 1, 2) and not run_raw.strip():
+                return MutationRunOutcome(
+                    mutants=[],
+                    tool="mutmut",
+                    raw_output=run_raw,
+                    error=(
+                        f"mutmut run exited {run_proc.returncode} with no output"
+                    ),
+                )
 
-        raw_output = (run_raw + "\n" + (results_proc.stdout or "")).strip()
-        groups = _parse_mutmut_results(results_proc.stdout or "")
-        mutants: list[Mutant] = []
-        for status, by_file in groups.items():
-            for file_path, ids in by_file.items():
-                for mid in ids:
-                    file_from_show, line, desc = self._show(binary, repo, mid)
-                    mutants.append(
-                        Mutant(
-                            file=file_from_show or file_path,
-                            line=line,
-                            mutation=desc or f"mutmut:{mid}",
-                            status=status,
+            try:
+                results_proc = subprocess.run(
+                    [binary, "results"],
+                    cwd=str(workspace),
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    timeout=self._timeout,
+                    check=False,
+                )
+            except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+                return MutationRunOutcome(
+                    mutants=[],
+                    tool="mutmut",
+                    raw_output=run_raw,
+                    error=f"mutmut results failed: {exc}",
+                )
+
+            raw_output = (run_raw + "\n" + (results_proc.stdout or "")).strip()
+            groups = _parse_mutmut_results(results_proc.stdout or "")
+            mutants: list[Mutant] = []
+            for status, by_file in groups.items():
+                for file_path, ids in by_file.items():
+                    for mid in ids:
+                        file_from_show, line, desc = self._show(
+                            binary, workspace, env, mid
                         )
-                    )
-        return MutationRunOutcome(
-            mutants=mutants,
-            tool="mutmut",
-            raw_output=raw_output,
-        )
+                        mutants.append(
+                            Mutant(
+                                file=file_from_show or file_path,
+                                line=line,
+                                mutation=desc or f"mutmut:{mid}",
+                                status=status,
+                            )
+                        )
+            return MutationRunOutcome(
+                mutants=mutants,
+                tool="mutmut",
+                raw_output=raw_output,
+            )
 
     def _show(
-        self, binary: str, repo: Path, mid: str
+        self,
+        binary: str,
+        workspace: Path,
+        env: dict[str, str],
+        mid: str,
     ) -> tuple[str | None, int, str]:
         try:
             proc = subprocess.run(
                 [binary, "show", mid],
-                cwd=str(repo),
+                cwd=str(workspace),
+                env=env,
                 capture_output=True,
                 text=True,
                 timeout=self._timeout,
