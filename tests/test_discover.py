@@ -21,17 +21,22 @@ import pytest
 
 from ccd import cli
 from ccd.discover import (
+    CANARY_MIN_MUTANTS_FOR_HALT,
     DEFAULT_BLOCKLIST_FILENAME,
     DEFAULT_DISCOVER_DIR_REL,
     DiscoveryResult,
     DiscoverySummary,
     FakeMutationRunner,
+    IsoVenvProvisioningError,
     Mutant,
     MutationRunOutcome,
     MutmutRunner,
+    _collect_killed_mutants_from_cache,
+    _detect_broken_mutation_setup,
     _isolated_clone,
     _parse_mutmut_results,
     _parse_mutmut_show,
+    _provision_iso_venv,
     _strip_git_remotes,
     _workspace_env,
     run_discovery,
@@ -764,6 +769,44 @@ def test_workspace_env_works_when_pythonpath_unset(
     assert env["PYTHONPATH"] == str(tmp_path / "work")
 
 
+def test_workspace_env_prepends_iso_venv_bin_to_path(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """spec_019 — mutmut's default runner is ``python -m pytest``; the iso-
+    venv's bin/ must come first on $PATH so ``python`` resolves there."""
+
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    iso_bin = tmp_path / "iso-venv" / "bin"
+    env = _workspace_env(tmp_path / "work", iso_venv_bin=iso_bin)
+
+    import os as _os
+
+    parts = env["PATH"].split(_os.pathsep)
+    assert parts[0] == str(iso_bin)
+    # Pre-existing $PATH entries are preserved.
+    assert "/usr/bin" in parts
+    # VIRTUAL_ENV points to the iso-venv's root so child Python doesn't
+    # think it's running under the *parent* venv.
+    assert env["VIRTUAL_ENV"] == str(iso_bin.parent)
+
+
+def test_workspace_env_without_iso_venv_does_not_touch_path(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """spec_019 — back-compat: when iso_venv_bin is None, no PATH rewrite."""
+
+    import os as _os
+
+    parent_virtual_env = _os.environ.get("VIRTUAL_ENV", "")
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    env = _workspace_env(tmp_path / "work")
+
+    assert env["PATH"] == "/usr/bin:/bin"
+    # VIRTUAL_ENV is only overwritten when iso_venv_bin is supplied;
+    # without it, the parent's VIRTUAL_ENV (or absence) is preserved.
+    assert env.get("VIRTUAL_ENV", "") == parent_virtual_env
+
+
 def test_mutmut_runner_subprocess_targets_isolated_clone_not_live_repo(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -773,6 +816,12 @@ def test_mutmut_runner_subprocess_targets_isolated_clone_not_live_repo(
     of them is the live repo path. The fact that something else (the clone)
     is used is the spec_014 §2-1 (a) guarantee from the production runner's
     side. No real mutmut runs.
+
+    spec_019: the iso-venv provisioner is stubbed so the test runs offline
+    (no actual ``python -m venv`` / ``pip install``). MutmutRunner's
+    binary-resolution path falls back to ``shutil.which`` when the stub
+    points at a nonexistent bin dir — which is fine for this test because
+    we intercept every mutmut invocation anyway.
     """
 
     src = tmp_path / "src"
@@ -801,6 +850,11 @@ def test_mutmut_runner_subprocess_targets_isolated_clone_not_live_repo(
 
     monkeypatch.setattr("ccd.discover.subprocess.run", fake_run)
 
+    def fake_provision(workspace, *, parent_python=None, timeout=None):  # type: ignore[no-untyped-def]
+        return workspace / ".ccd-iso-venv" / "bin"
+
+    monkeypatch.setattr("ccd.discover._provision_iso_venv", fake_provision)
+
     runner = MutmutRunner()
     outcome = runner.run(repo=src, paths=["ccd"])
 
@@ -818,12 +872,18 @@ def test_mutmut_runner_subprocess_targets_isolated_clone_not_live_repo(
             f"cwd {cwd!r} does not look like an isolated workspace"
         )
     # PYTHONPATH was passed and prepended with the workspace.
+    # PATH was prepended with the iso-venv's bin/.
     assert envs_seen
     for env in envs_seen:
         pp = env.get("PYTHONPATH", "")
         first = pp.split(":")[0] if ":" in pp else pp
         assert "ccd_discover_iso_" in first, (
             f"PYTHONPATH not prefixed with workspace: {pp!r}"
+        )
+        path = env.get("PATH", "")
+        first_path = path.split(":")[0] if ":" in path else path
+        assert ".ccd-iso-venv/bin" in first_path, (
+            f"PATH not prefixed with iso-venv bin: {path!r}"
         )
     # The outcome is empty (no mutants) and not an error.
     assert outcome.error == ""
@@ -899,6 +959,15 @@ def test_mutmut_runner_isolation_survives_real_git_writes_to_workspace(
 
     monkeypatch.setattr("ccd.discover.subprocess.run", malicious_mutmut)
 
+    # spec_019: stub out venv provisioning so this isolation test stays
+    # offline — the malicious_mutmut fake patches the mutmut subprocess
+    # itself, so a real iso-venv install isn't needed to exercise the
+    # git-leak isolation contract.
+    def fake_provision(workspace, *, parent_python=None, timeout=None):  # type: ignore[no-untyped-def]
+        return workspace / ".ccd-iso-venv" / "bin"
+
+    monkeypatch.setattr("ccd.discover._provision_iso_venv", fake_provision)
+
     runner = MutmutRunner()
     runner.run(repo=src, paths=["."])
 
@@ -915,3 +984,402 @@ def test_mutmut_runner_isolation_survives_real_git_writes_to_workspace(
     assert _git_log(src) == log_before
     assert _git_branches(src) == branches_before
     assert not (src / "LEAK.txt").exists()
+
+
+# --------------------------------------------------------------------------- #
+# spec_019 — iso-venv provisioning + canary
+# --------------------------------------------------------------------------- #
+
+
+def _make_canary_mutants(*, total: int, killed: int) -> list[Mutant]:
+    """Build a synthetic mutant list with the requested status mix.
+
+    Used to exercise the canary detector independent of mutmut. ``killed``
+    are real `killed` Mutants; the rest are `survived`.
+    """
+
+    assert killed <= total
+    out: list[Mutant] = []
+    for i in range(killed):
+        out.append(
+            Mutant(
+                file="ccd/agent.py", line=i + 1, mutation="k", status="killed"
+            )
+        )
+    for i in range(total - killed):
+        out.append(
+            Mutant(
+                file="ccd/agent.py",
+                line=100 + i,
+                mutation="s",
+                status="survived",
+            )
+        )
+    return out
+
+
+def test_canary_halts_when_many_mutants_but_zero_killed(repo: Path) -> None:
+    """spec_019 §2-2 — refuse to ship a 0-killed report.
+
+    Replays the spec_019 incident shape: mutmut reports a large number of
+    mutants, all survived, zero killed. This pattern is structurally
+    impossible for a real test suite and is the unambiguous signature that
+    ``import ccd`` is being routed away from the mutated clone. The
+    discovery halts; no report files are written.
+    """
+
+    mutants = _make_canary_mutants(total=1273, killed=0)
+    runner = FakeMutationRunner(mutants=mutants)
+
+    result = run_discovery(runner, repo=repo)
+
+    assert result.success is False
+    assert "mutation setup is broken" in result.halt_reason
+    assert "canary mutant survived" in result.halt_reason
+    assert "0 killed out of 1273" in result.halt_reason
+    # No report files written — the 0-killed list is not actionable data.
+    assert result.report_md_path is None
+    assert result.report_json_path is None
+    discover_dir = repo / DEFAULT_DISCOVER_DIR_REL
+    assert list(discover_dir.glob("discover_*.md")) == []
+    assert list(discover_dir.glob("discover_*.json")) == []
+
+
+def test_canary_passes_when_at_least_one_killed(repo: Path) -> None:
+    """spec_019 — the canary only fires on a *structurally* 0% kill rate.
+
+    A single killed mutant is sufficient evidence that mutmut is actually
+    exercising the tests; subsequent survivors are real test gaps.
+    """
+
+    mutants = _make_canary_mutants(total=20, killed=1)
+    runner = FakeMutationRunner(mutants=mutants)
+
+    result = run_discovery(runner, repo=repo)
+
+    assert result.success is True
+    assert result.halt_reason == ""
+    assert result.report_md_path is not None and result.report_md_path.exists()
+
+
+def test_canary_does_not_fire_below_threshold(repo: Path) -> None:
+    """spec_019 — a tiny run can legitimately produce 0 killed (e.g. a one-
+    file probe whose only mutants are equivalent). The canary only triggers
+    once there are enough mutants for ``0 killed`` to be impossible.
+    """
+
+    assert CANARY_MIN_MUTANTS_FOR_HALT >= 2
+    mutants = _make_canary_mutants(
+        total=CANARY_MIN_MUTANTS_FOR_HALT - 1, killed=0
+    )
+    runner = FakeMutationRunner(mutants=mutants)
+
+    result = run_discovery(runner, repo=repo)
+
+    # Under threshold → report still written; operator can read the
+    # `actionable` section and decide.
+    assert result.success is True
+    assert result.halt_reason == ""
+
+
+def test_canary_does_not_fire_for_zero_mutants(repo: Path) -> None:
+    """spec_019 — a clean run (no mutations produced at all) is graceful,
+    not a setup failure. The canary only flags ``ran but couldn't see``."""
+
+    runner = FakeMutationRunner(mutants=[])
+
+    result = run_discovery(runner, repo=repo)
+
+    assert result.success is True
+    assert result.halt_reason == ""
+
+
+def test_detect_broken_mutation_setup_pure_function() -> None:
+    """Unit test the canary predicate directly so the threshold semantics
+    can never silently drift away from the test suite's expectation."""
+
+    def _summary(*, total: int, killed: int) -> DiscoverySummary:
+        breakdown: dict[str, int] = {}
+        if killed:
+            breakdown["killed"] = killed
+        if total - killed:
+            breakdown["survived"] = total - killed
+        return DiscoverySummary(
+            tool="fake",
+            target_paths=("ccd",),
+            mutants_total=total,
+            status_breakdown=breakdown,
+            survived_total=total - killed,
+            survived_by_file={},
+            blocklisted_total=0,
+            actionable_total=total - killed,
+        )
+
+    # Below threshold: pass.
+    assert _detect_broken_mutation_setup(_summary(total=2, killed=0)) == ""
+    # Zero mutants: pass.
+    assert _detect_broken_mutation_setup(_summary(total=0, killed=0)) == ""
+    # At/above threshold with zero killed: fire.
+    msg = _detect_broken_mutation_setup(
+        _summary(total=CANARY_MIN_MUTANTS_FOR_HALT, killed=0)
+    )
+    assert "mutation setup is broken" in msg
+    # Above threshold with one killed: pass.
+    assert (
+        _detect_broken_mutation_setup(
+            _summary(total=100, killed=1)
+        )
+        == ""
+    )
+
+
+def test_cli_canary_halt_surfaces_through_discover(
+    repo: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """spec_019 — CLI halt path renders the canary halt_reason on stderr
+    with rc=1 so the operator (and CI) see why no report was emitted."""
+
+    mutants = _make_canary_mutants(total=50, killed=0)
+    runner = FakeMutationRunner(mutants=mutants)
+
+    rc = cli.main(["discover", "--repo", str(repo)], mutation_runner=runner)
+
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "discovery halted" in err
+    assert "mutation setup is broken" in err
+
+
+# --------------------------------------------------------------------------- #
+# spec_019 — iso-venv provisioning
+# --------------------------------------------------------------------------- #
+
+
+def test_provision_iso_venv_creates_clone_local_python(tmp_path: Path) -> None:
+    """spec_019 §2-1 — the iso-venv must live INSIDE the clone (so its
+    site-packages comes first on the iso-Python's sys.path, and its
+    editable finder — pointing at the clone — wins over the parent's).
+
+    This is an integration-style test that actually runs ``python -m venv``
+    and ``pip install -e`` against a minimal pyproject project. Marked
+    skippable when pip is unavailable (e.g. unusual CI envs) since the
+    iso-venv install is the production path under test.
+    """
+
+    workspace = tmp_path / "clone"
+    workspace.mkdir()
+    (workspace / "pyproject.toml").write_text(
+        "[build-system]\n"
+        'requires = ["setuptools>=68"]\n'
+        'build-backend = "setuptools.build_meta"\n'
+        "\n"
+        "[project]\n"
+        'name = "ccd-iso-fixture"\n'
+        'version = "0.0.1"\n'
+        'requires-python = ">=3.11"\n'
+        "\n"
+        "[tool.setuptools.packages.find]\n"
+        'include = ["ccd*"]\n',
+        encoding="utf-8",
+    )
+    (workspace / "ccd").mkdir()
+    (workspace / "ccd" / "__init__.py").write_text(
+        "MARKER = 'clone'\n", encoding="utf-8"
+    )
+
+    try:
+        iso_bin = _provision_iso_venv(workspace, timeout=180)
+    except IsoVenvProvisioningError as exc:
+        pytest.skip(f"iso-venv toolchain unavailable: {exc}")
+
+    assert iso_bin.exists()
+    assert iso_bin.is_dir()
+    assert iso_bin.parent == workspace / ".ccd-iso-venv"
+    iso_python = iso_bin / "python"
+    assert iso_python.exists()
+
+    # The iso-venv's Python must import the *clone's* ccd, not any other.
+    # We use --runtime probe: spawn iso-python and resolve `ccd.MARKER`.
+    proc = subprocess.run(
+        [str(iso_python), "-c", "import ccd; print(ccd.MARKER); print(ccd.__file__)"],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=str(workspace),
+    )
+    assert proc.returncode == 0, (
+        f"iso-python failed to import ccd: rc={proc.returncode} "
+        f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
+    )
+    assert "clone" in proc.stdout.splitlines()[0]
+    # The resolved file path must be inside the clone — proving the iso-
+    # venv's import machinery beats whatever the parent venv installs.
+    resolved_path = Path(proc.stdout.splitlines()[1]).resolve()
+    assert str(workspace.resolve()) in str(resolved_path), (
+        f"iso-python imported ccd from {resolved_path}, "
+        f"expected something under {workspace}"
+    )
+
+
+def test_provision_iso_venv_wraps_venv_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """spec_019 — provisioning errors must surface as
+    IsoVenvProvisioningError so MutmutRunner.run can convert them into a
+    graceful MutationRunOutcome.error rather than a traceback."""
+
+    def boom(*args, **kwargs):  # type: ignore[no-untyped-def]
+        raise subprocess.CalledProcessError(
+            returncode=1, cmd=args, output="", stderr="venv exploded"
+        )
+
+    monkeypatch.setattr("ccd.discover.subprocess.run", boom)
+
+    with pytest.raises(IsoVenvProvisioningError, match="venv creation failed"):
+        _provision_iso_venv(tmp_path / "clone")
+
+
+def _write_fake_mutmut_cache(
+    cache_path: Path,
+    *,
+    killed: list[tuple[str, int]] | None = None,
+) -> None:
+    """Build a minimal SQLite db mirroring mutmut 2.5.x's cache schema.
+
+    Only the columns CCD's reader joins on are populated. ``killed`` is a
+    list of ``(filename, line_number)`` pairs — each becomes one killed
+    Mutant row pointing at one Line row pointing at one SourceFile row.
+    """
+
+    import sqlite3 as _sql
+
+    con = _sql.connect(cache_path)
+    cur = con.cursor()
+    cur.executescript(
+        """
+        CREATE TABLE SourceFile (
+            id INTEGER PRIMARY KEY,
+            filename TEXT NOT NULL,
+            hash TEXT
+        );
+        CREATE TABLE Line (
+            id INTEGER PRIMARY KEY,
+            sourcefile INTEGER NOT NULL,
+            line TEXT,
+            line_number INTEGER NOT NULL
+        );
+        CREATE TABLE Mutant (
+            id INTEGER PRIMARY KEY,
+            line INTEGER NOT NULL,
+            "index" INTEGER,
+            tested_against_hash TEXT,
+            status TEXT NOT NULL
+        );
+        """
+    )
+    file_ids: dict[str, int] = {}
+    line_ids: dict[tuple[str, int], int] = {}
+    next_file = 1
+    next_line = 1
+    next_mutant = 1
+    for filename, line_no in killed or []:
+        if filename not in file_ids:
+            file_ids[filename] = next_file
+            cur.execute(
+                "INSERT INTO SourceFile(id, filename, hash) VALUES (?, ?, ?)",
+                (next_file, filename, "h"),
+            )
+            next_file += 1
+        line_key = (filename, line_no)
+        if line_key not in line_ids:
+            line_ids[line_key] = next_line
+            cur.execute(
+                "INSERT INTO Line(id, sourcefile, line, line_number) "
+                "VALUES (?, ?, ?, ?)",
+                (next_line, file_ids[filename], "x", line_no),
+            )
+            next_line += 1
+        cur.execute(
+            'INSERT INTO Mutant(id, line, "index", '
+            "tested_against_hash, status) VALUES (?, ?, ?, ?, ?)",
+            (next_mutant, line_ids[line_key], 0, "h", "ok_killed"),
+        )
+        next_mutant += 1
+    con.commit()
+    con.close()
+
+
+def test_collect_killed_mutants_from_cache_reads_killed_rows(
+    tmp_path: Path,
+) -> None:
+    """spec_019 — without this, ``killed`` always reports 0 because
+    ``mutmut results`` omits killed mutants from its output."""
+
+    workspace = tmp_path / "clone"
+    workspace.mkdir()
+    _write_fake_mutmut_cache(
+        workspace / ".mutmut-cache",
+        killed=[
+            ("ccd/protocol.py", 17),
+            ("ccd/protocol.py", 18),
+            ("ccd/agent.py", 42),
+        ],
+    )
+
+    killed = _collect_killed_mutants_from_cache(workspace)
+
+    assert len(killed) == 3
+    assert all(m.status == "killed" for m in killed)
+    by_file: dict[str, int] = {}
+    for m in killed:
+        by_file[m.file] = by_file.get(m.file, 0) + 1
+    assert by_file == {"ccd/protocol.py": 2, "ccd/agent.py": 1}
+
+
+def test_collect_killed_mutants_from_cache_missing_returns_empty(
+    tmp_path: Path,
+) -> None:
+    """No cache file → empty list (best-effort; canary halts the run)."""
+
+    workspace = tmp_path / "clone"
+    workspace.mkdir()
+    assert _collect_killed_mutants_from_cache(workspace) == []
+
+
+def test_collect_killed_mutants_from_cache_bad_schema_returns_empty(
+    tmp_path: Path,
+) -> None:
+    """Schema drift / unreadable cache → empty list, no crash."""
+
+    workspace = tmp_path / "clone"
+    workspace.mkdir()
+    # Write a non-SQLite file at the cache path — sqlite3.connect() opens
+    # it lazily, then the SELECT fails. The reader must swallow it.
+    (workspace / ".mutmut-cache").write_text("not a sqlite db", encoding="utf-8")
+    assert _collect_killed_mutants_from_cache(workspace) == []
+
+
+def test_mutmut_runner_returns_error_when_iso_venv_provisioning_fails(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """spec_019 — when the iso-venv can't be built, the runner returns an
+    error-bearing MutationRunOutcome (so `run_discovery` halts gracefully
+    with `success=False` and a clear halt_reason) instead of crashing."""
+
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "ccd").mkdir()
+    (src / "ccd" / "__init__.py").write_text("# x\n", encoding="utf-8")
+
+    def boom(workspace, *, parent_python=None, timeout=None):  # type: ignore[no-untyped-def]
+        raise IsoVenvProvisioningError("simulated venv breakage")
+
+    monkeypatch.setattr("ccd.discover._provision_iso_venv", boom)
+
+    runner = MutmutRunner()
+    outcome = runner.run(repo=src, paths=["ccd"])
+
+    assert outcome.error
+    assert "iso-venv provisioning failed" in outcome.error
+    assert "simulated venv breakage" in outcome.error
+    assert outcome.mutants == []
