@@ -2,6 +2,38 @@
 
 本プロジェクトの注目すべき変更を記録する。フォーマットは [Keep a Changelog](https://keepachangelog.com/) に準ずる。
 
+## [0.9.0] — 2026-05-24
+
+v2 Phase 1 のプロファイル基盤 — spec_018。`docs/DESIGN.md §9.3` の論点1で確定したとおり、v2 のループは**初日からプロファイル駆動で設計する**。プロファイル = 対象リポジトリ・発見戦略・スケジュール、といった設定一式で、「CCD 自己保守」は「プロファイル1個のループ」、将来クライアントリポジトリを足すのは「プロファイルを足す設定作業」に落ちる。spec_018 はそのモデルとローダを `ccd/profile.py` に追加し、`ccd profile` サブコマンド (9 つ目) で実効プロファイルを表示・検証できるようにする。
+
+**spec_018 はモデル＋ローダ＋表示用サブコマンドの追加のみ** — `ccd discover` / `brief` / `dispatch` などの既存サブコマンドは**再配線しない**。プロファイルを実際に消費して夜間実行を駆動するのはスケジューラ (spec_019) の責務。これにより spec_018 は既存挙動をゼロ変更で済む。
+
+### Added
+
+- **`ccd/profile.py` 新モジュール** — pydantic ベースの `Profile` モデル + TOML ローダ。
+  - **`Profile`** モデル — `repo: str = "."` / `discovery: DiscoveryConfig` / `schedule: ScheduleConfig` の 3 フィールド構成。すべて既定値つき。`extra="forbid"` でスキーマ違反 (未知フィールド・誤字) を黙って無視せず明確なエラーにする。
+  - **`DiscoveryConfig`** — `channels: list[str] = [mutation, adversarial, ai]` / `mutation_paths: list[str] = [ccd]`。`channels` は `KNOWN_CHANNELS` (= spec_013/015/016 の発見 3 チャンネル) に厳格に制限。
+  - **`ScheduleConfig`** — `nightly_at: str = "02:00"`。`HH:MM` (00:00–23:59) 形式を field validator で検証。
+  - **`load_profile(repo, path=None) -> Profile`** — 既定 `<repo>/_ai_workspace/ccd_profile.toml` を読む。ファイルが無ければ全既定値の `Profile()` を返す (graceful — プロファイル未設定でも CCD は動く)。TOML パースエラー・スキーマ違反は `ValueError` で raise (offending file path を必ず含める)。**捏造しない／黙って既定に倒さない** (spec §2-1)。
+  - **`load_profile_with_source(repo, path=None) -> ProfileLoadResult`** — `ccd profile` 用。プロファイル本体に加えて、`source` (実際に読まれたパス、ファイルが無ければ `None`) と `expected_path` (常にチェック対象パス) を返す。
+  - **`render_profile(result) -> str`** — `ccd profile` の出力レンダラ。TOML 互換シンタックスで実効プロファイルを描画 (operator がコピペで `ccd_profile.toml` に貼り戻せる形)、先頭コメントで「どのファイルから読んだか／既定を使ったか」を明示。
+- **`ccd profile` サブコマンド (9 つ目)** — `--repo`(既定 cwd) / `--profile`(任意、TOML パス明示)。実効プロファイルを stdout に表示。プロファイル不正なら stderr に `profile error: ...` を書いて非ゼロ終了。既存サブコマンド (`dispatch` / `chain` / `report` / `dashboard` / `retrospect` / `discover` / `brief` / `reconcile`) の挙動・引数・stdout は**完全に保持**。
+- **`tests/test_profile.py`** — 18 テスト: フル profile TOML 読み取り / 全フィールドが正しく入る / 既定パス & 明示パス / プロファイルファイル不在で全既定値 (graceful) / 部分プロファイル (一部フィールドのみ) は記述分が反映され残りは既定 / 不正 TOML は `ValueError` / 未知フィールド (Phase 2 `safety` 等) は `ValueError` / 未知チャンネルは `ValueError` / `nightly_at` の `HH:MM` 検証 / 型違い (list 期待で string) は `ValueError` / 既定の決定性 / 読み込みプロファイルの決定性 / `resolve_profile_path` の挙動 / CLI が既定値を表示 / CLI がロードされたファイルを表示 / CLI `--profile` の明示パス / CLI 不正で非ゼロ終了 / CLI 不正 TOML で非ゼロ終了。
+
+### Changed
+
+- `pyproject.toml` / `ccd/__init__.py` version `0.8.0` → `0.9.0` (**新機能 = minor bump**、spec §2-6)。
+- `tests/test_smoke.py::test_version_is_080` → `test_version_is_090`、`__version__ == "0.9.0"` を assert。
+- **`ccd/cli.py`** — `profile` サブパーサ追加 (`--repo` / `--profile`)、`main()` のディスパッチに `if args.command == "profile":` 分岐、`_cmd_profile` ハンドラを追加。既存サブコマンド (8 つ) の挙動・引数・stdout は**完全に保持**。
+
+### Constraints (spec §3)
+
+- **触ってよい**: `ccd/profile.py` (新規)、`ccd/cli.py` (`profile` サブコマンドのみ)、`tests/`、`CHANGELOG.md`、`pyproject.toml`、`ccd/__init__.py`。
+- **触ってない**: `ccd/{models,protocol,dispatch,chain,integrate,metrics,dashboard,run_writer,retry,backfill,agent,retrospect,discover,adversarial,ai_review,brief}.py` のコアロジックは 1 行も変更していない (再利用は無し、純粋に新規モジュール追加)。`docs/` も触らない。
+- TOML パースは Python 標準の `tomllib` (3.11+ 標準)。新規依存は足していない。
+- **Phase 2 フィールドは予約**: `safety` (`branch-only` / `push`)、コスト境界、未push バックログ閾値等は `ccd/profile.py` の docstring に「Phase 2 で実装予定」として文書化 (本 spec では実装しない、YAGNI、§9.7 の Phase 分け)。`extra="forbid"` のおかげで Phase 2 フィールドを誤って TOML に書いた operator は明確なエラーで気付ける。
+- 既存サブコマンドの挙動は不変 — spec_018 はモデル＋ローダ＋新サブコマンドの追加のみ、再配線なし (spec §2-4)。
+
 ## [0.8.0] — 2026-05-24
 
 v2 Phase 1 の人間向け成果物 — spec_017。spec_013/014（ミューテーション）/ spec_015（敵対的入力）/ spec_016（AI推論）の発見3チャンネルが個別に出す `_ai_workspace/discover/discover_NNN.{md,json}` を **1枚の朝レポート**に集約するレンダラ `ccd brief` を追加。`docs/DESIGN.md §9.6` の朝レポート構造を Phase 1（発見のみ・自律修正なし、§9.7）に適応した6セクション (A〜F) の Markdown を `_ai_workspace/nightly/report_YYYY-MM-DD.md` に出す。

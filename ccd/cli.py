@@ -39,6 +39,7 @@ from ccd.discover import (
 from ccd.integrate import DEFAULT_SMOKE_COMMANDS
 from ccd.metrics import aggregate, render_report
 from ccd.models import DispatchRecord, DispatchStatus
+from ccd.profile import load_profile_with_source, render_profile
 from ccd.protocol import parse_spec
 from ccd.retrospect import DEFAULT_LIMIT as DEFAULT_RETROSPECT_LIMIT
 from ccd.retrospect import run_retrospect
@@ -307,6 +308,34 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    p_profile = sub.add_parser(
+        "profile",
+        help=(
+            "Load and display the effective ccd profile (spec_018, v2 "
+            "Phase 1)."
+        ),
+        description=(
+            "Read the TOML profile (default: "
+            "<repo>/_ai_workspace/ccd_profile.toml) and print the effective "
+            "profile with all defaults filled in. Reports whether the "
+            "profile was loaded from a file or assembled from defaults. "
+            "Profile parse / schema errors are surfaced with a non-zero "
+            "exit. The profile is consumed by the scheduler (spec_019); "
+            "existing subcommands are not rewired by spec_018."
+        ),
+    )
+    p_profile.add_argument("--repo", type=Path, default=None)
+    p_profile.add_argument(
+        "--profile",
+        dest="profile_path",
+        type=Path,
+        default=None,
+        help=(
+            "Explicit profile TOML path. When omitted, the loader looks "
+            "at <repo>/_ai_workspace/ccd_profile.toml."
+        ),
+    )
+
     p_reconcile = sub.add_parser(
         "reconcile",
         help="Reconcile orphan RUNNING records to HALTED + INTERRUPTED.",
@@ -349,6 +378,8 @@ def main(
         return _cmd_discover(args, mutation_runner, runner)
     if args.command == "brief":
         return _cmd_brief(args)
+    if args.command == "profile":
+        return _cmd_profile(args)
     if args.command == "reconcile":
         return _cmd_reconcile(args)
 
@@ -587,6 +618,18 @@ def _cmd_brief(args: argparse.Namespace) -> int:
     if summary.channels_missing:
         missing = ", ".join(summary.channels_missing)
         print(f"channels not yet executed: {missing}")
+    return 0
+
+
+def _cmd_profile(args: argparse.Namespace) -> int:
+    repo = _resolve_repo(args.repo)
+    profile_path = getattr(args, "profile_path", None)
+    try:
+        result = load_profile_with_source(repo, profile_path)
+    except ValueError as exc:
+        print(f"profile error: {exc}", file=sys.stderr)
+        return 1
+    print(render_profile(result))
     return 0
 
 
