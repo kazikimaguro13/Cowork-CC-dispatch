@@ -460,6 +460,14 @@ def run_nightly(
     dispatch_timeout_s: float | None = None,
     # spec_028 — propose-mode workspace seam
     isolated_workspace: IsolatedWorkspace | None = None,
+    # spec_029 — per-policy output redirection. The sweep entry point
+    # (``ccd nightly-all``) passes CCD-side per-policy directories so the
+    # target repo never sees a write (the propose/off invariant) and
+    # multi-policy runs keep their artifacts siloed. Default ``None``
+    # preserves the single-policy flat layout under ``<repo>/_ai_workspace/``.
+    discover_dir: Path | None = None,
+    brief_dir: Path | None = None,
+    proposal_dir: Path | None = None,
 ) -> NightlyResult:
     """Drive one nightly orchestration end-to-end.
 
@@ -522,6 +530,7 @@ def run_nightly(
         mutation_paths=list(effective_profile.discovery.mutation_paths),
         repo=repo,
         run_channel_fn=run_channel_fn,
+        discover_dir=discover_dir,
     )
 
     auto_fix: AutoFixOutcome | None = None
@@ -572,9 +581,16 @@ def run_nightly(
                 if dispatch_timeout_s is not None
                 else _AUTO_FIX_DISPATCH_TIMEOUT_S
             ),
+            proposal_dir=proposal_dir,
         )
 
-    brief_result = run_brief_fn(repo=repo, today=today, auto_fix=auto_fix)
+    brief_result = run_brief_fn(
+        repo=repo,
+        today=today,
+        auto_fix=auto_fix,
+        brief_dir=brief_dir,
+        discover_dir=discover_dir,
+    )
     brief_md = brief_result.report_path if brief_result.success else None
 
     windows_path: Path | None = None
@@ -653,14 +669,24 @@ def _run_channels(
     mutation_paths: list[str],
     repo: Path,
     run_channel_fn: ChannelRunner,
+    discover_dir: Path | None = None,
 ) -> list[ChannelOutcome]:
-    """Invoke each enabled channel and collect the four shared fields."""
+    """Invoke each enabled channel and collect the four shared fields.
+
+    spec_029: when ``discover_dir`` is provided (per-policy sweep mode),
+    forward it to each channel so the discover JSON lands in CCD's
+    per-policy workspace instead of the target repo's. None preserves
+    the spec_020 flat layout under ``<repo>/_ai_workspace/discover/``.
+    """
 
     out: list[ChannelOutcome] = []
     for channel in channels:
         paths = mutation_paths if channel == "mutation" else None
+        kwargs: dict[str, Any] = {"repo": repo, "paths": paths}
+        if discover_dir is not None:
+            kwargs["discover_dir"] = discover_dir
         try:
-            result = run_channel_fn(channel, repo=repo, paths=paths)
+            result = run_channel_fn(channel, **kwargs)
         except Exception as exc:
             out.append(
                 ChannelOutcome(
@@ -1092,6 +1118,7 @@ def _run_propose_loop(
     git_ops: GitOps | None,
     isolated_workspace: IsolatedWorkspace | None,
     dispatch_timeout_s: float,
+    proposal_dir: Path | None = None,
 ) -> AutoFixOutcome:
     """Drive one propose-mode attempt (spec_028 §2-2).
 
@@ -1335,11 +1362,18 @@ def _run_propose_loop(
             # 10. Save the patch — the only live-repo write of propose
             # mode (and it lands under ``_ai_workspace/`` which is
             # gitignored, so the live git state is untouched).
+            #
+            # spec_029: when the sweep entry point passes a CCD-side
+            # ``proposal_dir`` (per-policy), the patch lands there and
+            # the target repo (which may be a client) is never written
+            # to. Without an override, the legacy ``<live_repo>/_ai_workspace
+            # /nightly/proposals/`` path is used (single-policy fallback).
             patch_path = _save_proposal_patch(
                 live_repo=repo,
                 spec_auto_id=tr.spec_auto_id,
                 diff_text=diff_text,
                 today=today,
+                proposal_dir=proposal_dir,
             )
 
             return AutoFixOutcome(
@@ -1407,6 +1441,7 @@ def _save_proposal_patch(
     spec_auto_id: str,
     diff_text: str,
     today: date | None,
+    proposal_dir: Path | None = None,
 ) -> Path:
     """Write the verified diff under ``_ai_workspace/nightly/proposals/``.
 
@@ -1415,10 +1450,20 @@ def _save_proposal_patch(
     under nightly) don't collide. Adds a trailing newline if the diff
     didn't already have one — ``git apply`` tolerates either, but a
     canonical newline keeps editor diffs clean.
+
+    spec_029: when ``proposal_dir`` is provided, the patch lands there
+    instead of ``<live_repo>/_ai_workspace/nightly/proposals/``. The
+    sweep entry point uses this to keep client-repo writes off the
+    target repo and instead segregate proposals by policy under CCD's
+    own ``_ai_workspace/``.
     """
 
     today_d = today if today is not None else _utc_today()
-    proposals_dir = live_repo / _PROPOSAL_DIR_REL
+    proposals_dir = (
+        Path(proposal_dir).resolve()
+        if proposal_dir is not None
+        else live_repo / _PROPOSAL_DIR_REL
+    )
     proposals_dir.mkdir(parents=True, exist_ok=True)
     patch_path = proposals_dir / (
         f"proposal_{today_d.isoformat()}_{spec_auto_id}.patch"

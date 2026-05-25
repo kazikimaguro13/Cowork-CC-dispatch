@@ -53,6 +53,7 @@ from ccd.run_writer import (
     halted_interrupted_record,
     reconcile_path,
 )
+from ccd.sweep import run_nightly_all
 
 DEFAULT_CLI_MAX_ATTEMPTS = 3
 
@@ -340,6 +341,56 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    p_nightly_all = sub.add_parser(
+        "nightly-all",
+        help=(
+            "Run `ccd nightly` once per policy in the profile registry "
+            "(spec_029, v2 Phase 3 — multi-policy sweep)."
+        ),
+        description=(
+            "Load every policy under <repo>/_ai_workspace/profiles/*.toml "
+            "(one TOML per policy; the filename without `.toml` is the "
+            "policy name) and run the existing `run_nightly` linear "
+            "orchestration for each in turn. Per-policy artifacts "
+            "(discover JSON, morning report, proposal patches) are "
+            "siloed under <repo>/_ai_workspace/{discover,nightly}/<name>/ "
+            "── client repos with `fix_mode=propose`/`off` never receive "
+            "a write. After every policy is attempted, the sweep writes "
+            "a one-line-per-policy cross-policy index at "
+            "<repo>/_ai_workspace/nightly/index_YYYY-MM-DD.md. "
+            "A failure in one policy never stops the next "
+            "(spec §2-2 论点4 — 1 施策の事故が他施策を止めない). When "
+            "the `profiles/` directory does not exist the sweep falls "
+            "back to the legacy single-profile path (`_ai_workspace/"
+            "ccd_profile.toml`, policy name `ccd`) so existing operation "
+            "is unchanged."
+        ),
+    )
+    p_nightly_all.add_argument(
+        "--repo",
+        type=Path,
+        default=None,
+        help=(
+            "CCD's own working directory (default: current). "
+            "The registry is read from <repo>/_ai_workspace/profiles/ "
+            "and ALL per-policy outputs land under <repo>/_ai_workspace/. "
+            "Each policy's `profile.repo` field selects the TARGET repo "
+            "the channels run against."
+        ),
+    )
+    p_nightly_all.add_argument(
+        "--profiles-dir",
+        dest="profiles_dir",
+        type=Path,
+        default=None,
+        help=(
+            "Override the registry directory (default: "
+            "<repo>/_ai_workspace/profiles/). Used by unit tests so a "
+            "sweep can be exercised against an isolated registry without "
+            "touching the live workspace."
+        ),
+    )
+
     p_nightly = sub.add_parser(
         "nightly",
         help=(
@@ -472,6 +523,11 @@ def main(
     dispatch_timeout_s: float | None = None,
     # spec_028 — propose-mode workspace seam (forwarded to ``ccd nightly``).
     isolated_workspace: Any | None = None,
+    # spec_029 — sweep seam (forwarded to ``ccd nightly-all``). Tests
+    # inject a fake nightly runner that records its calls and returns
+    # canned ``NightlyResult`` shapes so failure isolation can be
+    # exercised without invoking real channels / dispatch / guard.
+    nightly_runner: Any | None = None,
 ) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -510,6 +566,26 @@ def main(
             unpushed_backlog_limit=unpushed_backlog_limit,
             dispatch_timeout_s=dispatch_timeout_s,
             isolated_workspace=isolated_workspace,
+        )
+    if args.command == "nightly-all":
+        return _cmd_nightly_all(
+            args,
+            channel_runner=channel_runner,
+            brief_runner=brief_runner,
+            windows_mirror=windows_mirror,
+            agent_runner=runner,
+            mutation_runner=mutation_runner,
+            fix_dispatcher=fix_dispatcher,
+            suite_runner=suite_runner,
+            mutation_rechecker=mutation_rechecker,
+            adversarial_rechecker=adversarial_rechecker,
+            guard_inspector=guard_inspector,
+            git_ops=git_ops,
+            unpushed_counter=unpushed_counter,
+            unpushed_backlog_limit=unpushed_backlog_limit,
+            dispatch_timeout_s=dispatch_timeout_s,
+            isolated_workspace=isolated_workspace,
+            nightly_runner=nightly_runner,
         )
     if args.command == "guard":
         return _cmd_guard(args)
@@ -862,6 +938,88 @@ def _cmd_nightly(
     if not result.success:
         print(f"nightly halted: {result.halt_reason}", file=sys.stderr)
         return 1
+    return 0
+
+
+def _cmd_nightly_all(
+    args: argparse.Namespace,
+    *,
+    channel_runner: ChannelRunner | None,
+    brief_runner: BriefRunner | None,
+    windows_mirror: WindowsMirror | None,
+    agent_runner: AgentRunner | None = None,
+    mutation_runner: MutationRunner | None = None,
+    fix_dispatcher: Any | None = None,
+    suite_runner: Any | None = None,
+    mutation_rechecker: Any | None = None,
+    adversarial_rechecker: Any | None = None,
+    guard_inspector: Any | None = None,
+    git_ops: Any | None = None,
+    unpushed_counter: Any | None = None,
+    unpushed_backlog_limit: int | None = None,
+    dispatch_timeout_s: float | None = None,
+    isolated_workspace: Any | None = None,
+    nightly_runner: Any | None = None,
+) -> int:
+    """Run the multi-policy sweep (spec_029 §2-2).
+
+    All ``run_nightly`` seams (channel runner, brief runner, fix
+    dispatcher, etc.) are forwarded through to every per-policy run so
+    one test injection covers the whole sweep. The sweep itself is
+    swappable via ``nightly_runner`` for tests that want to bypass the
+    real ``run_nightly`` and exercise failure isolation directly.
+    """
+
+    repo = _resolve_repo(args.repo)
+    profiles_dir = getattr(args, "profiles_dir", None)
+
+    # Forwarded kwargs land in every per-policy ``run_nightly`` call.
+    # ``run_nightly_all`` overrides the per-policy output paths (it
+    # computes ``discover_dir``/``brief_dir``/``proposal_dir`` itself so
+    # client repos receive zero writes) but everything else flows
+    # through verbatim — exactly the same surface a single ``ccd
+    # nightly`` invocation would receive.
+    forwarded: dict[str, Any] = {
+        "channel_runner": channel_runner,
+        "brief_runner": brief_runner,
+        "windows_mirror": windows_mirror,
+        "agent_runner": agent_runner,
+        "mutation_runner": mutation_runner,
+        "fix_dispatcher": fix_dispatcher,
+        "suite_runner": suite_runner,
+        "mutation_rechecker": mutation_rechecker,
+        "adversarial_rechecker": adversarial_rechecker,
+        "guard_inspector": guard_inspector,
+        "git_ops": git_ops,
+        "unpushed_counter": unpushed_counter,
+        "unpushed_backlog_limit": unpushed_backlog_limit,
+        "dispatch_timeout_s": dispatch_timeout_s,
+        "isolated_workspace": isolated_workspace,
+    }
+    # Drop None values so ``run_nightly`` sees its own defaults rather
+    # than ``None`` for every unused seam.
+    forwarded = {k: v for k, v in forwarded.items() if v is not None}
+
+    try:
+        result = run_nightly_all(
+            repo=repo,
+            profiles_dir=profiles_dir,
+            nightly_runner=nightly_runner,
+            **forwarded,
+        )
+    except ValueError as exc:
+        # Registry loader errors (invalid name / parse / schema) are
+        # surfaced verbatim with a non-zero exit — the operator must
+        # fix the registry before the sweep can proceed.
+        print(f"nightly-all halted: {exc}", file=sys.stderr)
+        return 1
+
+    print(f"policies processed: {len(result.policies)}")
+    for outcome in result.policies:
+        status = "ok" if outcome.success else f"failed ({outcome.error})"
+        print(f"  - {outcome.name}: {status}")
+    if result.index_path is not None:
+        print(f"cross-policy index: {result.index_path}")
     return 0
 
 
