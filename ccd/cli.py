@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import subprocess
 import sys
 from collections.abc import Sequence
 from datetime import UTC, datetime
@@ -36,6 +37,7 @@ from ccd.discover import (
     MutationRunner,
     run_channel,
 )
+from ccd.guard import DEFAULT_PROD_DIFF_LIMIT, fetch_diff, inspect_diff
 from ccd.integrate import DEFAULT_SMOKE_COMMANDS
 from ccd.metrics import aggregate, render_report
 from ccd.models import DispatchRecord, DispatchStatus
@@ -368,6 +370,66 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    p_guard = sub.add_parser(
+        "guard",
+        help=(
+            "Inspect a git diff for fraudulent-fix patterns "
+            "(v2 Phase 2 — spec_021)."
+        ),
+        description=(
+            "Run the static guard against `git diff <base>..<head>`: "
+            "R1 (file allowlist), R2 (tests/ is append-only — no removed "
+            "lines, no skip/xfail markers), R3 (template B production "
+            "diff bound). A hardcoded self-protection denylist (the "
+            "guard itself, scheduler modules, CI config, packaging, "
+            "discovery config) overrides any caller allowlist. The "
+            "dynamic rules R4 (suite green) / R5 (target test killed) "
+            "are NOT in this command — they live in the loop wiring "
+            "(spec_023). Exit code is 0 on pass and 1 on HALT."
+        ),
+    )
+    p_guard.add_argument("--repo", type=Path, default=None)
+    p_guard.add_argument(
+        "--base",
+        default="main",
+        help="git ref to diff from (default: main).",
+    )
+    p_guard.add_argument(
+        "--head",
+        default="HEAD",
+        help="git ref to diff to (default: HEAD).",
+    )
+    p_guard.add_argument(
+        "--template",
+        choices=["A", "B"],
+        required=True,
+        help=(
+            "Fix template. A = tests-only (allowed_files conventionally "
+            "tests/). B = one named production file + tests/."
+        ),
+    )
+    p_guard.add_argument(
+        "--allowed",
+        nargs="+",
+        default=[],
+        help=(
+            "Allowed file(s) / directory prefix(es). Example: "
+            "`--allowed tests/` for template A, "
+            "`--allowed ccd/foo.py tests/` for template B."
+        ),
+    )
+    p_guard.add_argument(
+        "--max-prod-diff-lines",
+        dest="max_prod_diff_lines",
+        type=int,
+        default=DEFAULT_PROD_DIFF_LIMIT,
+        help=(
+            f"R3 threshold for template B (default: "
+            f"{DEFAULT_PROD_DIFF_LIMIT} +/- lines summed across all "
+            "non-test files)."
+        ),
+    )
+
     p_reconcile = sub.add_parser(
         "reconcile",
         help="Reconcile orphan RUNNING records to HALTED + INTERRUPTED.",
@@ -422,6 +484,8 @@ def main(
             brief_runner=brief_runner,
             windows_mirror=windows_mirror,
         )
+    if args.command == "guard":
+        return _cmd_guard(args)
     if args.command == "reconcile":
         return _cmd_reconcile(args)
 
@@ -709,6 +773,47 @@ def _cmd_nightly(
         print(f"nightly halted: {result.halt_reason}", file=sys.stderr)
         return 1
     return 0
+
+
+def _cmd_guard(args: argparse.Namespace) -> int:
+    repo = _resolve_repo(args.repo)
+    base = args.base
+    head = args.head
+    template = args.template
+    allowed = list(args.allowed) if args.allowed else []
+    max_prod = args.max_prod_diff_lines
+
+    try:
+        diff_text = fetch_diff(repo, base, head)
+    except subprocess.CalledProcessError as exc:
+        stderr = (exc.stderr or "").strip() or str(exc)
+        print(f"guard halted: git diff failed: {stderr}", file=sys.stderr)
+        return 1
+
+    result = inspect_diff(
+        diff=diff_text,
+        allowed_files=allowed,
+        template=template,
+        max_prod_diff_lines=max_prod,
+    )
+
+    print(f"template: {template}")
+    print(f"diff range: {base}..{head}")
+    if result.files_touched:
+        print("files touched:")
+        for f in result.files_touched:
+            print(f"  - {f}")
+    else:
+        print("files touched: (none)")
+
+    if result.passed:
+        print("guard: pass")
+        return 0
+
+    print(f"guard: HALT ({len(result.halt_reasons)} reason(s))", file=sys.stderr)
+    for r in result.halt_reasons:
+        print(f"  - {r}", file=sys.stderr)
+    return 1
 
 
 def _cmd_reconcile(args: argparse.Namespace) -> int:
