@@ -11,6 +11,16 @@ nightly slot). Phase 2 fields (`safety`, cost ceilings, un-pushed
 backlog thresholds) are *reserved* — documented below but **not
 implemented** in this spec (YAGNI; ``docs/DESIGN.md §9.7``).
 
+spec_027 (v2 Phase 3 — first spec) adds **cadence** to ``[schedule]``:
+``cadence`` (``"nightly"`` / ``"weekly"``, default ``"weekly"``) and
+``weekly_day`` (full English weekday name, default ``"Sunday"``). The
+default flips to weekly because nightly auto-fix is impractical while
+the system is still under active development (the loop would chase a
+moving target). The loop body itself (``ccd/nightly.py``) does not read
+cadence — the scheduler template (``_ai_workspace/register_nightly.ps1``)
+is what decides "how often"; ``ccd nightly`` still just runs one loop
+when invoked.
+
 The loader is graceful by design: if no profile file is present, an
 all-defaults ``Profile`` is returned. CCD therefore continues to work
 without any configuration, and a profile only needs to exist when an
@@ -72,6 +82,28 @@ KNOWN_CHANNELS: tuple[str, ...] = ("mutation", "adversarial", "ai")
 # templates (e.g., ``"C"`` for AI-inference findings) get added here.
 KNOWN_FIX_TEMPLATES: tuple[str, ...] = ("A", "B")
 
+# Scheduler cadences (spec_027). ``"nightly"`` keeps the legacy
+# every-night trigger; ``"weekly"`` (the new default) runs once per week
+# on ``weekly_day``. The loop body in ``ccd/nightly.py`` does NOT read
+# cadence — the scheduler template decides "how often"; ``ccd nightly``
+# runs one loop per invocation regardless.
+KNOWN_CADENCES: tuple[str, ...] = ("nightly", "weekly")
+
+# Full English weekday names accepted by PowerShell's
+# ``New-ScheduledTaskTrigger -DaysOfWeek`` (spec_027). We deliberately
+# keep this to the seven full names — short forms (``"Sun"``) and
+# locale-specific names are not accepted, so what lands in the profile
+# is exactly what the scheduler trigger consumes.
+KNOWN_WEEKDAYS: tuple[str, ...] = (
+    "Monday",
+    "Tuesday",
+    "Wednesday",
+    "Thursday",
+    "Friday",
+    "Saturday",
+    "Sunday",
+)
+
 DEFAULT_PROFILE_REL = Path("_ai_workspace") / "ccd_profile.toml"
 
 _HHMM_RE = re.compile(r"^(?:[01]\d|2[0-3]):[0-5]\d$")
@@ -114,11 +146,41 @@ class DiscoveryConfig(BaseModel):
 
 
 class ScheduleConfig(BaseModel):
-    """Scheduler settings (spec_018 §2-2, consumed by spec_019)."""
+    """Scheduler settings (spec_018 §2-2; cadence added by spec_027).
+
+    Three fields:
+
+    - ``nightly_at`` (``"HH:MM"``, default ``"02:00"``) — the **time of
+      day** the trigger fires. The name is historical (spec_018 only
+      had a nightly cadence): the value is cadence-independent — both
+      ``"nightly"`` and ``"weekly"`` cadences fire at this clock time.
+      We deliberately do **not** rename to e.g. ``run_at`` because
+      ``extra="forbid"`` would then reject the existing
+      ``[schedule] nightly_at = ...`` in deployed TOMLs (spec_027 §2-1).
+    - ``cadence`` (``"nightly"`` / ``"weekly"``, default ``"weekly"``)
+      — how often the scheduler fires (spec_027). ``"weekly"`` is the
+      new default: running autonomous-fix every night while the system
+      is under active development means chasing a moving target, so
+      weekly is the realistic operating cadence. ``"nightly"`` remains
+      available for the spec_021–026 legacy mode. Unknown values raise
+      ``ValueError`` (no silent fallback to a different cadence).
+    - ``weekly_day`` (full English weekday name, default ``"Sunday"``)
+      — which day the weekly trigger fires on. Stored exactly as
+      PowerShell's ``New-ScheduledTaskTrigger -DaysOfWeek`` expects
+      (``"Monday"`` … ``"Sunday"``). Inputs are case-normalised to
+      title case (so ``"sunday"`` is accepted and stored as
+      ``"Sunday"``) — what lands in the profile is always the canonical
+      form the trigger consumes. When ``cadence="nightly"`` the field
+      is **ignored** by the scheduler template, but it still has its
+      default and can sit in the TOML harmlessly so the operator can
+      flip ``cadence`` to ``"weekly"`` later without re-adding it.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
     nightly_at: str = "02:00"
+    cadence: str = "weekly"
+    weekly_day: str = "Sunday"
 
     @field_validator("nightly_at")
     @classmethod
@@ -128,6 +190,30 @@ class ScheduleConfig(BaseModel):
                 f"nightly_at must be 'HH:MM' (00:00–23:59); got {v!r}"
             )
         return v
+
+    @field_validator("cadence")
+    @classmethod
+    def _cadence_known(cls, v: str) -> str:
+        if v not in KNOWN_CADENCES:
+            raise ValueError(
+                f"unknown cadence {v!r}; allowed: {list(KNOWN_CADENCES)!r}"
+            )
+        return v
+
+    @field_validator("weekly_day")
+    @classmethod
+    def _weekday_known(cls, v: str) -> str:
+        # Accept any casing of a full English weekday name; store the
+        # canonical title-case form that PowerShell's
+        # ``-DaysOfWeek`` parameter consumes.
+        normalised = v.title() if isinstance(v, str) else v
+        if normalised not in KNOWN_WEEKDAYS:
+            raise ValueError(
+                f"unknown weekly_day {v!r}; "
+                f"allowed (full English weekday names): "
+                f"{list(KNOWN_WEEKDAYS)!r}"
+            )
+        return normalised
 
 
 class SafetyConfig(BaseModel):
@@ -329,6 +415,8 @@ def render_profile(result: ProfileLoadResult) -> str:
     lines.append("")
     lines.append("[schedule]")
     lines.append(f'nightly_at = "{p.schedule.nightly_at}"')
+    lines.append(f'cadence = "{p.schedule.cadence}"')
+    lines.append(f'weekly_day = "{p.schedule.weekly_day}"')
     lines.append("")
     lines.append("[safety]")
     lines.append(f"autonomous_fix = {_toml_bool(p.safety.autonomous_fix)}")
