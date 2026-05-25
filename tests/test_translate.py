@@ -859,3 +859,206 @@ def test_template_b_numbering_shares_seq_with_template_a(repo: Path) -> None:
     )
     assert r_b.spec_auto_id == "spec_auto_002"
     assert r_b.spec_auto_path != r_a.spec_auto_path
+
+
+# --------------------------------------------------------------------------- #
+# spec_026 — commit-required / no-push-branch-merge constraints
+# --------------------------------------------------------------------------- #
+#
+# spec_026 §1 documented the bug: the prior constraint block lifted the
+# human-spec idiom "push しない／ブランチ操作・merge しない" verbatim, and
+# the dispatched fix-task read it as "don't commit either" — the result
+# file landed with zero commits and the loop HALTed as ``agent_misread``
+# (偽 HALT). spec_026 §2-1 resolves the ambiguity by making commit
+# explicitly required (NOT a forbidden git op) and naming push / branch-
+# switch / new-branch / merge as the only forbidden git ops. These tests
+# pin both directions for templates A and B.
+
+
+def test_template_a_constraint_block_requires_commit_on_feature_branch(
+    repo: Path,
+) -> None:
+    """Template A must tell the fix-agent to commit on the feature branch
+    (spec_026 §2-1). Without this, the dispatched agent skips commit and
+    the loop HALTs as agent_misread on a fix that was actually correct."""
+
+    body = translate_finding(
+        _survivor_finding(),
+        repo=repo,
+        today=date(2026, 5, 25),
+    ).spec_auto_path.read_text(encoding="utf-8")
+
+    # The spec must instruct the agent to commit to the feature branch.
+    assert "feature branch" in body
+    assert "commit" in body
+    # The branch the agent is already on must be named so a clueless
+    # agent doesn't try to create a fresh branch.
+    assert "auto/" in body
+    # The instruction must declare commit as required, not forbidden.
+    # The exact phrase: "コミットは禁止ではなく必須".
+    assert "コミットは禁止ではなく必須" in body
+
+
+def test_template_a_constraint_block_forbids_push_branch_merge(
+    repo: Path,
+) -> None:
+    """Template A must forbid the three loop-owned git ops (push, branch
+    switch / creation, merge to main). All three are inside the
+    NO_PUSH_BRANCH_MERGE clause; this test pins each one's presence
+    independently so a partial deletion doesn't silently pass."""
+
+    body = translate_finding(
+        _survivor_finding(),
+        repo=repo,
+        today=date(2026, 5, 25),
+    ).spec_auto_path.read_text(encoding="utf-8")
+
+    assert "git push" in body
+    assert "別ブランチ" in body  # 別ブランチへの切り替え
+    assert "新規ブランチ" in body
+    # "main への merge は禁止" - the merge prohibition must be explicit
+    assert "merge は禁止" in body or "merge" in body and "禁止" in body
+
+
+def test_template_a_constraint_does_not_read_as_commit_forbidden(
+    repo: Path,
+) -> None:
+    """The whole point of spec_026 §2-1 is that the new wording must not
+    be readable as 'コミットするな' / 'コミットしてはならない'. If a future
+    edit re-introduces such phrasing, the bug spec_026 fixed comes back.
+
+    We assert no plausible 'don't commit' phrasing slips into the body."""
+
+    body = translate_finding(
+        _survivor_finding(),
+        repo=repo,
+        today=date(2026, 5, 25),
+    ).spec_auto_path.read_text(encoding="utf-8")
+
+    forbidden_substrings = (
+        "コミットするな",
+        "コミットしてはならない",
+        "コミットは禁止",
+        "commit するな",
+        "commit してはならない",
+    )
+    for needle in forbidden_substrings:
+        # An exact "コミットは禁止" prefix WOULD appear inside the longer
+        # phrase "コミットは禁止ではなく必須" — that's the *intended*
+        # negation. We grep for the standalone "禁止" without a
+        # following "ではなく必須" by checking each problematic phrase
+        # appears only as part of the negated reading.
+        if needle == "コミットは禁止":
+            # Allowed only when followed by "ではなく必須" (the negation
+            # that asserts commit is required, not forbidden).
+            idx = 0
+            while True:
+                hit = body.find(needle, idx)
+                if hit == -1:
+                    break
+                follow = body[hit + len(needle):hit + len(needle) + 20]
+                assert "ではなく必須" in follow, (
+                    f"'{needle}' appears without the 'ではなく必須' negation "
+                    f"at position {hit}: {body[hit:hit+60]!r}"
+                )
+                idx = hit + len(needle)
+        else:
+            assert needle not in body, (
+                f"forbidden 'don't commit' phrasing found in template A "
+                f"body: {needle!r}"
+            )
+
+
+def test_template_b_constraint_block_requires_commit_on_feature_branch(
+    repo: Path,
+) -> None:
+    """Template B parallel of the template-A test — same wording intent."""
+
+    body = translate_finding(
+        _adversarial_finding(),
+        repo=repo,
+        today=date(2026, 5, 25),
+    ).spec_auto_path.read_text(encoding="utf-8")
+
+    assert "feature branch" in body
+    assert "commit" in body
+    assert "auto/" in body
+    assert "コミットは禁止ではなく必須" in body
+
+
+def test_template_b_constraint_block_forbids_push_branch_merge(
+    repo: Path,
+) -> None:
+    """Template B parallel of the template-A push/branch/merge test."""
+
+    body = translate_finding(
+        _adversarial_finding(),
+        repo=repo,
+        today=date(2026, 5, 25),
+    ).spec_auto_path.read_text(encoding="utf-8")
+
+    assert "git push" in body
+    assert "別ブランチ" in body
+    assert "新規ブランチ" in body
+    assert "merge は禁止" in body or "merge" in body and "禁止" in body
+
+
+def test_template_b_constraint_does_not_read_as_commit_forbidden(
+    repo: Path,
+) -> None:
+    """Template B parallel of the template-A 'no commit-forbidden phrasing'
+    test. Same logic — the negated reading
+    'コミットは禁止ではなく必須' is allowed; bare 'コミットするな' / etc. is not."""
+
+    body = translate_finding(
+        _adversarial_finding(),
+        repo=repo,
+        today=date(2026, 5, 25),
+    ).spec_auto_path.read_text(encoding="utf-8")
+
+    forbidden_substrings = (
+        "コミットするな",
+        "コミットしてはならない",
+        "commit するな",
+        "commit してはならない",
+    )
+    for needle in forbidden_substrings:
+        assert needle not in body, (
+            f"forbidden 'don't commit' phrasing found in template B "
+            f"body: {needle!r}"
+        )
+
+    # And the load-bearing positive assertion.
+    assert "コミットは禁止ではなく必須" in body
+
+
+def test_template_a_commit_clauses_are_verbatim_constants(repo: Path) -> None:
+    """The new spec_026 commit / no-push clauses must be module-level
+    constants the test pins exactly (mirroring the existing
+    ``test_constraint_phrases_are_verbatim`` discipline)."""
+
+    from ccd import translate as t
+
+    body = translate_finding(
+        _survivor_finding(),
+        repo=repo,
+        today=date(2026, 5, 25),
+    ).spec_auto_path.read_text(encoding="utf-8")
+
+    assert t._CONSTRAINT_COMMIT_REQUIRED in body
+    assert t._CONSTRAINT_NO_PUSH_BRANCH_MERGE in body
+
+
+def test_template_b_commit_clauses_are_verbatim_constants(repo: Path) -> None:
+    """Template B parallel — pin the two new B-side constants verbatim."""
+
+    from ccd import translate as t
+
+    body = translate_finding(
+        _adversarial_finding(),
+        repo=repo,
+        today=date(2026, 5, 25),
+    ).spec_auto_path.read_text(encoding="utf-8")
+
+    assert t._CONSTRAINT_B_COMMIT_REQUIRED in body
+    assert t._CONSTRAINT_B_NO_PUSH_BRANCH_MERGE in body

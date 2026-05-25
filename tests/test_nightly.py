@@ -764,12 +764,19 @@ def test_channel_outcome_fields_are_preserved(tmp_path: Path) -> None:
 
 @dataclass
 class _FakeGitOps:
-    """Records every git operation the loop performs; never touches git."""
+    """Records every git operation the loop performs; never touches git.
+
+    spec_026 §2-2 added ``discard_local_changes`` / ``delete_branch`` so
+    HALT-path tests can assert the working-tree restore actually fires.
+    The two new lists (``discards``, ``deletes``) record those calls.
+    """
 
     branches_created: list[str] = field(default_factory=list)
     merges: list[str] = field(default_factory=list)
     checkouts: list[str] = field(default_factory=list)
     diffs_requested: list[tuple[str, str]] = field(default_factory=list)
+    discards: list[Path] = field(default_factory=list)
+    deletes: list[str] = field(default_factory=list)
     canned_diff: str = ""
     create_should_raise: Exception | None = None
     merge_should_raise: Exception | None = None
@@ -791,6 +798,12 @@ class _FakeGitOps:
 
     def checkout(self, *, repo: Path, ref: str) -> None:
         self.checkouts.append(ref)
+
+    def discard_local_changes(self, *, repo: Path) -> None:
+        self.discards.append(Path(repo))
+
+    def delete_branch(self, *, repo: Path, branch: str) -> None:
+        self.deletes.append(branch)
 
 
 @dataclass
@@ -2793,3 +2806,378 @@ def test_brief_phase1_section_b_when_no_autofix_at_all(tmp_path: Path) -> None:
 
     assert result.success is True
     assert result.auto_fix is None
+
+
+# --------------------------------------------------------------------------- #
+# spec_026 §2-2 — HALT-path working-tree restoration
+# --------------------------------------------------------------------------- #
+#
+# spec_026 documented the bug: every HALT exit of ``_run_auto_fix_loop``
+# left the auto/spec_auto_NNN branch AND uncommitted edits on the
+# working tree, so the next night's pre-flight saw a dirty repo. The
+# fix is a ``_restore_repo_after_halt`` helper that runs on every HALT
+# path: discard uncommitted edits → checkout main → delete auto branch.
+# These tests pin each HALT path independently and assert the three
+# operations fired on the injected fake GitOps.
+
+
+def _assert_halt_restore_fired(
+    *, gops: _FakeGitOps, repo: Path, branch: str
+) -> None:
+    """Shared assertion: spec_026 §2-2 restoration ran on a fake GitOps.
+
+    The HALT path must have invoked all three restore primitives in
+    order — discard_local_changes, checkout("main"), delete_branch.
+    """
+
+    assert gops.discards, "discard_local_changes was not called on HALT"
+    assert Path(repo).resolve() in [p.resolve() for p in gops.discards] or (
+        gops.discards[0] == Path(repo)
+    ), "discard_local_changes received an unexpected repo path"
+    assert "main" in gops.checkouts, "checkout('main') was not called on HALT"
+    assert branch in gops.deletes, (
+        f"delete_branch was not called for {branch!r} on HALT"
+    )
+
+
+def test_halt_restore_fires_on_dispatch_failure(tmp_path: Path) -> None:
+    """spec_026 §2-2 — dispatch returning 'failed' triggers the restore."""
+
+    _write_mutation_discover_json(repo=tmp_path)
+    dispatcher = _FakeFixDispatcher(
+        outcome=FixDispatchOutcome(
+            status="failed",
+            halt_reason="agent_misread",
+        )
+    )
+    suite = _FakeSuiteRunner()
+    recheck = _FakeMutationRechecker()
+    guard = _FakeGuardInspector()
+    gops = _FakeGitOps()
+    brief_runner, _ = _make_fake_brief_runner()
+
+    result = run_nightly(
+        repo=tmp_path,
+        profile=_autofix_profile(autonomous=True),
+        channel_runner=_RecordingChannelRunner(),
+        brief_runner=brief_runner,
+        windows_mirror=lambda _p: None,
+        fix_dispatcher=dispatcher,
+        suite_runner=suite,
+        mutation_rechecker=recheck,
+        guard_inspector=guard,
+        git_ops=gops,
+    )
+
+    af = result.auto_fix
+    assert af is not None
+    assert af.merged is False
+    assert "dispatch failed" in af.halt_reason
+    _assert_halt_restore_fired(gops=gops, repo=tmp_path, branch=af.branch)
+    # Sanity: the loop must NOT have merged when restoration fires.
+    assert gops.merges == []
+
+
+def test_halt_restore_fires_on_dispatch_exception(tmp_path: Path) -> None:
+    """spec_026 §2-2 — a dispatcher that raises also triggers restore."""
+
+    _write_mutation_discover_json(repo=tmp_path)
+
+    def _raising_dispatcher(
+        *, spec_path: Path, repo: Path, branch: str
+    ) -> FixDispatchOutcome:
+        raise RuntimeError("simulated subprocess crash")
+
+    suite = _FakeSuiteRunner()
+    recheck = _FakeMutationRechecker()
+    guard = _FakeGuardInspector()
+    gops = _FakeGitOps()
+    brief_runner, _ = _make_fake_brief_runner()
+
+    result = run_nightly(
+        repo=tmp_path,
+        profile=_autofix_profile(autonomous=True),
+        channel_runner=_RecordingChannelRunner(),
+        brief_runner=brief_runner,
+        windows_mirror=lambda _p: None,
+        fix_dispatcher=_raising_dispatcher,
+        suite_runner=suite,
+        mutation_rechecker=recheck,
+        guard_inspector=guard,
+        git_ops=gops,
+    )
+
+    af = result.auto_fix
+    assert af is not None
+    assert af.merged is False
+    assert af.dispatched is False
+    assert "RuntimeError" in af.halt_reason
+    _assert_halt_restore_fired(gops=gops, repo=tmp_path, branch=af.branch)
+
+
+def test_halt_restore_fires_on_r5_failure(tmp_path: Path) -> None:
+    """spec_026 §2-2 — R5 fail (mutation still surviving) triggers restore."""
+
+    _write_mutation_discover_json(repo=tmp_path)
+    dispatcher = _FakeFixDispatcher()
+    suite = _FakeSuiteRunner(outcome=SuiteOutcome(passed=True))
+    recheck = _FakeMutationRechecker(status="survived")  # R5 fails
+    guard = _FakeGuardInspector()
+    gops = _FakeGitOps()
+    brief_runner, _ = _make_fake_brief_runner()
+
+    result = run_nightly(
+        repo=tmp_path,
+        profile=_autofix_profile(autonomous=True),
+        channel_runner=_RecordingChannelRunner(),
+        brief_runner=brief_runner,
+        windows_mirror=lambda _p: None,
+        fix_dispatcher=dispatcher,
+        suite_runner=suite,
+        mutation_rechecker=recheck,
+        guard_inspector=guard,
+        git_ops=gops,
+    )
+
+    af = result.auto_fix
+    assert af is not None
+    assert af.merged is False
+    assert "R5 failed" in af.halt_reason
+    _assert_halt_restore_fired(gops=gops, repo=tmp_path, branch=af.branch)
+
+
+def test_halt_restore_fires_on_r4_failure(tmp_path: Path) -> None:
+    """spec_026 §2-2 — R4 fail (suite red) triggers restore."""
+
+    _write_mutation_discover_json(repo=tmp_path)
+    dispatcher = _FakeFixDispatcher()
+    suite = _FakeSuiteRunner(outcome=SuiteOutcome(passed=False))
+    recheck = _FakeMutationRechecker(status="killed")
+    guard = _FakeGuardInspector()
+    gops = _FakeGitOps()
+    brief_runner, _ = _make_fake_brief_runner()
+
+    result = run_nightly(
+        repo=tmp_path,
+        profile=_autofix_profile(autonomous=True),
+        channel_runner=_RecordingChannelRunner(),
+        brief_runner=brief_runner,
+        windows_mirror=lambda _p: None,
+        fix_dispatcher=dispatcher,
+        suite_runner=suite,
+        mutation_rechecker=recheck,
+        guard_inspector=guard,
+        git_ops=gops,
+    )
+
+    af = result.auto_fix
+    assert af is not None
+    assert af.merged is False
+    assert "R4 failed" in af.halt_reason
+    _assert_halt_restore_fired(gops=gops, repo=tmp_path, branch=af.branch)
+
+
+def test_halt_restore_fires_on_guard_halt(tmp_path: Path) -> None:
+    """spec_026 §2-2 — guard HALT triggers restore."""
+
+    _write_mutation_discover_json(repo=tmp_path)
+    dispatcher = _FakeFixDispatcher()
+    suite = _FakeSuiteRunner(outcome=SuiteOutcome(passed=True))
+    recheck = _FakeMutationRechecker(status="killed")
+    guard = _FakeGuardInspector(
+        result=GuardResult(
+            passed=False,
+            halt_reasons=("R2: tests/x.py removed lines",),
+            files_touched=("tests/x.py", "ccd/sneaky.py"),
+            template="A",
+        )
+    )
+    gops = _FakeGitOps()
+    brief_runner, _ = _make_fake_brief_runner()
+
+    result = run_nightly(
+        repo=tmp_path,
+        profile=_autofix_profile(autonomous=True),
+        channel_runner=_RecordingChannelRunner(),
+        brief_runner=brief_runner,
+        windows_mirror=lambda _p: None,
+        fix_dispatcher=dispatcher,
+        suite_runner=suite,
+        mutation_rechecker=recheck,
+        guard_inspector=guard,
+        git_ops=gops,
+    )
+
+    af = result.auto_fix
+    assert af is not None
+    assert af.merged is False
+    assert "guard halted the fix" in af.halt_reason
+    _assert_halt_restore_fired(gops=gops, repo=tmp_path, branch=af.branch)
+
+
+def test_halt_restore_fires_on_branch_creation_failure(tmp_path: Path) -> None:
+    """spec_026 §2-2 — branch creation failure also calls the restore.
+
+    Even though no work happened, the partial branch state must be
+    swept up so the next pre-flight starts clean.
+    """
+
+    _write_mutation_discover_json(repo=tmp_path)
+    dispatcher = _FakeFixDispatcher()
+    suite = _FakeSuiteRunner()
+    recheck = _FakeMutationRechecker()
+    guard = _FakeGuardInspector()
+    gops = _FakeGitOps(create_should_raise=RuntimeError("checkout -b boom"))
+    brief_runner, _ = _make_fake_brief_runner()
+
+    result = run_nightly(
+        repo=tmp_path,
+        profile=_autofix_profile(autonomous=True),
+        channel_runner=_RecordingChannelRunner(),
+        brief_runner=brief_runner,
+        windows_mirror=lambda _p: None,
+        fix_dispatcher=dispatcher,
+        suite_runner=suite,
+        mutation_rechecker=recheck,
+        guard_inspector=guard,
+        git_ops=gops,
+    )
+
+    af = result.auto_fix
+    assert af is not None
+    assert af.merged is False
+    assert "branch creation failed" in af.halt_reason
+    # The fake records discard / checkout / delete_branch calls even
+    # when create_and_checkout_branch raised — that is the entire point
+    # of the restore-on-HALT contract (spec_026 §2-2).
+    assert gops.discards, "discard_local_changes was not called"
+    assert "main" in gops.checkouts
+    assert af.branch in gops.deletes
+
+
+def test_success_merge_deletes_feature_branch_but_keeps_main(
+    tmp_path: Path,
+) -> None:
+    """spec_026 §2-2 — success path also deletes the auto branch, but the
+    merge commit stays on main (the existing behavior we must not break).
+
+    The success path doesn't need to discard local changes (the merge
+    already moved us to main with a clean tree); only the branch delete
+    fires."""
+
+    _write_mutation_discover_json(repo=tmp_path)
+    dispatcher = _FakeFixDispatcher(
+        outcome=FixDispatchOutcome(status="done", commits_made=1)
+    )
+    suite = _FakeSuiteRunner(outcome=SuiteOutcome(passed=True))
+    recheck = _FakeMutationRechecker(status="killed")
+    guard = _FakeGuardInspector(
+        result=GuardResult(
+            passed=True, halt_reasons=(), files_touched=("tests/x.py",), template="A"
+        )
+    )
+    gops = _FakeGitOps(canned_diff="diff --git a/tests/x.py b/tests/x.py\n")
+    brief_runner, _ = _make_fake_brief_runner()
+
+    result = run_nightly(
+        repo=tmp_path,
+        profile=_autofix_profile(autonomous=True),
+        channel_runner=_RecordingChannelRunner(),
+        brief_runner=brief_runner,
+        windows_mirror=lambda _p: None,
+        fix_dispatcher=dispatcher,
+        suite_runner=suite,
+        mutation_rechecker=recheck,
+        guard_inspector=guard,
+        git_ops=gops,
+    )
+
+    af = result.auto_fix
+    assert af is not None
+    assert af.merged is True
+    # Merge commit is recorded — existing behavior preserved.
+    assert gops.merges == [af.branch]
+    # Branch was deleted post-merge.
+    assert af.branch in gops.deletes
+    # Success path does NOT discard / checkout — the merge already
+    # put us on main with a clean tree.
+    assert gops.discards == []
+    # The only checkout was the one create_and_checkout_branch did
+    # during setup (FakeGitOps appends the branch name to checkouts);
+    # the loop does NOT add a redundant checkout("main") on success.
+    assert "main" not in gops.checkouts
+
+
+def test_halt_restore_swallows_exceptions_per_step(tmp_path: Path) -> None:
+    """spec_026 §2-2 — restoration is best-effort. If any single step
+    raises (e.g. ``git checkout main`` fails because main was just
+    deleted), the remaining steps still run. The morning brief still
+    renders with the original halt_reason."""
+
+    _write_mutation_discover_json(repo=tmp_path)
+
+    @dataclass
+    class _PartiallyFailingGitOps(_FakeGitOps):
+        # All three restore primitives raise to prove the loop's
+        # try/except wrapping catches each independently.
+        def discard_local_changes(self, *, repo: Path) -> None:
+            self.discards.append(Path(repo))
+            raise RuntimeError("git reset failed")
+
+        def checkout(self, *, repo: Path, ref: str) -> None:
+            self.checkouts.append(ref)
+            raise RuntimeError("git checkout failed")
+
+        def delete_branch(self, *, repo: Path, branch: str) -> None:
+            self.deletes.append(branch)
+            raise RuntimeError("git branch -D failed")
+
+    dispatcher = _FakeFixDispatcher()
+    suite = _FakeSuiteRunner()
+    recheck = _FakeMutationRechecker(status="survived")  # forces HALT
+    guard = _FakeGuardInspector()
+    gops = _PartiallyFailingGitOps()
+    brief_runner, _ = _make_fake_brief_runner()
+
+    # The whole run must not raise — every restore step is wrapped in
+    # try/except, and the brief renders the halt_reason from the
+    # original failure rather than the cleanup-step exception.
+    result = run_nightly(
+        repo=tmp_path,
+        profile=_autofix_profile(autonomous=True),
+        channel_runner=_RecordingChannelRunner(),
+        brief_runner=brief_runner,
+        windows_mirror=lambda _p: None,
+        fix_dispatcher=dispatcher,
+        suite_runner=suite,
+        mutation_rechecker=recheck,
+        guard_inspector=guard,
+        git_ops=gops,
+    )
+
+    af = result.auto_fix
+    assert af is not None
+    assert af.merged is False
+    assert "R5 failed" in af.halt_reason
+    # All three primitives fired (each appended before raising).
+    assert gops.discards
+    assert "main" in gops.checkouts
+    assert af.branch in gops.deletes
+
+
+def test_gitops_protocol_has_spec_026_methods() -> None:
+    """spec_026 §2-2 — the GitOps Protocol must expose
+    ``discard_local_changes`` and ``delete_branch`` so tests + the
+    SubprocessGitOps default can implement them. A future deletion of
+    either method would silently disable the HALT-restore contract."""
+
+    from ccd.nightly import GitOps, SubprocessGitOps
+
+    # Protocol methods (read off attributes; Protocol allows them at
+    # runtime as ellipsis stubs).
+    assert hasattr(GitOps, "discard_local_changes")
+    assert hasattr(GitOps, "delete_branch")
+    # SubprocessGitOps must implement them as real callables.
+    impl = SubprocessGitOps()
+    assert callable(impl.discard_local_changes)
+    assert callable(impl.delete_branch)
