@@ -32,8 +32,14 @@ Phase 2 fields
   autonomous-fix loop in ``ccd nightly``. Default ``False`` (safe) so a
   freshly-configured profile only does discovery + morning report; flip
   to ``True`` in CCD's own profile to let the loop translate one
-  template-A finding per night and merge the fix locally (`docs/DESIGN.md
+  template finding per night and merge the fix locally (`docs/DESIGN.md
   §9.7` 论点1 tier: CCD itself = ON, future client repos = OFF).
+- ``safety.fix_templates`` (spec_024) — **which templates the loop is
+  allowed to process** (``docs/DESIGN.md §9.7`` risk-tier ramp). Default
+  ``["A"]`` (test-only, structurally safest). Operators flip to
+  ``["A", "B"]`` once template A is trusted on the repo to let the loop
+  also fix adversarial ungraceful crashes (one production file +
+  ``tests/``, R3 prod-diff bound enforced).
 
 Phase 2 reserved fields (NOT implemented yet)
 ---------------------------------------------
@@ -59,6 +65,12 @@ from pathlib import Path
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 KNOWN_CHANNELS: tuple[str, ...] = ("mutation", "adversarial", "ai")
+
+# Templates the autonomous-fix loop knows how to handle. ``"A"`` = mutation
+# survivor → test-only fix (spec_022/spec_023). ``"B"`` = adversarial
+# ungraceful crash → production-fix + reproducer test (spec_024). Future
+# templates (e.g., ``"C"`` for AI-inference findings) get added here.
+KNOWN_FIX_TEMPLATES: tuple[str, ...] = ("A", "B")
 
 DEFAULT_PROFILE_REL = Path("_ai_workspace") / "ccd_profile.toml"
 
@@ -119,21 +131,66 @@ class ScheduleConfig(BaseModel):
 
 
 class SafetyConfig(BaseModel):
-    """Phase 2 safety knobs (spec_023 §2-1).
+    """Phase 2 safety knobs (spec_023 §2-1; ``fix_templates`` by spec_024).
 
     ``autonomous_fix`` is the **gate** that ignites the autonomous-fix
     loop. When ``True``, ``ccd nightly`` runs
     ``discover → translate → dispatch → verify → guard → local-merge``
-    for one template-A finding per night. When ``False`` (the safe
-    default), ``ccd nightly`` does Phase-1 discovery + morning report
-    only — no translation, no dispatch, no merge. The default is OFF so
-    a freshly-configured client repo never auto-fixes by surprise; only
-    a profile that explicitly opts in flips it on.
+    for one finding per night. When ``False`` (the safe default), ``ccd
+    nightly`` does Phase-1 discovery + morning report only — no
+    translation, no dispatch, no merge. The default is OFF so a
+    freshly-configured client repo never auto-fixes by surprise; only a
+    profile that explicitly opts in flips it on.
+
+    ``fix_templates`` controls **which templates the loop is allowed to
+    process** (``docs/DESIGN.md §9.7`` risk-tier ramp). Template A
+    (test-only) is structurally the safest autonomous edit; template B
+    (one production file + tests/) is one step riskier because it edits
+    live code. Per spec_024, the staged enablement is operator-controlled:
+
+    - ``["A"]`` (default) — only template A. Adversarial findings stay
+      report-only. This is the safe default — a client repo gets only
+      the structurally-safest autonomous edit even after flipping
+      ``autonomous_fix=True``.
+    - ``["A", "B"]`` — both templates. The loop processes mutation AND
+      adversarial findings. Enable B only after A is trusted on this
+      repo.
+    - ``["B"]`` is allowed for completeness but unusual — operators
+      would normally keep A enabled too.
+
+    Empty lists are rejected; the gate is the right way to disable the
+    loop, not an empty template list.
     """
 
     model_config = ConfigDict(extra="forbid")
 
     autonomous_fix: bool = False
+    fix_templates: list[str] = Field(default_factory=lambda: ["A"])
+
+    @field_validator("fix_templates")
+    @classmethod
+    def _templates_known(cls, v: list[str]) -> list[str]:
+        if not v:
+            raise ValueError(
+                "fix_templates must list at least one template; "
+                "use safety.autonomous_fix=false to disable the loop "
+                "instead of providing an empty fix_templates list"
+            )
+        bad = [t for t in v if t not in KNOWN_FIX_TEMPLATES]
+        if bad:
+            raise ValueError(
+                f"unknown fix_templates: {bad!r}; "
+                f"allowed: {list(KNOWN_FIX_TEMPLATES)!r}"
+            )
+        # Reject duplicates: ["A","A","B"] is a typo, not intent.
+        seen: list[str] = []
+        for t in v:
+            if t in seen:
+                raise ValueError(
+                    f"duplicate template {t!r} in fix_templates={v!r}"
+                )
+            seen.append(t)
+        return v
 
 
 class Profile(BaseModel):
@@ -275,6 +332,7 @@ def render_profile(result: ProfileLoadResult) -> str:
     lines.append("")
     lines.append("[safety]")
     lines.append(f"autonomous_fix = {_toml_bool(p.safety.autonomous_fix)}")
+    lines.append("fix_templates = " + _toml_str_list(p.safety.fix_templates))
     return "\n".join(lines)
 
 

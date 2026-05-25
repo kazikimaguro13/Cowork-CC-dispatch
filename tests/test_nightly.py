@@ -1628,3 +1628,660 @@ def test_cli_nightly_off_profile_no_auto_fix_line(
     assert rc == 0
     out = capsys.readouterr().out
     assert "auto-fix" not in out
+
+
+# --------------------------------------------------------------------------- #
+# spec_024 — template B fakes / helpers
+# --------------------------------------------------------------------------- #
+
+
+@dataclass
+class _FakeAdversarialRechecker:
+    status: str = "graceful_error"
+    calls: list[tuple[str, str]] = field(default_factory=list)
+
+    def __call__(
+        self,
+        *,
+        repo: Path,
+        parser: str,
+        case_name: str,
+    ) -> str:
+        self.calls.append((parser, case_name))
+        return self.status
+
+
+def _write_adversarial_discover_json(
+    *,
+    repo: Path,
+    seq: int = 1,
+    findings: list[dict[str, Any]] | None = None,
+) -> Path:
+    """Drop a synthetic adversarial ``discover_NNN.json`` so the loop has
+    a template-B candidate to chew on. Default: one UnicodeDecodeError
+    leak from parse_spec (mimicking the spec_024 §1 实弾 example)."""
+
+    discover_dir = repo / "_ai_workspace" / "discover"
+    discover_dir.mkdir(parents=True, exist_ok=True)
+    if findings is None:
+        findings = [
+            {
+                "parser": "ccd.protocol.parse_spec",
+                "case": "05_invalid_utf8_bytes",
+                "exception_type": "UnicodeDecodeError",
+                "exception_message": "'utf-8' codec can't decode byte 0xff",
+            }
+        ]
+    payload = {
+        "channel": "adversarial",
+        "summary": {
+            "parsers": ["ccd.protocol.parse_spec"],
+            "cases_total": 18,
+            "evaluations_total": 72,
+            "graceful_total": 64,
+            "ungraceful_total": len(findings),
+            "graceful_by_parser": {},
+            "ungraceful_by_parser": {},
+            "ungraceful_by_exception_type": {},
+        },
+        "findings": findings,
+        "cases": [],
+    }
+    json_path = discover_dir / f"discover_{seq:03d}.json"
+    json_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    md_path = discover_dir / f"discover_{seq:03d}.md"
+    md_path.write_text(
+        f"# discover_{seq:03d} — fake adversarial report\n",
+        encoding="utf-8",
+    )
+    return json_path
+
+
+def _autofix_profile_b(*, autonomous: bool = True) -> Profile:
+    """Profile with template B enabled (``fix_templates=["A", "B"]``)."""
+
+    return Profile(
+        discovery=DiscoveryConfig(
+            channels=["mutation", "adversarial"],
+        ),
+        schedule=ScheduleConfig(),
+        safety=SafetyConfig(
+            autonomous_fix=autonomous, fix_templates=["A", "B"]
+        ),
+    )
+
+
+# --------------------------------------------------------------------------- #
+# spec_024 — template B is gated by safety.fix_templates
+# --------------------------------------------------------------------------- #
+
+
+def test_template_b_finding_ignored_when_only_a_enabled(tmp_path: Path) -> None:
+    """``fix_templates=["A"]`` (default) — even with adversarial findings
+    on disk, the loop never picks them up. The morning brief still
+    surfaces them via the report-only path."""
+
+    _write_adversarial_discover_json(repo=tmp_path)
+    dispatcher = _FakeFixDispatcher()
+    suite = _FakeSuiteRunner()
+    recheck = _FakeMutationRechecker()
+    adv_recheck = _FakeAdversarialRechecker()
+    guard = _FakeGuardInspector()
+    gops = _FakeGitOps()
+    brief_runner, _ = _make_fake_brief_runner()
+
+    result = run_nightly(
+        repo=tmp_path,
+        profile=_autofix_profile(autonomous=True),  # fix_templates=["A"]
+        channel_runner=_RecordingChannelRunner(),
+        brief_runner=brief_runner,
+        windows_mirror=lambda _p: None,
+        fix_dispatcher=dispatcher,
+        suite_runner=suite,
+        mutation_rechecker=recheck,
+        adversarial_rechecker=adv_recheck,
+        guard_inspector=guard,
+        git_ops=gops,
+    )
+
+    af = result.auto_fix
+    assert af is not None
+    assert af.skipped is True
+    assert "no template-A candidate" in af.skip_reason
+    # Adversarial rechecker NEVER called — template B path not exercised.
+    assert adv_recheck.calls == []
+    assert dispatcher.calls == []
+
+
+def test_template_b_happy_path_merges_locally(tmp_path: Path) -> None:
+    """Gate ON + ``fix_templates=["A", "B"]`` + only adversarial finding
+    + dispatch ok + R5=graceful_error + R4 green + guard pass → loop
+    merges the production fix into local main."""
+
+    _write_adversarial_discover_json(repo=tmp_path)
+    dispatcher = _FakeFixDispatcher(
+        outcome=FixDispatchOutcome(status="done", commits_made=1)
+    )
+    suite = _FakeSuiteRunner(outcome=SuiteOutcome(passed=True))
+    recheck = _FakeMutationRechecker()  # A path — not called
+    adv_recheck = _FakeAdversarialRechecker(status="graceful_error")
+    guard = _FakeGuardInspector(
+        result=GuardResult(
+            passed=True,
+            halt_reasons=(),
+            files_touched=("ccd/protocol.py", "tests/test_protocol.py"),
+            template="B",
+        )
+    )
+    gops = _FakeGitOps(
+        canned_diff=(
+            "diff --git a/ccd/protocol.py b/ccd/protocol.py\n"
+            "diff --git a/tests/test_protocol.py b/tests/test_protocol.py\n"
+        )
+    )
+    brief_runner, _ = _make_fake_brief_runner()
+
+    result = run_nightly(
+        repo=tmp_path,
+        profile=_autofix_profile_b(autonomous=True),
+        channel_runner=_RecordingChannelRunner(),
+        brief_runner=brief_runner,
+        windows_mirror=lambda _p: None,
+        fix_dispatcher=dispatcher,
+        suite_runner=suite,
+        mutation_rechecker=recheck,
+        adversarial_rechecker=adv_recheck,
+        guard_inspector=guard,
+        git_ops=gops,
+        today=date(2026, 5, 25),
+    )
+
+    af = result.auto_fix
+    assert isinstance(af, AutoFixOutcome)
+    assert af.skipped is False
+    assert af.template == "B"
+    assert af.spec_auto_id.startswith("spec_auto_")
+    assert af.spec_auto_path is not None
+    assert af.spec_auto_path.exists()
+    assert af.finding_signature == (
+        "ccd.protocol.parse_spec:05_invalid_utf8_bytes:UnicodeDecodeError"
+    )
+    assert af.branch == f"auto/{af.spec_auto_id}"
+    assert af.dispatched is True
+    assert af.dispatch_status == "done"
+    assert af.r5_killed is True  # treated as "R5 passed" — name is historical
+    assert af.r4_suite_passed is True
+    assert af.guard_passed is True
+    assert af.merged is True
+    assert af.halt_reason == ""
+
+    # The adversarial rechecker received the parser + case from the finding.
+    assert adv_recheck.calls == [
+        ("ccd.protocol.parse_spec", "05_invalid_utf8_bytes"),
+    ]
+    # The mutation rechecker was NOT called — template B uses adv path only.
+    assert recheck.calls == []
+    # Guard received template B + the named production file + tests/.
+    assert guard.calls == [
+        (gops.canned_diff, ("ccd/protocol.py", "tests/"), "B"),
+    ]
+    assert gops.branches_created == [af.branch]
+    assert gops.merges == [af.branch]
+
+
+def test_template_b_halts_when_parser_silently_accepts(tmp_path: Path) -> None:
+    """spec_024 §3: 'fix must error gracefully, not succeed'. When the
+    rechecker reports ``graceful_success`` (the parser silently accepted
+    the broken input), R5 must fail with a distinct halt reason that
+    pinpoints the silent-acceptance failure mode."""
+
+    _write_adversarial_discover_json(repo=tmp_path)
+    dispatcher = _FakeFixDispatcher()
+    suite = _FakeSuiteRunner(outcome=SuiteOutcome(passed=True))
+    adv_recheck = _FakeAdversarialRechecker(status="graceful_success")
+    guard = _FakeGuardInspector(
+        result=GuardResult(
+            passed=True, halt_reasons=(), files_touched=(), template="B"
+        )
+    )
+    gops = _FakeGitOps()
+    brief_runner, _ = _make_fake_brief_runner()
+
+    result = run_nightly(
+        repo=tmp_path,
+        profile=_autofix_profile_b(autonomous=True),
+        channel_runner=_RecordingChannelRunner(),
+        brief_runner=brief_runner,
+        windows_mirror=lambda _p: None,
+        fix_dispatcher=dispatcher,
+        suite_runner=suite,
+        adversarial_rechecker=adv_recheck,
+        guard_inspector=guard,
+        git_ops=gops,
+    )
+
+    af = result.auto_fix
+    assert af is not None
+    assert af.template == "B"
+    assert af.r5_killed is False
+    assert af.merged is False
+    assert "silently accepted" in af.halt_reason
+    assert "spec_024 §3" in af.halt_reason
+    assert gops.merges == []
+
+
+def test_template_b_halts_when_parser_still_ungraceful(tmp_path: Path) -> None:
+    """Rechecker reports ``ungraceful`` (the fix didn't take, the crash
+    still leaks) → R5 fails with the "did not become a graceful error"
+    reason."""
+
+    _write_adversarial_discover_json(repo=tmp_path)
+    dispatcher = _FakeFixDispatcher()
+    suite = _FakeSuiteRunner(outcome=SuiteOutcome(passed=True))
+    adv_recheck = _FakeAdversarialRechecker(status="ungraceful")
+    guard = _FakeGuardInspector()
+    gops = _FakeGitOps()
+    brief_runner, _ = _make_fake_brief_runner()
+
+    result = run_nightly(
+        repo=tmp_path,
+        profile=_autofix_profile_b(autonomous=True),
+        channel_runner=_RecordingChannelRunner(),
+        brief_runner=brief_runner,
+        windows_mirror=lambda _p: None,
+        fix_dispatcher=dispatcher,
+        suite_runner=suite,
+        adversarial_rechecker=adv_recheck,
+        guard_inspector=guard,
+        git_ops=gops,
+    )
+
+    af = result.auto_fix
+    assert af is not None
+    assert af.r5_killed is False
+    assert af.merged is False
+    assert "did not become a graceful error" in af.halt_reason
+    assert "ungraceful" in af.halt_reason
+    assert gops.merges == []
+
+
+def test_template_b_guard_halt_via_r3_diff_size(tmp_path: Path) -> None:
+    """spec_024 §2-2: 'R3 (本番 diff サイズ上限) が有効'. The loop must
+    pass ``template="B"`` to ``guard_inspector`` so R3 is enforced. We
+    pin this by having the fake guard return an R3 halt and verifying the
+    loop honored it (didn't merge) AND that the guard call used
+    template="B" with the production file in allowed_files."""
+
+    _write_adversarial_discover_json(repo=tmp_path)
+    dispatcher = _FakeFixDispatcher()
+    suite = _FakeSuiteRunner(outcome=SuiteOutcome(passed=True))
+    adv_recheck = _FakeAdversarialRechecker(status="graceful_error")
+    guard = _FakeGuardInspector(
+        result=GuardResult(
+            passed=False,
+            halt_reasons=(
+                "R3: production diff is 123 +/- lines across 1 file(s) "
+                "(limit 60); narrow-scope fixes should not produce large "
+                "diffs — likely scope creep",
+            ),
+            files_touched=("ccd/protocol.py", "tests/test_protocol.py"),
+            template="B",
+        )
+    )
+    gops = _FakeGitOps(canned_diff="diff --git a/ccd/protocol.py b/ccd/protocol.py\n")
+    brief_runner, _ = _make_fake_brief_runner()
+
+    result = run_nightly(
+        repo=tmp_path,
+        profile=_autofix_profile_b(autonomous=True),
+        channel_runner=_RecordingChannelRunner(),
+        brief_runner=brief_runner,
+        windows_mirror=lambda _p: None,
+        fix_dispatcher=dispatcher,
+        suite_runner=suite,
+        adversarial_rechecker=adv_recheck,
+        guard_inspector=guard,
+        git_ops=gops,
+    )
+
+    af = result.auto_fix
+    assert af is not None
+    assert af.template == "B"
+    assert af.guard_passed is False
+    assert "R3" in af.guard_halt_reasons[0]
+    assert af.merged is False
+    assert "guard halted the fix" in af.halt_reason
+    # Crucial: the guard call passed template="B" (so R3 is enforced)
+    # and the production file + tests/ as allowed_files.
+    assert guard.calls == [
+        (gops.canned_diff, ("ccd/protocol.py", "tests/"), "B"),
+    ]
+    assert gops.merges == []
+
+
+def test_template_b_guard_blocks_production_file_outside_allowed(
+    tmp_path: Path,
+) -> None:
+    """When the guard halts on R1 (a file outside the per-finding allowed
+    set), the loop must surface the halt — proving the allowed_files
+    contains only the *named* file + tests/, not "any ccd/*.py"."""
+
+    _write_adversarial_discover_json(repo=tmp_path)
+    dispatcher = _FakeFixDispatcher()
+    suite = _FakeSuiteRunner(outcome=SuiteOutcome(passed=True))
+    adv_recheck = _FakeAdversarialRechecker(status="graceful_error")
+    guard = _FakeGuardInspector(
+        result=GuardResult(
+            passed=False,
+            halt_reasons=(
+                "R1: ccd/sneaky.py is not in the allowed file set "
+                "(allowed=['ccd/protocol.py', 'tests/'])",
+            ),
+            files_touched=(),
+            template="B",
+        )
+    )
+    gops = _FakeGitOps()
+    brief_runner, _ = _make_fake_brief_runner()
+
+    result = run_nightly(
+        repo=tmp_path,
+        profile=_autofix_profile_b(autonomous=True),
+        channel_runner=_RecordingChannelRunner(),
+        brief_runner=brief_runner,
+        windows_mirror=lambda _p: None,
+        fix_dispatcher=dispatcher,
+        suite_runner=suite,
+        adversarial_rechecker=adv_recheck,
+        guard_inspector=guard,
+        git_ops=gops,
+    )
+
+    af = result.auto_fix
+    assert af is not None
+    assert af.guard_passed is False
+    assert "R1" in af.guard_halt_reasons[0]
+    assert af.merged is False
+
+
+def test_template_a_priority_over_b_when_both_present(tmp_path: Path) -> None:
+    """spec_024 priority: 'A before B' (test-only is structurally safer).
+    Even when both templates are enabled AND both have candidates, the
+    loop picks A first. B's candidate stays in the discover JSON for the
+    morning brief / a future night."""
+
+    _write_mutation_discover_json(repo=tmp_path)  # discover_001.json (mutation)
+    _write_adversarial_discover_json(repo=tmp_path, seq=2)  # discover_002.json
+    dispatcher = _FakeFixDispatcher()
+    suite = _FakeSuiteRunner()
+    recheck = _FakeMutationRechecker(status="killed")
+    adv_recheck = _FakeAdversarialRechecker(status="graceful_error")
+    guard = _FakeGuardInspector()
+    gops = _FakeGitOps()
+    brief_runner, _ = _make_fake_brief_runner()
+
+    result = run_nightly(
+        repo=tmp_path,
+        profile=_autofix_profile_b(autonomous=True),
+        channel_runner=_RecordingChannelRunner(),
+        brief_runner=brief_runner,
+        windows_mirror=lambda _p: None,
+        fix_dispatcher=dispatcher,
+        suite_runner=suite,
+        mutation_rechecker=recheck,
+        adversarial_rechecker=adv_recheck,
+        guard_inspector=guard,
+        git_ops=gops,
+    )
+
+    af = result.auto_fix
+    assert af is not None
+    assert af.template == "A"  # NOT "B"
+    assert af.finding_signature == "ccd/protocol.py:46:x == y → x != y"
+    # Mutation rechecker called, adversarial NOT.
+    assert recheck.calls
+    assert adv_recheck.calls == []
+
+
+def test_template_b_falls_through_when_a_has_no_candidate(
+    tmp_path: Path,
+) -> None:
+    """With ``fix_templates=["A", "B"]``: if A has no candidate (no
+    mutation discover JSON, or only killed/blocklisted findings), the
+    loop falls through to template B."""
+
+    # Only an adversarial JSON exists — no mutation JSON.
+    _write_adversarial_discover_json(repo=tmp_path)
+    dispatcher = _FakeFixDispatcher()
+    suite = _FakeSuiteRunner()
+    recheck = _FakeMutationRechecker()
+    adv_recheck = _FakeAdversarialRechecker(status="graceful_error")
+    guard = _FakeGuardInspector(
+        result=GuardResult(
+            passed=True, halt_reasons=(), files_touched=(), template="B"
+        )
+    )
+    gops = _FakeGitOps()
+    brief_runner, _ = _make_fake_brief_runner()
+
+    result = run_nightly(
+        repo=tmp_path,
+        profile=_autofix_profile_b(autonomous=True),
+        channel_runner=_RecordingChannelRunner(),
+        brief_runner=brief_runner,
+        windows_mirror=lambda _p: None,
+        fix_dispatcher=dispatcher,
+        suite_runner=suite,
+        mutation_rechecker=recheck,
+        adversarial_rechecker=adv_recheck,
+        guard_inspector=guard,
+        git_ops=gops,
+    )
+
+    af = result.auto_fix
+    assert af is not None
+    assert af.template == "B"
+    assert af.merged is True
+    assert adv_recheck.calls  # adv path exercised
+    assert recheck.calls == []  # mutation path not
+
+
+def test_template_b_no_candidate_when_only_b_enabled_but_no_adversarial_findings(
+    tmp_path: Path,
+) -> None:
+    """``fix_templates=["B"]`` + no adversarial findings on disk → loop
+    skips with a B-specific no-candidate reason (the test pins that the
+    message names template-B explicitly so the morning brief can
+    distinguish 'no A' from 'no B')."""
+
+    dispatcher = _FakeFixDispatcher()
+    adv_recheck = _FakeAdversarialRechecker()
+    brief_runner, _ = _make_fake_brief_runner()
+
+    profile = Profile(
+        discovery=DiscoveryConfig(channels=["adversarial"]),
+        schedule=ScheduleConfig(),
+        safety=SafetyConfig(autonomous_fix=True, fix_templates=["B"]),
+    )
+
+    result = run_nightly(
+        repo=tmp_path,
+        profile=profile,
+        channel_runner=_RecordingChannelRunner(),
+        brief_runner=brief_runner,
+        windows_mirror=lambda _p: None,
+        fix_dispatcher=dispatcher,
+        adversarial_rechecker=adv_recheck,
+    )
+
+    af = result.auto_fix
+    assert af is not None
+    assert af.skipped is True
+    assert "template-B" in af.skip_reason
+    assert dispatcher.calls == []
+
+
+def test_template_b_default_adversarial_rechecker_distinguishes_graceful(
+    tmp_path: Path,  # noqa: ARG001 — kept for fixture symmetry
+) -> None:
+    """The production default rechecker classifies the four real outcomes:
+
+    - ``ccd.protocol.parse_spec`` × ``05_invalid_utf8_bytes`` →
+      ``"ungraceful"`` (the current bug we're trying to surface — leaks
+      UnicodeDecodeError).
+    - ``ccd.protocol.parse_spec`` × ``08_spec_missing_title_heading`` →
+      ``"graceful_error"`` (ValueError, clean rejection).
+    - unknown parser → ``"unknown"`` (loop halts conservatively).
+    - unknown case → ``"unknown"``.
+
+    This pins the rechecker contract without re-running mutmut/claude/
+    pytest — it's a pure in-process function call against fixtures from
+    ``ccd.adversarial``."""
+
+    from ccd.nightly import _default_adversarial_rechecker
+
+    assert (
+        _default_adversarial_rechecker(
+            repo=Path("/tmp"),  # noqa: S108 — irrelevant; not used by impl
+            parser="ccd.protocol.parse_spec",
+            case_name="05_invalid_utf8_bytes",
+        )
+        == "ungraceful"
+    )
+    assert (
+        _default_adversarial_rechecker(
+            repo=Path("/tmp"),
+            parser="ccd.protocol.parse_spec",
+            case_name="08_spec_missing_title_heading",
+        )
+        == "graceful_error"
+    )
+    assert (
+        _default_adversarial_rechecker(
+            repo=Path("/tmp"),
+            parser="ccd.protocol.no_such_parser",
+            case_name="05_invalid_utf8_bytes",
+        )
+        == "unknown"
+    )
+    assert (
+        _default_adversarial_rechecker(
+            repo=Path("/tmp"),
+            parser="ccd.protocol.parse_spec",
+            case_name="999_no_such_case",
+        )
+        == "unknown"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# spec_024 — discover JSON channel routing
+# --------------------------------------------------------------------------- #
+
+
+def test_disk_fallback_distinguishes_mutation_vs_adversarial_json(
+    tmp_path: Path,
+) -> None:
+    """When both a mutation JSON (discover_001.json) and an adversarial
+    JSON (discover_002.json) exist on disk and no channel outcome
+    surfaces either, the loop must read them via channel — not just
+    'latest by number'. Otherwise template A's selector would pick up
+    the adversarial JSON's empty 'actionable' list and skip silently
+    while a real mutation finding sits unhandled."""
+
+    _write_mutation_discover_json(repo=tmp_path)  # discover_001.json
+    _write_adversarial_discover_json(repo=tmp_path, seq=2)  # discover_002.json
+    dispatcher = _FakeFixDispatcher()
+    suite = _FakeSuiteRunner()
+    recheck = _FakeMutationRechecker(status="killed")
+    adv_recheck = _FakeAdversarialRechecker(status="graceful_error")
+    guard = _FakeGuardInspector()
+    gops = _FakeGitOps()
+    brief_runner, _ = _make_fake_brief_runner()
+
+    # Profile only has template A — the loop must find the mutation JSON
+    # despite the adversarial JSON having a higher sequence number.
+    result = run_nightly(
+        repo=tmp_path,
+        profile=_autofix_profile(autonomous=True),
+        channel_runner=_RecordingChannelRunner(),
+        brief_runner=brief_runner,
+        windows_mirror=lambda _p: None,
+        fix_dispatcher=dispatcher,
+        suite_runner=suite,
+        mutation_rechecker=recheck,
+        adversarial_rechecker=adv_recheck,
+        guard_inspector=guard,
+        git_ops=gops,
+    )
+
+    af = result.auto_fix
+    assert af is not None
+    assert af.template == "A"
+    assert af.finding_signature == "ccd/protocol.py:46:x == y → x != y"
+    # Adversarial path stayed dormant.
+    assert adv_recheck.calls == []
+
+
+def test_template_b_one_candidate_per_night(tmp_path: Path) -> None:
+    """Multiple adversarial findings → exactly one is picked (论点3,
+    same single-candidate guarantee as template A)."""
+
+    _write_adversarial_discover_json(
+        repo=tmp_path,
+        findings=[
+            {
+                "parser": "ccd.protocol.parse_spec",
+                "case": "05_invalid_utf8_bytes",
+                "exception_type": "UnicodeDecodeError",
+                "exception_message": "msg-1",
+            },
+            {
+                "parser": "ccd.protocol.parse_result",
+                "case": "05_invalid_utf8_bytes",
+                "exception_type": "UnicodeDecodeError",
+                "exception_message": "msg-2",
+            },
+            {
+                "parser": "ccd.run_writer.load_records",
+                "case": "05_invalid_utf8_bytes",
+                "exception_type": "UnicodeDecodeError",
+                "exception_message": "msg-3",
+            },
+        ],
+    )
+    dispatcher = _FakeFixDispatcher()
+    suite = _FakeSuiteRunner()
+    adv_recheck = _FakeAdversarialRechecker(status="graceful_error")
+    guard = _FakeGuardInspector(
+        result=GuardResult(
+            passed=True, halt_reasons=(), files_touched=(), template="B"
+        )
+    )
+    gops = _FakeGitOps()
+    brief_runner, _ = _make_fake_brief_runner()
+
+    result = run_nightly(
+        repo=tmp_path,
+        profile=_autofix_profile_b(autonomous=True),
+        channel_runner=_RecordingChannelRunner(),
+        brief_runner=brief_runner,
+        windows_mirror=lambda _p: None,
+        fix_dispatcher=dispatcher,
+        suite_runner=suite,
+        adversarial_rechecker=adv_recheck,
+        guard_inspector=guard,
+        git_ops=gops,
+    )
+
+    af = result.auto_fix
+    assert af is not None
+    # Dispatcher called exactly once.
+    assert len(dispatcher.calls) == 1
+    assert af.candidate_count == 3
+    # The first finding (parse_spec) won.
+    assert af.finding_signature == (
+        "ccd.protocol.parse_spec:05_invalid_utf8_bytes:UnicodeDecodeError"
+    )
+    assert len(gops.branches_created) == 1
+    assert len(gops.merges) == 1
