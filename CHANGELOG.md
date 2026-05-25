@@ -2,6 +2,53 @@
 
 本プロジェクトの注目すべき変更を記録する。フォーマットは [Keep a Changelog](https://keepachangelog.com/) に準ずる。
 
+## [0.12.0] — 2026-05-25
+
+v2 Phase 2 の 2 本目 — spec_022。spec_021 で**インチキ修正ガード**（`ccd/guard.py`）が静的検査単独で実証された次の段として、**翻訳器** を追加。発見（`discover_NNN.json` の生存改変 1 件）を、CC に投げられる修正 spec（`spec_auto_NNN.md`）に変換する（`docs/DESIGN.md §9.5` 論点5）。本 spec はテンプレ A（ミューテーション生存改変 → test-only 修正）のみを実装 ── テンプレ B（敵対的入力 → 本番コード修正）は spec_024 の責務。
+
+論点5 の核心は **翻訳は AI を一切使わない機械的なテンプレート穴埋め** であること。発見は Phase 1 で曖昧さゼロに絞り込まれているので grill-me で詰めるべき穴がない。翻訳ステップは「修正係に指示書を手渡す」段階 ── その指示そのものは AI が手を加えるとスコープを広げたり制約を緩めたりしうるので、純粋な機械的テンプレ穴埋めにする。本 spec の翻訳器は **AI を 1 度も呼ばない・決定的**（同じ発見 → 同じ spec_auto 本文）で、`tests/test_translate.py::test_translation_is_deterministic_same_finding_same_body` がこれを byte-identical 比較で pin。
+
+`spec_auto_NNN` は **別名前空間**（`_ai_workspace/bridge/inbox/` に `spec_auto_` プレフィクスで置く）── 人間が grill-me で練った `spec_NNN` 連番と git 履歴・朝レポートで一目で判別できるように混ぜない。連番は inbox 内の `spec_auto_*.md` の最大 +1（存在しなければ 001）。
+
+### Added
+
+- **`ccd/translate.py` 新モジュール** — Phase 2 の翻訳器（テンプレ A のみ）。
+  - **`translate_finding(finding, *, repo, inbox_dir=None, outbox_dir=None, channel="mutation", source_report="", today=None) -> TranslateResult`** — エントリ関数。発見 1 件 → `spec_auto_NNN.md` 1 件。`finding` は `Finding` dataclass または `discover_NNN.json` の `actionable` エントリ dict をそのまま受け取れる（`Finding.from_dict` で正規化）。`today` は決定性テスト用の注入 seam（既定 `datetime.now(UTC).date()`）。
+  - **`Finding` dataclass (frozen)** — `channel` / `file` / `line` / `mutation` / `status` / `signature` / `source_report`。`from_dict(payload, *, channel, source_report)` で `discover_NNN.json` の actionable エントリから組み立てる（壊れた line 値は 0 に倒して downstream の template-fit check で halt させる ── 例外で loop を落とさない）。
+  - **`TranslateResult` dataclass (frozen)** — `success` / `spec_auto_id` / `spec_auto_path: Path \| None` / `finding: Finding` / `template: str` / `halt_reason: str`。frozen なので外側から書き換え不可（`test_translate_result_is_frozen_dataclass` で pin）。
+  - **テンプレ A 本文構造** — 7 セクション、すべて自己完結（標準の dispatch プロンプトでそのまま回せる）:
+    1. **§1 文脈（事実）** — file:line・mutation 引用・`<old> → <new>` 分解（mutmut 既定の "→" 矢印を検出）・mutmut 出力の証拠アンカー。
+    2. **§2 やってほしいこと** — このロジックを縛るテストを **1 本だけ** 書く、改変時に特定アサーションで失敗・現行 main で成功・既存テスト数 +1。
+    3. **§3 制約（テンプレ A 逐語、本タスクで侵食してはならない）** — 5 つの制約を逐語で焼き込み（モジュールトップレベルの定数 `_CONSTRAINT_TEST_ONLY` / `_CONSTRAINT_EXISTING_TESTS_IMMUTABLE` / `_CONSTRAINT_NO_SKIP_MARKERS` / `_CONSTRAINT_DETERMINISTIC` / `_CONSTRAINT_ALLOWED_SET`、`test_constraint_phrases_are_verbatim` で逐語 pin）。論点5 の「指示は侵食不能な剛体」を物理的に保証。
+    4. **§4 検証要件** — 改変時 fail / main で pass / `pytest -q` 全緑 / `ruff check .` clean / `ccd guard --template A --allowed tests/` で HALT しない（spec_021 の静的ガード呼び出し方を明示）。
+    5. **§5 許可ファイル集合（R1 ファイル許可リスト、逐語宣言）** — 「触れてよい ＝ `tests/` のみ」を逐語で書き、触れてはならないファイル群（`ccd/` 以下・`_ai_workspace/` 以下・`docs/`・`pyproject.toml`・`.github/` 等）を列挙。`ccd guard` の `--allowed tests/` 引数と一致する宣言（呼び出し側がこれを直接読んで R1 を適用）。
+    6. **§6 出力先** — `_ai_workspace/bridge/outbox/result_auto_NNN.md`（`ccd/protocol.py::_derive_result_id` の `spec_*` → `result_*` 変換と整合）。
+    7. **§7 メタ情報** — 翻訳元発見の signature / channel / status / レポートを記録、`spec_auto_*` 別名前空間と AI 不使用・決定性を明記。
+  - **報告専用降格** — `_why_template_a_does_not_fit(finding)` で発見がテンプレ A に収まるかチェック。`channel != "mutation"` / `status != "survived"` / `file` 空 / `line <= 0` / `mutation` 空 のいずれかで `TranslateResult(success=False, halt_reason="finding does not fit template A — downgraded to report-only: ...")` を返す（spec_auto は書き出さない）。テンプレ A は構造上常に収まるはずだが、将来テンプレ B / AI チャンネル等が増えたときの保険として明文化・実装。
+  - **`_next_spec_auto_seq(inbox_dir)`** — `spec_auto_*.md` の最大連番 +1（存在しなければ 1）。人間の `spec_NNN.md` は無視（regex `^spec_auto_(\d+)\.md$` で match）。inbox 不在なら mkdir。
+  - **AI なしの構造的強制** — `ccd/translate.py` は `AgentRunner` / `ClaudeCodeRunner` / `dispatch_one` / `dispatch_with_retry` を一切 import せず、関数シグネチャにも `runner: AgentRunner` 引数を持たない。`test_translator_does_not_import_any_agent_runner` がこのモジュール surface の forbidden symbol を pin。
+- **`tests/test_translate.py`** — 17 テスト:
+  - **happy path**: `spec_auto_001.md` 生成 / テンプレ A 全要素 / 制約逐語 / dict 入力 / `parse_spec` で parseable
+  - **採番**: inbox に既存 spec_auto を置いた状態で max+1 / 連続 2 件で 001 → 002 / inbox 不在で mkdir
+  - **決定性**: 同じ finding + 同じ today で 2 つの fresh inbox に書いて byte-identical / AI runner forbidden import
+  - **報告専用降格**: channel `adversarial` / status `killed` / file 空 / line=0 / mutation 空、すべて success=False + halt_reason、spec_auto 未生成
+  - **データクラス健全性**: `Finding.from_dict` の壊れた line 値正規化 / `TranslateResult` frozen
+
+### Changed
+
+- `pyproject.toml` / `ccd/__init__.py` version `0.11.0` → `0.12.0`（**新機能 = minor bump**、spec §2-6）。
+- `tests/test_smoke.py::test_version_is_0110` → `test_version_is_0120`、`__version__ == "0.12.0"` を assert。
+
+### Constraints (spec §3)
+
+- **触ってよい**: `ccd/translate.py`（新規）、`tests/test_translate.py`（新規）、`tests/test_smoke.py`（version assert）、`CHANGELOG.md`、`pyproject.toml`、`ccd/__init__.py`。
+- **触っていない**: `ccd/{models,protocol,dispatch,chain,integrate,metrics,dashboard,run_writer,retry,backfill,agent,retrospect,discover,adversarial,ai_review,brief,profile,nightly,guard,cli}.py` のコアロジックは **1 行も変更していない**（`cli.py` も含めて未変更 ── 本 spec の `translate` CLI 化は spec_023 のループ配線で同時に行う方が自然と判断、明示的な CLI が必要なら同 spec で `_cmd_translate` を追加できる）。`docs/` / `docs/data/*.json` も触らない。
+- 翻訳は **AI を一切呼ばない**。純粋な機械的テンプレート穴埋め（モジュールが `AgentRunner` 系を import していないこと自体をテストで pin）。
+- 生成するのは spec の "種" ではなく、そのまま dispatch できる **完全な修正 spec**（発見が曖昧さゼロなので grill-me 不要 ── §2/§3/§4/§5 が full instruction として並ぶ）。
+- すべて**追加のみ**。**push しない／ブランチ操作・merge しない**（spec §3）。
+
+
+
 ## [0.11.0] — 2026-05-25
 
 v2 Phase 2（**自律修正ループ点火**）の最初の spec — spec_021。Phase 2 は「発見を無人で直す」ループを閉じる段階で、確定事項(2)「インチキ修正の危険」（自律修正係がテストを消す/assert を緩めることで失敗を消す）を退治することが第一の責務。Phase 1 が「発見ファースト」だったのと同じ精神で、Phase 2 は **ガードファースト** ── インチキ修正ガードを**先に・単独で**実装し、crafted な diff（インチキ diff・正当な diff）で実証してから、ループ本体を点火する。
