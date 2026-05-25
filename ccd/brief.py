@@ -1,4 +1,4 @@
-"""ccd brief — morning report renderer (spec_017, v2 Phase 1).
+"""ccd brief — morning report renderer (spec_017, v2 Phase 1 + spec_025).
 
 The morning report is Loop β's single human-facing artifact
 (``docs/DESIGN.md §9.6``). spec_017's job is the **renderer**: it reads
@@ -7,13 +7,30 @@ one *latest* per channel (``mutation`` / ``adversarial`` / ``ai``) — and
 writes a one-page 6-section Markdown report to
 ``_ai_workspace/nightly/report_YYYY-MM-DD.md``.
 
+spec_025 — §B upgrade
+---------------------
+When the night included a successful autonomous-fix merge, §B switches
+to the **Phase 2** layout: it surfaces the fix's *finding → action*
+narrative, the diff that landed on local ``main``, the verification
+evidence (R5 / R4 / guard), and a ready-to-paste ``git push`` one-liner
+the operator runs after reviewing the diff. Nights without an
+autonomous-fix merge keep the Phase 1 §B (mechanical-channel
+discoveries only).
+
+To stay aligned with ``docs/DESIGN.md §9.6`` ("既定は簡潔・例外時のみ
+伸びる"), the Phase 2 §B is only rendered when ``auto_fix`` is present
+and reports ``merged=True``. Skipped / halted nights still see the
+Phase 1 §B — those nights have nothing additional worth surfacing in
+the brief's body that isn't already in §D (halt / skip).
+
 What this module is NOT
 -----------------------
 - It does **not** run the discovery channels. Driving the channels and
   then rendering the brief is the scheduler's responsibility (spec_019).
-- It does **not** auto-fix anything. Phase 1 is discovery-only
-  (``docs/DESIGN.md §9.7``). The morning report's §F (honesty section)
-  states this out loud.
+- Phase 1 (and Phase 2 §B) describe what the loop did; rendering does
+  not itself dispatch, merge, or push. spec_025 §3 keeps push as the
+  operator's manual action — the Phase 2 §B's ``git push`` line is a
+  *suggestion*, not an automation hook.
 
 Channel attribution
 -------------------
@@ -29,7 +46,9 @@ The factual summary (``BriefSummary``) is computed in Python from the
 JSON inputs; same inputs → same numbers. The findings the channels
 themselves surfaced may individually be deterministic (mutation,
 adversarial) or non-deterministic (ai); the brief inherits that
-property and reports it honestly per channel.
+property and reports it honestly per channel. Phase 2 §B is purely
+deterministic — diff + signature + R-results all come from the
+:class:`ccd.nightly.AutoFixOutcome` recorded by the loop.
 """
 
 from __future__ import annotations
@@ -40,7 +59,18 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from ccd.nightly import AutoFixOutcome
+
+# Phase 2 §B diff cap — the brief shouldn't grow unbounded if a fix's
+# diff is unexpectedly large. The guard's R3 already caps template-B
+# production diffs at 60 ± lines, but template A test-only diffs are
+# unbounded by R3 and a runaway agent could (in principle) generate a
+# huge tests/ diff. 16 KB is plenty for any reasonable autonomous fix
+# and prevents the morning report from ballooning if something is off.
+_PHASE2_DIFF_CAP = 16 * 1024
 
 DEFAULT_DISCOVER_DIR_REL = Path("_ai_workspace") / "discover"
 DEFAULT_NIGHTLY_DIR_REL = Path("_ai_workspace") / "nightly"
@@ -122,6 +152,7 @@ def run_brief(
     brief_dir: Path | None = None,
     discover_dir: Path | None = None,
     today: date | None = None,
+    auto_fix: AutoFixOutcome | None = None,
 ) -> BriefResult:
     """Render one morning report from already-completed discovery JSON.
 
@@ -134,6 +165,13 @@ def run_brief(
     Channels with no discovered report are recorded as "未実行" in
     sections D and F rather than crashing — the brief always renders
     something honest.
+
+    spec_025: when ``auto_fix`` is supplied **and** describes a merged
+    autonomous-fix (``auto_fix.merged is True``), §B switches to the
+    Phase 2 layout — finding → action narrative, diff embed, R-result
+    evidence, and a ready-to-paste ``git push`` line. All other cases
+    (auto_fix omitted / skipped / halted) render the Phase 1 §B
+    unchanged.
     """
 
     repo = Path(repo).resolve()
@@ -164,6 +202,8 @@ def run_brief(
             today=today_d,
             summary=summary,
             channels=channels,
+            auto_fix=auto_fix,
+            repo=repo,
         ),
         encoding="utf-8",
     )
@@ -314,37 +354,94 @@ def _render_md(
     today: date,
     summary: BriefSummary,
     channels: list[ChannelReport],
+    auto_fix: AutoFixOutcome | None = None,
+    repo: Path | None = None,
 ) -> str:
     by_channel = {c.channel: c for c in channels}
+    phase2_active = (
+        auto_fix is not None
+        and not auto_fix.skipped
+        and auto_fix.merged
+    )
+
+    if phase2_active:
+        header = (
+            f"# 朝レポート {today.isoformat()} — "
+            "ccd v2 Phase 2 (昨夜の自律修正あり)"
+        )
+        preamble = (
+            "> Loop β の発見3チャンネル "
+            "(`mutation` / `adversarial` / `ai`) に加え、"
+            "**昨夜の自律修正ループ** (`docs/DESIGN.md §9.5 / §9.7`) が "
+            "ローカルに 1 件マージしました。§B に修正の diff と検証証拠と "
+            "push コマンドを掲載 ── レビューしてから手動で push してください "
+            "(spec_025 §2-2、安全境界レベル 2)。"
+        )
+    else:
+        header = (
+            f"# 朝レポート {today.isoformat()} — ccd v2 Phase 1 (発見のみ)"
+        )
+        preamble = (
+            "> このレポートは Loop β の発見3チャンネル "
+            "(`mutation` / `adversarial` / `ai`) の最新出力を集約した "
+            "**朝レポート**です。Phase 1 は **発見のみ** — "
+            "本レポートに基づく自律修正は行いません "
+            "(`docs/DESIGN.md §9.6 / §9.7`)。"
+        )
 
     parts: list[str] = [
-        f"# 朝レポート {today.isoformat()} — ccd v2 Phase 1 (発見のみ)",
+        header,
         "",
-        "> このレポートは Loop β の発見3チャンネル "
-        "(`mutation` / `adversarial` / `ai`) の最新出力を集約した "
-        "**朝レポート**です。Phase 1 は **発見のみ** — "
-        "本レポートに基づく自律修正は行いません "
-        "(`docs/DESIGN.md §9.6 / §9.7`)。",
+        preamble,
         "",
     ]
-    parts.extend(_render_section_a(summary))
-    parts.extend(_render_section_b(by_channel))
+    parts.extend(_render_section_a(summary, auto_fix=auto_fix))
+    if phase2_active:
+        assert auto_fix is not None  # narrowed by phase2_active above
+        parts.extend(_render_section_b_phase2(auto_fix=auto_fix, repo=repo))
+    else:
+        parts.extend(_render_section_b(by_channel))
     parts.extend(_render_section_c(by_channel))
-    parts.extend(_render_section_d(by_channel, summary))
+    parts.extend(_render_section_d(by_channel, summary, auto_fix=auto_fix))
     parts.extend(_render_section_e(summary, by_channel))
-    parts.extend(_render_section_f(summary))
+    parts.extend(_render_section_f(summary, auto_fix=auto_fix))
 
     return "\n".join(parts).rstrip() + "\n"
 
 
-def _render_section_a(summary: BriefSummary) -> list[str]:
+def _render_section_a(
+    summary: BriefSummary,
+    *,
+    auto_fix: AutoFixOutcome | None = None,
+) -> list[str]:
+    bits: list[str] = []
+
+    # spec_025 — surface the auto-fix outcome on the front page so the
+    # operator gets the headline before scrolling. Three states matter:
+    # merged (Phase 2 §B will follow), skipped (no candidate / paused /
+    # un-pushed backlog), halted (loop ran but did not merge).
+    if auto_fix is not None:
+        if not auto_fix.skipped and auto_fix.merged:
+            bits.append(
+                f"**昨夜の自律修正 1 件をローカル merge** "
+                f"(template {auto_fix.template}, "
+                f"`{auto_fix.spec_auto_id}`) — §B に diff と push コマンド"
+            )
+        elif not auto_fix.skipped and not auto_fix.merged:
+            bits.append(
+                f"**自律修正 HALT** ({auto_fix.spec_auto_id or 'no spec'}) — "
+                f"{auto_fix.halt_reason or '理由不明'}"
+            )
+        elif auto_fix.skipped and auto_fix.skip_reason:
+            bits.append(f"**自律修正 skip**: {auto_fix.skip_reason}")
+
     if not summary.channels_picked:
-        headline = (
+        bits.append(
             "**発見なし** — 3チャンネルのいずれも出力が無く、本レポートには"
             "集約すべき discover_NNN が存在しなかった。"
+            " (今夜は何もなし — エラーではない)"
         )
     else:
-        bits: list[str] = []
         bits.append(
             f"**機械的チャンネル: {summary.mechanical_findings_total} 件** "
             f"(ミューテーション actionable {summary.mutation_actionable} / "
@@ -359,7 +456,7 @@ def _render_section_a(summary: BriefSummary) -> list[str]:
                 _CHANNEL_LABEL.get(c, c) for c in summary.channels_missing
             )
             bits.append(f"**一部チャンネル未実行**: {missing_label}")
-        headline = "; ".join(bits)
+    headline = "; ".join(bits)
     return [
         "## A. 一行判定",
         "",
@@ -455,6 +552,134 @@ def _render_adversarial_findings(report: ChannelReport | None) -> list[str]:
     return lines
 
 
+def _render_section_b_phase2(
+    *,
+    auto_fix: AutoFixOutcome,
+    repo: Path | None,
+) -> list[str]:
+    """spec_025 §2-2 — replace §B with the night's autonomous-fix story.
+
+    Only invoked when ``auto_fix.merged is True``. Surfaces four
+    artifacts the operator needs to decide whether to ``git push``:
+
+    1. **Finding → action narrative** — what was discovered (mutation
+       survivor / adversarial ungraceful crash) and what the loop did
+       (added a test / fixed a parser).
+    2. **Verification evidence** — R5 (template-specific) / R4 (full
+       suite) / guard verdict, all from the :class:`AutoFixOutcome` the
+       loop already recorded.
+    3. **Diff embed** — the diff captured pre-merge by the loop. Guard's
+       R3 keeps template-B diffs small; template A is test-only so the
+       diff is usually a handful of lines.
+    4. **Push command** — a copy-paste-ready ``git push origin main``
+       the operator runs after reviewing the diff. The repo path is
+       inlined when known so the operator can paste it as-is even when
+       their shell is in a different directory.
+    """
+
+    template = auto_fix.template or "?"
+    if template == "A":
+        template_desc = "テンプレ A (ミューテーション生存 → test-only fix)"
+    elif template == "B":
+        template_desc = (
+            "テンプレ B (敵対的入力 ungraceful → 本番修正 + 再現テスト)"
+        )
+    else:
+        template_desc = f"テンプレ {template}"
+
+    lines: list[str] = [
+        "## B. 昨夜の自律修正 (Phase 2 — `docs/DESIGN.md §9.5/§9.7`)",
+        "",
+        "ローカル `main` に **1 件 merge 済み**。レビューしてから "
+        "下記の `git push` を手動で実行してください "
+        "(spec_025 §3、安全境界レベル 2 — ループは push しない)。",
+        "",
+        "### 発見と修正",
+        "",
+        f"- **テンプレ**: {template_desc}",
+        f"- **signature**: `{auto_fix.finding_signature or '(不明)'}`",
+        f"- **spec_auto**: `{auto_fix.spec_auto_id or '(不明)'}` "
+        f"({auto_fix.candidate_count} 候補中 1 件を選択)",
+        f"- **マージ済みブランチ**: `{auto_fix.branch or '(不明)'}` → "
+        "`main` (local, no push)",
+        "",
+        "### 検証の証拠",
+        "",
+    ]
+    if template == "A":
+        r5_label = "R5 (target mutation killed)"
+    elif template == "B":
+        r5_label = "R5 (parser now raises a graceful error)"
+    else:
+        r5_label = "R5"
+    lines.append(
+        f"- {r5_label}: **{'pass' if auto_fix.r5_killed else 'fail'}**"
+    )
+    lines.append(
+        f"- R4 (`pytest -q` 全件 green): "
+        f"**{'pass' if auto_fix.r4_suite_passed else 'fail'}**"
+    )
+    if auto_fix.guard_passed:
+        lines.append("- ガード (R1〜R3): **pass**")
+    else:
+        reasons_text = "; ".join(auto_fix.guard_halt_reasons) or "理由不明"
+        lines.append(f"- ガード: **HALT** — {reasons_text}")
+
+    lines.append("")
+    lines.append("### 修正の diff")
+    lines.append("")
+    diff = auto_fix.merge_diff or ""
+    if not diff:
+        lines.append(
+            "_(diff が記録されていません — loop の seam が `merge_diff` "
+            "を埋めなかった構造的ケース。テスト dispatch などで起こりうる。)_"
+        )
+    else:
+        truncated = len(diff) > _PHASE2_DIFF_CAP
+        body = diff[:_PHASE2_DIFF_CAP] if truncated else diff
+        lines.append("```diff")
+        lines.extend(body.rstrip("\n").splitlines() or [""])
+        lines.append("```")
+        if truncated:
+            lines.append("")
+            lines.append(
+                f"_(diff は {_PHASE2_DIFF_CAP} byte で切り詰めました — "
+                "全体は `git show` でご確認ください。)_"
+            )
+
+    lines.append("")
+    lines.append("### push コマンド")
+    lines.append("")
+    lines.append(
+        "レビュー後にコピーして実行してください "
+        "(論点 2 レベル 2 — push 判断は人間):"
+    )
+    lines.append("")
+    lines.append("```bash")
+    lines.append(_compose_push_command(repo))
+    lines.append("```")
+    lines.append("")
+    return lines
+
+
+def _compose_push_command(repo: Path | None) -> str:
+    """Produce the ``git push origin main`` one-liner for the brief.
+
+    When ``repo`` is known and absolute, embed it via ``git -C <repo>``
+    so the operator can paste from any shell. Otherwise fall back to a
+    relative-cwd version — still safe because the operator is normally
+    sitting in the repo when reading the morning brief.
+    """
+
+    if repo is not None:
+        try:
+            repo_str = str(Path(repo).resolve())
+        except OSError:
+            repo_str = str(repo)
+        return f"git -C {repo_str} push origin main"
+    return "git push origin main"
+
+
 def _render_section_c(by_channel: dict[str, ChannelReport]) -> list[str]:
     """AI-inference findings — visually distinct from §B (spec_017 §2-2)."""
 
@@ -509,6 +734,8 @@ def _render_section_c(by_channel: dict[str, ChannelReport]) -> list[str]:
 def _render_section_d(
     by_channel: dict[str, ChannelReport],
     summary: BriefSummary,
+    *,
+    auto_fix: AutoFixOutcome | None = None,
 ) -> list[str]:
     """halt / skip section — appears only when there is something to say."""
 
@@ -527,6 +754,20 @@ def _render_section_d(
         if isinstance(halt, str) and halt:
             label = _CHANNEL_LABEL.get(channel, channel)
             items.append(f"- **{label}** halt: {halt}")
+
+    # spec_025 — surface autonomous-fix halts and structural skips so
+    # the operator sees them in §D alongside channel halts. A *merged*
+    # auto-fix isn't a halt; §B Phase 2 owns that story.
+    if auto_fix is not None:
+        if auto_fix.skipped and auto_fix.skip_reason:
+            items.append(f"- **自律修正 skipped**: {auto_fix.skip_reason}")
+        elif not auto_fix.skipped and not auto_fix.merged:
+            items.append(
+                f"- **自律修正 HALT** "
+                f"(`{auto_fix.spec_auto_id or 'no spec'}`, "
+                f"template {auto_fix.template or '?'}): "
+                f"{auto_fix.halt_reason or '理由不明'}"
+            )
 
     if not items:
         return []
@@ -577,21 +818,44 @@ def _render_section_e(
     return lines
 
 
-def _render_section_f(summary: BriefSummary) -> list[str]:
+def _render_section_f(
+    summary: BriefSummary,
+    *,
+    auto_fix: AutoFixOutcome | None = None,
+) -> list[str]:
     """Honesty section. Always present — anchors the Phase-1 invariant."""
 
-    lines = [
-        "## F. 起きなかったこと (正直さの節)",
-        "",
-        "- **Phase 1 は自律修正していない** — これは発見のみのレポートであり、"
-        "本レポート生成時に CCD はコードを変更していない。"
-        "機械的発見の自律修正ループ (Phase 2) は別 spec の責務。",
-        "- **AI推論の所見は引き金にしない** — §C の所見は主張であって"
-        "事実ではない。`_ai_workspace/bridge/inbox/` への自動投入も、"
-        "自動 spec 化も、自動 dispatch もしていない。",
-        "- **発見チャンネル自体はこの brief 生成では走らせていない** — "
-        "spec_017 は純粋なレンダラ。チャンネル実行は別経路 (人手 / spec_019)。",
-    ]
+    phase2_merge = (
+        auto_fix is not None
+        and not auto_fix.skipped
+        and auto_fix.merged
+    )
+
+    lines = ["## F. 起きなかったこと (正直さの節)", ""]
+    if phase2_merge:
+        lines.append(
+            "- **push は実行していない** — 昨夜の自律修正は "
+            "**ローカル merge まで**。`origin/main` へは反映していない "
+            "(spec_025 §3、安全境界レベル 2 — 論点 2: 朝に人間が diff を "
+            "見て手動 push)。"
+        )
+        lines.append(
+            "- **次の発見チャンネルは走らせていない** — spec_017 は純粋な"
+            "レンダラ。チャンネル実行は別経路 (人手 / `ccd nightly`)。"
+        )
+    else:
+        lines.extend(
+            [
+                "- **Phase 1 は自律修正していない** — これは発見のみのレポートであり、"
+                "本レポート生成時に CCD はコードを変更していない。"
+                "機械的発見の自律修正ループ (Phase 2) は別 spec の責務。",
+                "- **AI推論の所見は引き金にしない** — §C の所見は主張であって"
+                "事実ではない。`_ai_workspace/bridge/inbox/` への自動投入も、"
+                "自動 spec 化も、自動 dispatch もしていない。",
+                "- **発見チャンネル自体はこの brief 生成では走らせていない** — "
+                "spec_017 は純粋なレンダラ。チャンネル実行は別経路 (人手 / spec_019)。",
+            ]
+        )
     if summary.channels_missing:
         missing_label = ", ".join(
             f"`{c}`" for c in summary.channels_missing

@@ -2,6 +2,68 @@
 
 本プロジェクトの注目すべき変更を記録する。フォーマットは [Keep a Changelog](https://keepachangelog.com/) に準ずる。
 
+## [0.15.0] — 2026-05-25
+
+v2 Phase 2 の最終 spec — spec_025。spec_021〜024 で自律修正ループ（ガード・翻訳・テンプレ A / B）が点火・実証された次の段として、**運用の歯止め**（コスト/停止境界）と**朝レポート §B のアップグレード**を入れて、ループを安全に夜間運用できる状態に仕上げる（`docs/DESIGN.md §9.6` 论点8 / 论点9）。これで v2 Phase 2 が完成する。
+
+歯止めは 4 つ：(a) dispatch 実時間 40 分上限（threading-based timeout、超過したら failed 扱い）、(b) 未push 自律修正 3 件で新規 dispatch を一時停止（朝レポートで promote 促し）、(c) `_ai_workspace/PAUSE` ファイルがあればその夜 nightly は何もしない（中島さんの非常ブレーキ）、(d) 発見ゼロは正常終了（エラーではなく「今夜は何もなし」）。
+
+朝レポート §B は、自律修正が **merge した夜**だけ Phase 2 版に切り替える：(1) 何を発見し何を直したかの narrative、(2) 修正の diff を埋め込み（論点6 の R3 で size 抑制済み）、(3) R5 / R4 / ガードの検証証拠、(4) そのまま貼れる `git push origin main` ワンライナー。自律修正が無かった夜（gate off / skip / HALT）は Phase 1 版 §B （発見のみ）のまま ── 「既定は簡潔・例外時のみ伸びる」（§9.6）を維持。
+
+安全境界レベル 2 は引き続き構造的：`GitOps` Protocol が push 系メソッドを持たないので push 不能、§B Phase 2 の push コマンドはあくまで **operator 向けの提案**（自動実行はしない、論点 2「朝、人間が差分を見て手動 push」）。
+
+### Added
+
+- **`ccd/nightly.py` 拡張** — spec_025 §2-1 のコスト/停止境界 4 件。
+  - **(a) Dispatch wall-clock 上限** — `_AUTO_FIX_DISPATCH_TIMEOUT_S = 40 * 60` の module 定数 + `run_nightly` の `dispatch_timeout_s: float | None = None` kwarg。`_dispatch_with_timeout` ヘルパが `concurrent.futures.ThreadPoolExecutor(max_workers=1)` で dispatcher 呼び出しを wrap し、`future.result(timeout=...)` で超過を検出。超過時は `FixDispatchOutcome(status="failed", halt_reason="dispatch timed out after Ns (spec_025 §2-1(a))")` を返す ── 下層の `claude` subprocess は Python の thread cancel で完全 kill できない構造的制約があり、その制約は docstring に明記。
+  - **(b) 未push 自律修正バックログ上限** — `_AUTO_FIX_UNPUSHED_BACKLOG_LIMIT = 3` の module 定数 + `UnpushedCounter = Callable[[Path], int]` seam + `unpushed_counter` / `unpushed_backlog_limit` kwarg。`_default_unpushed_counter` が `git log origin/main..main --pretty=format:%s` を実行し `"auto-merge:"` プレフィクスを数える（spec_023 の `SubprocessGitOps.merge_branch_into_main` がこの prefix で merge を作る）。閾値以上で `AutoFixOutcome(skipped=True, skip_reason="un-pushed autonomous-fix commits at or above limit (N un-pushed, limit M); review and `git push origin main` before the loop resumes")` を返す ── 朝レポートが「未push の自律修正が N 件。レビューして push してから続けます」を render する素材。Counter 例外時は backlog 0 扱い（counter 故障で loop を silent disable しない）。
+  - **(c) PAUSE ファイル kill switch** — `_AUTO_FIX_PAUSE_REL = Path("_ai_workspace") / "PAUSE"`。`run_nightly` 入口の pre-flight より前にチェックし、ファイルがあれば `NightlyResult(success=True, paused=True, halt_reason="paused: _ai_workspace/PAUSE present")` を即返。**何も実行しない**（channel / fix / brief / mirror 全部 skip）。`NightlyResult.paused: bool` field を追加。`_ai_workspace/` 配下は gitignored なのでうっかり commit される事故なし。
+  - **(d) 発見ゼロは正常終了** — 既存の "no template-X candidate available" skip 経路が既に `success=True` を返していたのを構造的に維持。`_render_section_a` の "発見なし" headline に「(今夜は何もなし — エラーではない)」の補足を追加して operator が朝レポートで判定しやすくした。
+- **`ccd/nightly.py:AutoFixOutcome.merge_diff: str = ""`** — fix が merge した夜だけ pre-merge diff（guard が R3 で size 抑制済みなので小さい）を捕まえて outcome に乗せる。`_run_auto_fix_loop` の guard step 直前で `diff_text = gops.diff(repo=repo, base="main", head=branch)` を捕まえ、merge 成功時だけ `surfaced_diff = diff_text` を outcome に詰める。**halt 時は空のまま** ── 朝レポートに un-merged な diff を埋め込まない構造的保証。
+- **`ccd/brief.py` 拡張** — §B Phase 2 upgrade（spec_025 §2-2）。
+  - **`run_brief` シグネチャに `auto_fix: AutoFixOutcome | None = None`** を追加。`auto_fix.merged is True` のときだけ Phase 2 §B が rendered される、それ以外（None / skipped / halted）は Phase 1 §B のまま（spec_017 の挙動 bit-for-bit 不変）。
+  - **`_render_section_b_phase2(auto_fix, repo)`** — 4 部構成:
+    1. **発見と修正** — テンプレ (A: ミューテーション → test-only / B: 敵対的 → 本番修正)、signature、spec_auto_id、candidate_count、branch、ローカル merge / no push。
+    2. **検証の証拠** — R5（テンプレ別ラベル: A は "target mutation killed"、B は "parser now raises a graceful error"）、R4 (pytest -q)、ガード (R1〜R3) の pass/fail。HALT 時は理由文字列も surface。
+    3. **修正の diff** — `auto_fix.merge_diff` を ````diff … ```` ブロックに埋め込み。`_PHASE2_DIFF_CAP = 16 * 1024` 超は truncate + 「`git show` で全体確認」の footer。`merge_diff == ""` 時（テスト dispatch 等で seam が埋めない構造的ケース）は「diff が記録されていません」を render（捏造で埋めない正直さ）。
+    4. **push コマンド** — `_compose_push_command(repo)` が `git -C <abs_repo> push origin main` を生成（operator がどの shell からでも copy-paste 可能）。repo 不明時は `git push origin main` にフォールバック。
+  - **header / preamble の Phase 2 切替** — header の "Phase 1 (発見のみ)" を "Phase 2 (昨夜の自律修正あり)" に切り替え、preamble で「§B に diff と検証証拠と push コマンドを掲載 ── レビューしてから手動で push してください」を出す。
+  - **§A の一行判定強化** — `auto_fix` 3 ステータス（merged / halted / skipped）を §A の 1 行目に surface ── operator が scroll せず headline で読める。`merged` は spec_auto_id と template を含む「昨夜の自律修正 1 件をローカル merge」、`halted` は halt_reason 引用、`skipped` は skip_reason 引用。
+  - **§D の HALT/SKIP 拡張** — channel halts と並べて autonomous-fix の skipped/halted を「自律修正 skipped: <reason>」「自律修正 HALT (`<spec_auto_id>`, template <X>): <halt_reason>」として出す。spec_023 の既存 §D は channel-only だったので、Phase 2 で loop の状態も同じセクションに集約。
+  - **§F (正直さの節) の Phase 2 切替** — fix が merged した夜は「push は実行していない」「次の発見チャンネルは走らせていない」の 2 点だけ簡潔に出す（既存の長文 Phase 1 boilerplate は載せない、論点 2 レベル 2 を逐語で立てる）。
+- **`ccd/cli.py` 拡張** — `main()` / `_cmd_nightly` に `unpushed_counter` / `unpushed_backlog_limit` / `dispatch_timeout_s` の 3 seam を追加（既存 6 seam と同じ流儀）。PAUSE 短絡時に "nightly: paused (PAUSE file present — no channels / no fix / no brief)" を stdout に出して return 0。既存サブコマンドの shape は不変。
+- **`tests/test_nightly.py` (+17 件、46 件 → 63 件)** — spec_025 §2-3 のテスト要件:
+  - **PAUSE** — PAUSE ファイル存在で channel / fix / brief / mirror が一切呼ばれず paused=True を返す / PAUSE absent では normal run / CLI が "paused" を stdout に出して return 0。
+  - **未push backlog** — counter==3 で skipped + skip_reason に "un-pushed autonomous-fix commits" + "3 un-pushed" + "limit 3" + "git push" / counter==2 で normal merge / `unpushed_backlog_limit=1` override で 1 件でも止まる / counter が raise しても loop は止めない（counter 故障で silent disable しない）。
+  - **dispatch timeout** — slow dispatcher (sleep 2.0s) + `dispatch_timeout_s=0.2` で dispatch_status="failed" + halt_reason に "timed out" + "spec_025 §2-1(a)" / R4/R5/guard が呼ばれない / module 定数の値が 40*60 / backlog limit 定数が 3。
+  - **発見ゼロ正常終了** — discover JSON なしで gate ON → skipped + success=True + brief が render される。
+  - **`merge_diff` capture** — merge 成功時に diff が outcome に乗る / R5 失敗 HALT 時は merge_diff="" のまま。
+  - **§B Phase 2 end-to-end** — real `run_brief` + merged outcome で生成された report.md に "Phase 2" / "## B. 昨夜の自律修正" / "```diff" / "tests/test_protocol.py" / "R5 pass" / "R4" / "ガード" / "push origin main" が含まれ、Phase 1 §B header (`## B. 機械的チャンネルの発見`) が**含まれない** / 同じ条件で merged=False (R5 survived) なら Phase 1 §B のまま + §D に "自律修正 HALT" / auto_fix=None なら従来通り。
+- **`tests/test_brief.py` (+10 件、20 件 → 30 件)** — brief 単体での Phase 2 §B 検証:
+  - §B Phase 2 が merged outcome で render される（finding / spec_auto / branch / R-evidence / diff / push 全部 surface）/ Phase 1 §B header (`機械的チャンネルの発見`) は同時に出ない。
+  - push コマンドが `git -C <abs_repo>` 形式（どの shell からでも paste 可能）。
+  - auto_fix=None / skipped / halted では Phase 1 §B のまま、各々 §D に skipped/HALT が surface。
+  - 大きすぎる diff (16KB 超) は truncate + 「切り詰めました」footer。
+  - テンプレ B の §B は「テンプレ B (敵対的入力 ungraceful → 本番修正 + 再現テスト)」と「graceful error」の R5 ラベルを surface。
+  - §A に auto_fix の headline が出る（merged + spec_auto_001 が §A 内）。
+  - 発見ゼロでも §A に「今夜は何もなし — エラーではない」が surface。
+
+### Changed
+
+- `pyproject.toml` / `ccd/__init__.py` version `0.14.0` → **`0.15.0`**（**新機能 = minor bump**、spec §2-4）。
+- `tests/test_smoke.py::test_version_is_0140` → **`test_version_is_0150`**、assert を `0.15.0` に。
+- `ccd/brief.py:_render_section_b` の Phase 1 版は完全に保持（既存 brief テスト 20 件全 green）。Phase 2 切替は新ヘルパ `_render_section_b_phase2` を別に生やす形（既存 helper を破壊的に変更しない）。
+- `ccd/nightly.py:_run_auto_fix_loop` のシグネチャに `unpushed_counter` / `unpushed_backlog_limit` / `dispatch_timeout_s` の 3 引数を追加。3 引数とも `run_nightly` から forward され、kwargs default を介して module 定数にフォールバック ── 既存呼び出し（テストの直接 `_run_auto_fix_loop` 呼び出しはなく、すべて `run_nightly` 経由）の shape 不変。
+
+### Constraints (spec §3)
+
+- **触ってよい**: `ccd/nightly.py`（コスト/停止境界）、`ccd/brief.py`（§B アップグレード）、`ccd/cli.py`（CLI で paused surface + seam forwarding）、`tests/test_nightly.py` / `tests/test_brief.py` / `tests/test_smoke.py`、`CHANGELOG.md`、`pyproject.toml`、`ccd/__init__.py`。
+- **触っていない**: `ccd/{models,protocol,dispatch,chain,integrate,metrics,dashboard,run_writer,retry,backfill,agent,retrospect,discover,adversarial,ai_review,guard,translate,profile}.py` のコアロジックは **1 行も変更していない**（spec §3 で明示）。プロファイル経由の PAUSE フラグは導入していない（spec §3「（またはプロファイルのフラグ）」は *or*、ファイル方式で要件を満たすので最小サーフェスを選択）。`docs/` も触らない（spec §3、Phase 2 完成に伴う `docs/DESIGN.md` の §9.5〜9.7 更新は別 spec の責務）。
+- 安全境界レベル 2：ループは依然 **push しない**。`GitOps` Protocol が push 系メソッドを持たない構造的保証は spec_023 から継承、§B Phase 2 の push コマンドは operator 向けの**提案テキスト**であって自動実行はしない（論点 2: 朝、人間が差分を見て手動 push）。
+- **テストで実 mutmut・実 claude を呼ばない** — 既存 fakes（`_FakeFixDispatcher` / `_FakeSuiteRunner` / `_FakeMutationRechecker` / `_FakeGuardInspector` / `_FakeGitOps`）に加え、(a) 用に `_slow_dispatcher` (`time.sleep(2.0)`) を inline で書く、(b) 用に `unpushed_counter=lambda: 3` を inline。`_default_unpushed_counter` は実 git に shellout するが、test で呼ばない（すべて override）。
+- **spec_013〜024 の既存挙動・既存テスト 461 件は完全不変**（smoke の version assert 名 1 件のみ rename + 文字列差し替え、spec §2-4 要件）。`pytest -q` で **486 passed**（461 → +17 nightly + 10 brief - 2 dup = 486）。
+- すべて**追加のみ**。ローカル commit のみ、**push しない／ブランチ操作しない**（spec §3）。
+
 ## [0.14.0] — 2026-05-25
 
 v2 Phase 2 のリスク傾斜後半 — spec_024。spec_023 で**テンプレ A（ミューテーション → test-only）**の自律修正ループが点火・実証された次の段として、**テンプレ B（敵対的入力の ungraceful クラッシュ → 本番コード修正＋再現テスト）** を自律化（`docs/DESIGN.md §9.5/§9.7`）。テンプレ B は**本番コードに触る**ため A より一段リスクが高い ── だから A が信用できてから点火する（§9.7 リスク傾斜）。

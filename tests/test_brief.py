@@ -523,3 +523,240 @@ def test_cli_brief_inputs_flag(
     # ai missing because we didn't pass it.
     assert "channels not yet executed:" in captured.out
     assert "ai" in captured.out
+
+
+# --------------------------------------------------------------------------- #
+# spec_025 — §B Phase 2 upgrade (autonomous-fix narrative)
+# --------------------------------------------------------------------------- #
+
+
+def _make_merged_auto_fix(
+    *,
+    template: str = "A",
+    merge_diff: str = (
+        "diff --git a/tests/test_protocol.py b/tests/test_protocol.py\n"
+        "+++ added reproducer\n"
+    ),
+):
+    """Build an :class:`AutoFixOutcome` representing a merged fix."""
+
+    from ccd.nightly import AutoFixOutcome
+
+    return AutoFixOutcome(
+        skipped=False,
+        spec_auto_id="spec_auto_001",
+        spec_auto_path=Path("/tmp/spec_auto_001.md"),  # noqa: S108
+        finding_signature="ccd/protocol.py:46:x == y → x != y",
+        candidate_count=1,
+        template=template,
+        branch="auto/spec_auto_001",
+        dispatched=True,
+        dispatch_status="done",
+        r5_killed=True,
+        r4_suite_passed=True,
+        guard_passed=True,
+        merged=True,
+        merge_diff=merge_diff,
+    )
+
+
+def test_section_b_phase2_rendered_when_auto_fix_merged(tmp_path: Path) -> None:
+    """spec_025 §2-2 — when ``auto_fix.merged is True``, the brief
+    replaces §B with the Phase 2 narrative (finding + diff + R-evidence
+    + push command)."""
+
+    discover = tmp_path / "_ai_workspace" / "discover"
+    _write_mutation(discover, seq=1)
+    af = _make_merged_auto_fix(template="A")
+
+    result = run_brief(
+        repo=tmp_path,
+        today=date(2026, 5, 25),
+        auto_fix=af,
+    )
+    assert result.report_path is not None
+    md = result.report_path.read_text(encoding="utf-8")
+
+    # Header announces Phase 2.
+    assert "Phase 2" in md
+    # New §B header.
+    assert "## B. 昨夜の自律修正" in md
+    # The Phase 1 §B title is replaced (not merely appended).
+    assert "## B. 機械的チャンネルの発見" not in md
+    # Finding + spec_auto + branch surface.
+    assert "ccd/protocol.py:46:x == y → x != y" in md
+    assert "spec_auto_001" in md
+    assert "auto/spec_auto_001" in md
+    # R-evidence.
+    assert "R5" in md and "pass" in md
+    assert "R4" in md
+    assert "ガード" in md
+    # Diff embed.
+    assert "```diff" in md
+    assert "tests/test_protocol.py" in md
+    # Push command — must be copy-pasteable.
+    assert "git " in md
+    assert "push origin main" in md
+
+
+def test_section_b_phase2_push_command_includes_repo_path(
+    tmp_path: Path,
+) -> None:
+    """The push command embeds the absolute repo path so the operator
+    can paste it from any shell."""
+
+    af = _make_merged_auto_fix()
+    result = run_brief(
+        repo=tmp_path,
+        today=date(2026, 5, 25),
+        auto_fix=af,
+    )
+    assert result.report_path is not None
+    md = result.report_path.read_text(encoding="utf-8")
+    # The push command embeds the repo via -C <abs_path>.
+    assert f"git -C {tmp_path.resolve()} push origin main" in md
+
+
+def test_section_b_stays_phase1_when_auto_fix_is_none(tmp_path: Path) -> None:
+    """No auto_fix → Phase 1 §B (existing behavior preserved)."""
+
+    discover = tmp_path / "_ai_workspace" / "discover"
+    _write_mutation(discover, seq=1)
+
+    result = run_brief(repo=tmp_path, today=date(2026, 5, 25))
+    assert result.report_path is not None
+    md = result.report_path.read_text(encoding="utf-8")
+
+    assert "## B. 機械的チャンネルの発見" in md
+    assert "## B. 昨夜の自律修正" not in md
+    assert "Phase 1" in md
+    # No push command appears anywhere in the brief.
+    assert "push origin main" not in md
+
+
+def test_section_b_stays_phase1_when_auto_fix_skipped(tmp_path: Path) -> None:
+    """Skipped fix (no candidate) → Phase 1 §B; §D surfaces the skip."""
+
+    from ccd.nightly import AutoFixOutcome
+
+    discover = tmp_path / "_ai_workspace" / "discover"
+    _write_mutation(discover, seq=1)
+    af = AutoFixOutcome(
+        skipped=True,
+        skip_reason="no template-A candidate available",
+    )
+
+    result = run_brief(
+        repo=tmp_path,
+        today=date(2026, 5, 25),
+        auto_fix=af,
+    )
+    assert result.report_path is not None
+    md = result.report_path.read_text(encoding="utf-8")
+
+    assert "## B. 機械的チャンネルの発見" in md
+    assert "## B. 昨夜の自律修正" not in md
+    # Skip surfaces in §D.
+    assert "自律修正 skipped" in md
+    assert "no template-A candidate available" in md
+
+
+def test_section_b_stays_phase1_when_auto_fix_halted(tmp_path: Path) -> None:
+    """Loop ran but did NOT merge (HALT) → Phase 1 §B; §D surfaces HALT."""
+
+    from ccd.nightly import AutoFixOutcome
+
+    discover = tmp_path / "_ai_workspace" / "discover"
+    _write_mutation(discover, seq=1)
+    af = AutoFixOutcome(
+        skipped=False,
+        spec_auto_id="spec_auto_001",
+        finding_signature="ccd/x.py:1:a → b",
+        template="A",
+        branch="auto/spec_auto_001",
+        dispatched=True,
+        dispatch_status="done",
+        merged=False,
+        halt_reason="R5 failed: target mutation not killed",
+    )
+
+    result = run_brief(
+        repo=tmp_path,
+        today=date(2026, 5, 25),
+        auto_fix=af,
+    )
+    assert result.report_path is not None
+    md = result.report_path.read_text(encoding="utf-8")
+
+    assert "## B. 機械的チャンネルの発見" in md
+    assert "## B. 昨夜の自律修正" not in md
+    assert "自律修正 HALT" in md
+    assert "R5 failed" in md
+
+
+def test_section_b_phase2_diff_truncation(tmp_path: Path) -> None:
+    """A pathologically large diff is truncated with an explanatory
+    footer so the morning report doesn't balloon."""
+
+    from ccd.brief import _PHASE2_DIFF_CAP
+
+    huge_diff = "diff --git a/x.py b/x.py\n" + ("+x = 1\n" * 20000)
+    assert len(huge_diff) > _PHASE2_DIFF_CAP
+
+    af = _make_merged_auto_fix(merge_diff=huge_diff)
+    result = run_brief(
+        repo=tmp_path,
+        today=date(2026, 5, 25),
+        auto_fix=af,
+    )
+    assert result.report_path is not None
+    md = result.report_path.read_text(encoding="utf-8")
+    assert "切り詰めました" in md
+    assert "## B. 昨夜の自律修正" in md
+
+
+def test_section_b_phase2_template_b_label(tmp_path: Path) -> None:
+    """Template B's Phase 2 §B describes a production-fix, not test-only."""
+
+    af = _make_merged_auto_fix(template="B")
+    result = run_brief(
+        repo=tmp_path,
+        today=date(2026, 5, 25),
+        auto_fix=af,
+    )
+    assert result.report_path is not None
+    md = result.report_path.read_text(encoding="utf-8")
+    assert "テンプレ B" in md
+    assert "本番修正" in md
+    # The R5 label is the template-B variant ("graceful error").
+    assert "graceful error" in md
+
+
+def test_section_a_surfaces_auto_fix_merged_headline(tmp_path: Path) -> None:
+    """§A's one-line judgment includes the auto-fix headline when
+    merged (so the operator sees it without scrolling)."""
+
+    af = _make_merged_auto_fix()
+    result = run_brief(
+        repo=tmp_path,
+        today=date(2026, 5, 25),
+        auto_fix=af,
+    )
+    assert result.report_path is not None
+    md = result.report_path.read_text(encoding="utf-8")
+    # Locate §A — it ends before "## B." starts.
+    section_a = md.split("## B.", 1)[0]
+    assert "昨夜の自律修正" in section_a
+    assert "spec_auto_001" in section_a
+
+
+def test_section_a_zero_finding_normal_note(tmp_path: Path) -> None:
+    """spec_025 §2-1(d) — zero findings should render the friendly
+    "今夜は何もなし — エラーではない" note rather than an error."""
+
+    # No discover JSON at all → all three channels missing.
+    result = run_brief(repo=tmp_path, today=date(2026, 5, 25))
+    assert result.report_path is not None
+    md = result.report_path.read_text(encoding="utf-8")
+    assert "発見なし" in md
+    assert "今夜は何もなし" in md

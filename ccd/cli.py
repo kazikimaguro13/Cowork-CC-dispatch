@@ -466,6 +466,10 @@ def main(
     adversarial_rechecker: Any | None = None,
     guard_inspector: Any | None = None,
     git_ops: Any | None = None,
+    # spec_025 — cost / halt boundary seams (forwarded to ``ccd nightly``).
+    unpushed_counter: Any | None = None,
+    unpushed_backlog_limit: int | None = None,
+    dispatch_timeout_s: float | None = None,
 ) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -500,6 +504,9 @@ def main(
             adversarial_rechecker=adversarial_rechecker,
             guard_inspector=guard_inspector,
             git_ops=git_ops,
+            unpushed_counter=unpushed_counter,
+            unpushed_backlog_limit=unpushed_backlog_limit,
+            dispatch_timeout_s=dispatch_timeout_s,
         )
     if args.command == "guard":
         return _cmd_guard(args)
@@ -770,6 +777,9 @@ def _cmd_nightly(
     adversarial_rechecker: Any | None = None,
     guard_inspector: Any | None = None,
     git_ops: Any | None = None,
+    unpushed_counter: Any | None = None,
+    unpushed_backlog_limit: int | None = None,
+    dispatch_timeout_s: float | None = None,
 ) -> int:
     repo = _resolve_repo(args.repo)
     profile_path = getattr(args, "profile_path", None)
@@ -788,7 +798,16 @@ def _cmd_nightly(
         adversarial_rechecker=adversarial_rechecker,
         guard_inspector=guard_inspector,
         git_ops=git_ops,
+        unpushed_counter=unpushed_counter,
+        unpushed_backlog_limit=unpushed_backlog_limit,
+        dispatch_timeout_s=dispatch_timeout_s,
     )
+
+    # spec_025 §2-1(c) — PAUSE short-circuit. Surface the pause and
+    # exit 0; the nightly window owner re-runs after removing the file.
+    if result.paused:
+        print("nightly: paused (PAUSE file present — no channels / no fix / no brief)")
+        return 0
 
     print("channels executed: " + (", ".join(result.channels_executed) or "(none)"))
     for co in result.channels_run:
