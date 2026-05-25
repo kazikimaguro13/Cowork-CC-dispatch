@@ -16,10 +16,13 @@ import pytest
 from ccd import cli
 from ccd.profile import (
     DEFAULT_PROFILE_REL,
+    KNOWN_CADENCES,
     KNOWN_CHANNELS,
+    KNOWN_WEEKDAYS,
     Profile,
     load_profile,
     load_profile_with_source,
+    render_profile,
     resolve_profile_path,
 )
 
@@ -664,3 +667,393 @@ def test_safety_fix_templates_renders_with_both_when_enabled(
     assert rc == 0
     out = capsys.readouterr().out
     assert 'fix_templates = ["A", "B"]' in out
+
+
+# --------------------------------------------------------------------------- #
+# Phase 3 — schedule.cadence + schedule.weekly_day (spec_027)
+# --------------------------------------------------------------------------- #
+
+
+def test_schedule_known_cadences_constant() -> None:
+    """The module exposes the allow-list as a tuple so other modules
+    (and tests) can reference it without re-typing the literals."""
+
+    assert KNOWN_CADENCES == ("nightly", "weekly")
+
+
+def test_schedule_known_weekdays_constant() -> None:
+    """Full English weekday names — what PowerShell's
+    ``New-ScheduledTaskTrigger -DaysOfWeek`` consumes (spec_027 §2-2)."""
+
+    assert set(KNOWN_WEEKDAYS) == {
+        "Monday",
+        "Tuesday",
+        "Wednesday",
+        "Thursday",
+        "Friday",
+        "Saturday",
+        "Sunday",
+    }
+    assert len(KNOWN_WEEKDAYS) == 7
+
+
+def test_schedule_cadence_default_is_weekly() -> None:
+    """spec_027 §2-1: the **default flips to weekly** because running
+    autonomous-fix every night while the system is under active
+    development means chasing a moving target."""
+
+    profile = Profile()
+
+    assert profile.schedule.cadence == "weekly"
+
+
+def test_schedule_weekly_day_default_is_sunday() -> None:
+    """spec_027 §2-1: default weekly trigger fires on Sunday."""
+
+    profile = Profile()
+
+    assert profile.schedule.weekly_day == "Sunday"
+
+
+def test_schedule_nightly_at_default_unchanged_from_spec_018() -> None:
+    """spec_027 §2-1: ``nightly_at`` is **NOT renamed** — it still
+    means 'time of day' and cadence-independently defaults to 02:00."""
+
+    profile = Profile()
+
+    assert profile.schedule.nightly_at == "02:00"
+
+
+def test_schedule_cadence_nightly_accepted(tmp_path: Path) -> None:
+    """``cadence = "nightly"`` keeps the legacy every-night trigger
+    available for the spec_021–026 operating mode."""
+
+    profile_path = tmp_path / "_ai_workspace" / "ccd_profile.toml"
+    profile_path.parent.mkdir(parents=True)
+    profile_path.write_text(
+        '[schedule]\ncadence = "nightly"\n',
+        encoding="utf-8",
+    )
+
+    profile = load_profile(tmp_path)
+
+    assert profile.schedule.cadence == "nightly"
+    # Other fields keep defaults
+    assert profile.schedule.weekly_day == "Sunday"
+    assert profile.schedule.nightly_at == "02:00"
+
+
+def test_schedule_cadence_weekly_accepted(tmp_path: Path) -> None:
+    profile_path = tmp_path / "_ai_workspace" / "ccd_profile.toml"
+    profile_path.parent.mkdir(parents=True)
+    profile_path.write_text(
+        dedent(
+            """
+            [schedule]
+            cadence = "weekly"
+            weekly_day = "Saturday"
+            nightly_at = "03:30"
+            """
+        ).strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    profile = load_profile(tmp_path)
+
+    assert profile.schedule.cadence == "weekly"
+    assert profile.schedule.weekly_day == "Saturday"
+    assert profile.schedule.nightly_at == "03:30"
+
+
+def test_schedule_cadence_unknown_value_raises_value_error(
+    tmp_path: Path,
+) -> None:
+    """spec_027 §2-1: ``cadence`` outside {nightly, weekly} must raise
+    (same flavour as the ``channels`` / ``fix_templates`` validators)."""
+
+    profile_path = tmp_path / "_ai_workspace" / "ccd_profile.toml"
+    profile_path.parent.mkdir(parents=True)
+    profile_path.write_text(
+        '[schedule]\ncadence = "daily"\n',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError) as excinfo:
+        load_profile(tmp_path)
+
+    msg = str(excinfo.value)
+    assert "cadence" in msg
+    assert "daily" in msg
+
+
+def test_schedule_weekly_day_unknown_value_raises_value_error(
+    tmp_path: Path,
+) -> None:
+    """spec_027 §2-1: garbage weekday names (``"Funday"``) must raise —
+    we don't want a typo to silently fall through to PowerShell which
+    would then fail at task-registration time."""
+
+    profile_path = tmp_path / "_ai_workspace" / "ccd_profile.toml"
+    profile_path.parent.mkdir(parents=True)
+    profile_path.write_text(
+        '[schedule]\nweekly_day = "Funday"\n',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError) as excinfo:
+        load_profile(tmp_path)
+
+    msg = str(excinfo.value)
+    assert "weekly_day" in msg
+    assert "Funday" in msg
+
+
+def test_schedule_weekly_day_short_form_rejected(tmp_path: Path) -> None:
+    """Short forms (``"Sun"``) are not accepted — PowerShell's
+    ``-DaysOfWeek`` wants the full name. We reject early so the
+    operator notices in ``ccd profile`` rather than at PS1 run time."""
+
+    profile_path = tmp_path / "_ai_workspace" / "ccd_profile.toml"
+    profile_path.parent.mkdir(parents=True)
+    profile_path.write_text(
+        '[schedule]\nweekly_day = "Sun"\n',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError):
+        load_profile(tmp_path)
+
+
+def test_schedule_weekly_day_case_insensitive_input(tmp_path: Path) -> None:
+    """spec_027 §2-1 / §6: input is title-cased so ``"sunday"`` is
+    accepted and stored as ``"Sunday"`` — what lands in the profile is
+    always the canonical form PowerShell consumes."""
+
+    profile_path = tmp_path / "_ai_workspace" / "ccd_profile.toml"
+    profile_path.parent.mkdir(parents=True)
+    profile_path.write_text(
+        '[schedule]\nweekly_day = "sunday"\n',
+        encoding="utf-8",
+    )
+
+    profile = load_profile(tmp_path)
+
+    assert profile.schedule.weekly_day == "Sunday"
+
+
+def test_schedule_weekly_day_all_uppercase_input(tmp_path: Path) -> None:
+    profile_path = tmp_path / "_ai_workspace" / "ccd_profile.toml"
+    profile_path.parent.mkdir(parents=True)
+    profile_path.write_text(
+        '[schedule]\nweekly_day = "WEDNESDAY"\n',
+        encoding="utf-8",
+    )
+
+    profile = load_profile(tmp_path)
+
+    assert profile.schedule.weekly_day == "Wednesday"
+
+
+def test_schedule_cadence_missing_in_toml_yields_weekly_default(
+    tmp_path: Path,
+) -> None:
+    """**Backward-compatibility pin** (spec_027 §4): a TOML written
+    against spec_018–026 (no ``cadence`` field) must load cleanly and
+    end up with ``cadence="weekly"``. This is the existing deployed
+    ``_ai_workspace/ccd_profile.toml`` shape — it must not break."""
+
+    profile_path = tmp_path / "_ai_workspace" / "ccd_profile.toml"
+    profile_path.parent.mkdir(parents=True)
+    profile_path.write_text(
+        dedent(
+            """
+            repo = "."
+
+            [discovery]
+            channels = ["mutation"]
+            mutation_paths = ["ccd/protocol.py"]
+
+            [schedule]
+            nightly_at = "02:00"
+
+            [safety]
+            autonomous_fix = true
+            fix_templates = ["A"]
+            """
+        ).strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    profile = load_profile(tmp_path)
+
+    assert profile.schedule.nightly_at == "02:00"
+    assert profile.schedule.cadence == "weekly"
+    assert profile.schedule.weekly_day == "Sunday"
+
+
+def test_schedule_weekly_day_harmless_under_nightly_cadence(
+    tmp_path: Path,
+) -> None:
+    """spec_027 §2-1: ``weekly_day`` is ignored by the scheduler when
+    ``cadence="nightly"``, but writing it in the TOML is still allowed
+    so an operator can pre-set the day before flipping to weekly."""
+
+    profile_path = tmp_path / "_ai_workspace" / "ccd_profile.toml"
+    profile_path.parent.mkdir(parents=True)
+    profile_path.write_text(
+        dedent(
+            """
+            [schedule]
+            cadence = "nightly"
+            weekly_day = "Wednesday"
+            """
+        ).strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    profile = load_profile(tmp_path)
+
+    assert profile.schedule.cadence == "nightly"
+    assert profile.schedule.weekly_day == "Wednesday"
+
+
+def test_schedule_section_renders_cadence_and_weekly_day(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """spec_027 §2-3: ``ccd profile`` emits ``cadence`` and
+    ``weekly_day`` alongside ``nightly_at`` under ``[schedule]``."""
+
+    rc = cli.main(["profile", "--repo", str(tmp_path)])
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "[schedule]" in out
+    assert 'nightly_at = "02:00"' in out
+    assert 'cadence = "weekly"' in out
+    assert 'weekly_day = "Sunday"' in out
+
+
+def test_schedule_section_renders_overridden_values(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    profile_path = tmp_path / "_ai_workspace" / "ccd_profile.toml"
+    profile_path.parent.mkdir(parents=True)
+    profile_path.write_text(
+        dedent(
+            """
+            [schedule]
+            cadence = "nightly"
+            weekly_day = "Friday"
+            nightly_at = "04:15"
+            """
+        ).strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    rc = cli.main(["profile", "--repo", str(tmp_path)])
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert 'cadence = "nightly"' in out
+    assert 'weekly_day = "Friday"' in out
+    assert 'nightly_at = "04:15"' in out
+
+
+def test_register_nightly_ps1_supports_cadence() -> None:
+    """spec_027 §2-2: the scheduler template must expose ``$Cadence`` /
+    ``$WeeklyDay`` editing points, branch the trigger by cadence
+    (``-Weekly -DaysOfWeek`` for weekly, ``-Daily`` for nightly), and
+    halt on an unknown cadence rather than silently fall back to Daily.
+
+    We don't execute the PS1 — only check the template text contains the
+    expected anchors. The PS1 is a *template* (human edits + runs),
+    so a text-level check is enough to catch a regression in the spec
+    surface.
+
+    Note: ``_ai_workspace/`` is gitignored (the PS1 ships as a working
+    template, not a committed artifact), so when the file is missing
+    from a clean checkout this test is skipped rather than failing —
+    text checks would be meaningless against a non-existent file."""
+
+    # ``register_nightly.ps1`` lives under the repo's ``_ai_workspace/``
+    # directory. ``tests/`` is at ``<repo>/tests/`` so ``../`` is repo
+    # root.
+    ps1 = (
+        Path(__file__).resolve().parent.parent
+        / "_ai_workspace"
+        / "register_nightly.ps1"
+    )
+    if not ps1.exists():
+        pytest.skip(
+            f"{ps1} not present (gitignored template); "
+            "skip text-level cadence checks"
+        )
+    body = ps1.read_text(encoding="utf-8")
+
+    # Editing points exist
+    assert "$Cadence" in body
+    assert "$WeeklyDay" in body
+
+    # Both branches exist
+    assert "-Weekly" in body
+    assert "-DaysOfWeek" in body
+    assert "-Daily" in body
+
+    # Unknown cadence stops the script
+    assert "Write-Error" in body
+
+    # Default mirrors the profile default (spec_027 §2-1)
+    assert '$Cadence     = "weekly"' in body
+    assert '$WeeklyDay   = "Sunday"' in body
+
+
+def test_render_profile_round_trip_preserves_schedule(tmp_path: Path) -> None:
+    """spec_027 §2-4: rendering then re-loading the output yields an
+    equal ``Profile`` — the renderer is a faithful TOML emitter and
+    the new fields don't break the round-trip."""
+
+    profile_path = tmp_path / "_ai_workspace" / "ccd_profile.toml"
+    profile_path.parent.mkdir(parents=True)
+    profile_path.write_text(
+        dedent(
+            """
+            repo = "./client"
+
+            [discovery]
+            channels = ["mutation", "adversarial"]
+            mutation_paths = ["src", "lib"]
+
+            [schedule]
+            nightly_at = "03:30"
+            cadence = "weekly"
+            weekly_day = "Saturday"
+
+            [safety]
+            autonomous_fix = true
+            fix_templates = ["A", "B"]
+            """
+        ).strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    original = load_profile_with_source(tmp_path)
+    rendered = render_profile(original)
+
+    # Strip the leading `# loaded from:` comment line so the body is
+    # pure TOML, then write it to a new file and re-load.
+    body = "\n".join(
+        line for line in rendered.splitlines() if not line.startswith("#")
+    )
+    round_trip_path = tmp_path / "round_trip.toml"
+    round_trip_path.write_text(body, encoding="utf-8")
+
+    reloaded = load_profile(tmp_path, path=round_trip_path)
+
+    assert reloaded == original.profile

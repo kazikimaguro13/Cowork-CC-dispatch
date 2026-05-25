@@ -2,6 +2,64 @@
 
 本プロジェクトの注目すべき変更を記録する。フォーマットは [Keep a Changelog](https://keepachangelog.com/) に準ずる。
 
+## [0.16.0] — 2026-05-25
+
+spec_027 — **v2 Phase 3 の最初の spec**。Phase 2 (spec_021〜026) で自律修正ループが完成し、`ccd nightly` の end-to-end 実走で「ループが自分のテスト隙間を発見し、正しい修正を書き、ガード・検証を通してローカル merge する」ところまで実証できた次の段として、**ケイデンス（実行頻度）** をプロファイルに導入する（minor bump = 新機能）。
+
+経緯: Phase 2 までは「毎晩（nightly）」前提でしかスケジューラに登録できなかったが、**開発途中のシステムに毎晩自律修正を回すのは実用的でない**（動く標的を毎晩追う / 夜間の自律修正コミットが昼の人間の開発と衝突する）。詰め直した結論は「**自律修正は行う。ただし頻度は週次にする**」── これが本来求めていた運用形態。
+
+本 spec は**プロファイルのモデルとスケジューラ登録テンプレートだけ**を変更する軽い spec。`ccd/nightly.py` の自律修正ループ本体・発見・ガード・翻訳・検証経路には **1 行も触れない** ── `ccd nightly` は呼ばれたら 1 回ループを回すだけ、頻度はスケジューラ（PS1）が決める、という役割分担は不変。
+
+### Added
+
+- **`ccd/profile.py` の `ScheduleConfig` にケイデンス 2 フィールド追加**:
+  - **`cadence: str`** ── 実行頻度。`"nightly"`（毎晩）/ `"weekly"`（週1）のいずれか。**default は `"weekly"`**（spec_027 §2-1 の運用判断）。既知の値以外は `field_validator` で `ValueError` ── `channels` / `fix_templates` の既存バリデータと同じ流儀。
+  - **`weekly_day: str`** ── 週次実行の曜日。default `"Sunday"`。Windows タスクスケジューラの `New-ScheduledTaskTrigger -DaysOfWeek` にそのまま渡せるフル英名（`Monday`〜`Sunday`）。
+  - **新規 module 定数**: `KNOWN_CADENCES: tuple[str, ...] = ("nightly", "weekly")` / `KNOWN_WEEKDAYS: tuple[str, ...] = (Monday … Sunday)`。
+  - **入力正規化（spec §6 の CC 判断）**: `weekly_day` は title-case 正規化を入れた ── `"sunday"` / `"SUNDAY"` / `"Sunday"` のいずれも受理し、プロファイルには `"Sunday"`（PowerShell の `-DaysOfWeek` が直接受ける canonical 形）で保存。短縮名（`"Sun"`）は受けない（PowerShell が解釈しない表記を受けると task 登録時まで失敗が遅延する ── 早めに loader で stop）。
+  - **`cadence` 未指定の TOML は `cadence="weekly"`** ── 既存 `_ai_workspace/ccd_profile.toml`（cadence 行なし）は完全に後方互換、自動で週次に切り替わる。
+- **`_ai_workspace/register_nightly.ps1` を週次対応**:
+  - 編集ポイントに **`$Cadence`**（既定 `"weekly"`）と **`$WeeklyDay`**（既定 `"Sunday"`）を追加。コメントで「profile の `schedule.cadence` / `schedule.weekly_day` と一致させる」と明記。
+  - `$trigger` 生成を `switch ($Cadence)` で分岐: `"weekly"` → `New-ScheduledTaskTrigger -Weekly -DaysOfWeek $WeeklyDay -At $NightlyAt` / `"nightly"` → `New-ScheduledTaskTrigger -Daily -At $NightlyAt` / その他 → `Write-Error` で停止（不正値を黙って Daily にしない）。
+  - 登録完了メッセージは cadence に応じた `$TriggerDesc`（週次なら `"weekly on $WeeklyDay at $NightlyAt"`、毎晩なら `"daily at $NightlyAt"`）。
+  - 冒頭コメント / 編集ポイント説明を更新。タスク名 `CcdNightlyMaintenance` は据え置き（リネームは登録済みタスクとの不整合を生む、spec_027 §2-2）。
+- **`ccd profile` の出力に新2フィールドを emit** ── `render_profile` の `[schedule]` セクションに `cadence = "..."` / `weekly_day = "..."` を `nightly_at` と並べて出す。round-trip（renderer 出力を再ロード）で同じ Profile になる。
+
+### Added (tests)
+
+- **`tests/test_profile.py` (+18 件)** — spec_027 §2-4 のテスト要件:
+  - `KNOWN_CADENCES` / `KNOWN_WEEKDAYS` 定数の存在と中身（曜日 7 つ揃っている）
+  - `Profile()` の default で `cadence=="weekly"` / `weekly_day=="Sunday"` / `nightly_at=="02:00"`（nightly_at 不変保証）
+  - `cadence="nightly"` / `cadence="weekly"` 両受理
+  - `cadence="daily"` 等の不正値で `ValueError`
+  - `weekly_day="Funday"` 等の不正値 / 短縮名 `"Sun"` で `ValueError`
+  - `weekly_day="sunday"` / `"WEDNESDAY"` の case-insensitive 入力 → `"Sunday"` / `"Wednesday"` に正規化
+  - cadence 未指定の既存 TOML 形（spec_018〜026 の deployed 形）ロード時に `cadence="weekly"` になる **後方互換 pin**
+  - `cadence="nightly"` + `weekly_day="Wednesday"` の組み合わせも受理（cadence=nightly でも weekly_day はフィールドとして無害に保持される、将来切り替え用）
+  - `ccd profile` の出力に `cadence` / `weekly_day` / `nightly_at` の 3 行が `[schedule]` に出る（default 値と override 値の両方）
+  - **renderer round-trip pin** ── full profile を render → コメント行を除去 → 再ロードで equal な Profile になる
+- **`tests/test_profile.py::test_register_nightly_ps1_supports_cadence`** ── PS1 テンプレートのテキスト検査（spec §2-4 の方針通り execute はしない）。`$Cadence` / `$WeeklyDay` の編集ポイント、`-Weekly` / `-DaysOfWeek` / `-Daily` の両分岐、不正値で `Write-Error` 停止、`$Cadence`/`$WeeklyDay` の default が profile の default（`"weekly"` / `"Sunday"`）と一致することを assert。
+
+### Changed
+
+- `pyproject.toml` / `ccd/__init__.py` version `0.15.1` → **`0.16.0`**（**新機能 = minor bump**、spec §2-5）。
+- `tests/test_smoke.py::test_version_is_0151` → **`test_version_is_0160`**、assert を `0.16.0` に。
+- `ccd/profile.py` module docstring に spec_027 でケイデンスが入った旨を追記。`ScheduleConfig` の docstring を新2フィールドの意味・default・`weekly_day` が nightly では無視される点・`nightly_at` をリネームしなかった理由を含めて全面更新。
+
+### Constraints (spec §3)
+
+- **触ってよい**: `ccd/profile.py`（`ScheduleConfig` + 関連 docstring）/ `_ai_workspace/register_nightly.ps1` / `tests/test_profile.py` / `tests/test_smoke.py` / `CHANGELOG.md` / `pyproject.toml` / `ccd/__init__.py`。
+- **触ってはいけない**: `ccd/{models,protocol,dispatch,chain,integrate,metrics,dashboard,run_writer,retry,backfill,agent,retrospect,discover,adversarial,ai_review,brief,guard,translate,nightly}.py` のコアロジック ── すべて遵守（1 行も touch していない）。特に **`ccd/nightly.py` は触らない** ── `ccd nightly` 自体は cadence を読まない（呼ばれたら 1 回走るだけ）。`docs/` / `docs/data/*.json` ── 触っていない。
+- `ccd nightly` コマンド名・`CcdNightlyMaintenance` タスク名はリネームしない（侵襲的）── 遵守。
+- 既存サブコマンド・既存挙動は不変。**追加のみ**。ローカル commit のみ、**push しない／ブランチ操作・merge しない** ── 遵守。
+
+### Verification
+
+- **`pytest -q`**: **521 passed** in 29.53s（既存 503 件 + 新規 18 件）。spec_013〜026 の既存テストはすべて不変で green（特にプロファイル関連 spec_018/023/024 の既存テストが壊れていない）、smoke の version assert 1 件だけ rename + 文字列差し替え。
+- **`ruff check .`**: `All checks passed!`。
+- **`python3 -m ccd --version`** → `ccd 0.16.0`（smoke の subprocess テストが確認）。
+
+
 ## [0.15.1] — 2026-05-25
 
 spec_026 — `ccd nightly` の end-to-end 実走で発覚した 2 つのバグの修正（patch bump）。v2 Phase 2 の機構自体（ガード・翻訳・テンプレ A / B・コスト境界・朝レポート §B Phase 2）は spec_021〜025 で完成しており、本 spec は**ループが正しい修正を実際に完了できる**ようにする後始末。
