@@ -2,7 +2,50 @@
 
 本プロジェクトの注目すべき変更を記録する。フォーマットは [Keep a Changelog](https://keepachangelog.com/) に準ずる。
 
-## [0.10.0] — 2026-05-25
+## [0.11.0] — 2026-05-25
+
+v2 Phase 2（**自律修正ループ点火**）の最初の spec — spec_021。Phase 2 は「発見を無人で直す」ループを閉じる段階で、確定事項(2)「インチキ修正の危険」（自律修正係がテストを消す/assert を緩めることで失敗を消す）を退治することが第一の責務。Phase 1 が「発見ファースト」だったのと同じ精神で、Phase 2 は **ガードファースト** ── インチキ修正ガードを**先に・単独で**実装し、crafted な diff（インチキ diff・正当な diff）で実証してから、ループ本体を点火する。
+
+`ccd/guard.py` を新規追加し、**git diff だけを検査する強制層**として実装。`result_NNN.md` やエージェントの自己申告は一切読まない（diff は事実、申告は主張）。`ccd guard` サブコマンド（11個目）で人間が手動でブランチ diff を検査でき、Phase 2 の次の spec（loop wiring）から再利用可能なエントリ関数 `inspect_diff(*, diff, allowed_files, template, max_prod_diff_lines)` を提供。**自律修正ループ自体はまだ作らない** ── ガード単独の証明だけが本 spec のスコープ。
+
+### Added
+
+- **`ccd/guard.py` 新モジュール** — Phase 2 のインチキ修正ガード（静的検査層）。論点6 の R1〜R3 を実装、R4（既存スイートが緑）・R5（標的テストが撃破）は**動的検査なので本 spec では扱わない**（spec_023 のループ配線で合成）。
+  - **`inspect_diff(*, diff, allowed_files, template, max_prod_diff_lines=60) -> GuardResult`** — エントリ関数。unified diff テキストを引数で受け取る（git に依存しない、テストで crafted diff を直接食わせられる）。`template` は "A"（tests/ のみ）or "B"（本番1ファイル + tests/）。`allowed_files` は呼び出し側が宣言する許可ファイル集合（ファイル/ディレクトリプレフィクス/グロブ）。
+  - **R1（ファイル許可リスト）** — diff が触れる各ファイルが `allowed_files` に含まれるか（ディレクトリプレフィクスマッチ含む）。範囲外は HALT。
+  - **R2（`tests/` 追加のみ）** — 既存テストファイルの行削除/変更を禁止。`is_new_file=False` のテストファイルに `-` 行があれば HALT。テストファイル削除（`deleted file mode`）も HALT。新規 `@pytest.mark.skip` / `@pytest.mark.skipif` / `@pytest.mark.xfail` / `@unittest.skip` / `pytest.skip(...)` / `pytest.xfail(...)` マーカー（**新規テストファイル含む**）が現れたら HALT。テストファイル定義は `tests/` 配下の `.py` ファイル。
+  - **R3（本番 diff 有界、テンプレB のみ）** — テンプレB の本番ファイル（非テスト）の `+` + `-` 行数合計に上限（既定 60 行、`max_prod_diff_lines` で上書き可）。超過で HALT（狭いはずの修正で大 diff = スコープ超過のシグナル）。
+  - **自己保護 denylist (`DENYLIST_GLOBS`)** — `ccd/guard.py` 自身・`ccd/nightly.py`（および将来の `ccd/nightly_*.py` / `ccd/scheduler*.py`）・`.github/**`・`pyproject.toml`・`setup.py`・`setup.cfg`・`.pre-commit-config.yaml`・`_ai_workspace/discover/blocklist.txt`・`_ai_workspace/ccd_profile.toml`・`ccd_profile.toml`。**diff がこれらに触れたら、`allowed_files` に明示的に含まれていても無条件で HALT**（「番人を誰が見張るか」 ── 自律修正ループは自分自身のゲートを緩められない）。rename の場合は old_path 側もチェックして、protected ファイルを rename で逃げる経路を塞ぐ。
+  - **偽陽性可・偽陰性不可** — バイナリ diff・rename・mode 変更・パース不能 diff はすべて **safe-halt**。「正当な修正を誤って止める」は朝レポートに出て人間が見るだけで安上がり、「インチキを通す」は絶対に避ける、を機械化。
+  - **`GuardResult` dataclass (frozen)** — `passed` / `halt_reasons: tuple[str, ...]`（HALT 時に「どのルールがなぜ作動したか」を人間可読で全件列挙、短絡しない）/ `files_touched: tuple[str, ...]`（朝レポート向け）/ `template`。
+  - **`FileDiff` dataclass (frozen)** — `_parse_diff` の出力単位。`old_path` / `new_path` / `added_lines` / `removed_lines` / `added_text` / `removed_text` / `is_binary` / `is_rename` / `is_mode_change` / `is_new_file` / `is_deleted_file`、`path` プロパティ（新側優先、削除時のみ旧側）。
+  - **`fetch_diff(repo, base, head) -> str`** — `git -C <repo> diff <base>..<head>` の薄いラッパ。CLI 用、テストは `inspect_diff` を直接呼ぶ。
+- **`ccd guard` サブコマンド（11 個目）** — `--repo`（既定 cwd）/ `--base`（既定 main）/ `--head`（既定 HEAD）/ `--template {A,B}`（必須）/ `--allowed PATH...`（許可ファイル集合）/ `--max-prod-diff-lines`（既定 60、R3 閾値）。stdout に `template` / `diff range` / `files touched` / `guard: pass` を出力、HALT 時は stderr に `guard: HALT (N reason(s))` + 各 halt 理由 1 行を出力。pass で exit 0、HALT で exit 1。`git diff` が失敗（不正な ref 等）したら `guard halted: git diff failed: ...` を stderr に出して exit 1（空 diff で silent pass しない）。
+- **`tests/test_guard.py`** — 25+ テスト、**handcrafted unified diff** で各インチキ手口を捕まえることを実証（ガードファーストの中核証明）:
+  - **正当 diff pass**: テンプレA の既存テストへの追加 / 新規テストファイル / テンプレB の小さな本番 diff + テスト追加。
+  - **R2 HALT**: 既存テスト行削除 / assert 弱化（`assert x == 6` → `assert x > 0`）/ `@pytest.mark.skip` 付与 / 新規テストファイル内の `@pytest.mark.xfail` / テストファイル丸ごと削除。
+  - **R1 HALT**: テンプレA で `ccd/` に触れる diff。
+  - **denylist HALT**: `ccd/guard.py` / `pyproject.toml` / `.github/workflows/ci.yml` / `ccd/nightly.py` を許可集合に入れても HALT。
+  - **R3 HALT**: テンプレB で本番 diff が limit 超過。
+  - **R3 非適用**: テンプレA では R3 を一切走らせない（`max_prod_diff_lines=1` でも tests/ pass）。
+  - **safe-halt**: バイナリ / rename / mode 変更 / 空 diff（→ pass）/ 不明テンプレート / 複数違反全件列挙 / `GuardResult` frozen 確認 / `DENYLIST_GLOBS` スモーク。
+  - **CLI end-to-end (実 git)**: 正当 diff で `ccd guard` rc=0 / テスト削除で rc=1 + `R2` / denylist + 許可集合で rc=1 + `denylist` / テンプレB 大 diff で rc=1 + `R3` / 不正 ref で rc=1 + `guard halted`。実 git リポジトリを `tmp_path` 配下に init して `git diff main..HEAD` を本当に走らせる（end-to-end の唯一の git 統合点）。
+
+### Changed
+
+- `pyproject.toml` / `ccd/__init__.py` version `0.10.0` → `0.11.0`（**新機能 = minor bump**、spec §2-7）。
+- `tests/test_smoke.py::test_version_is_0100` → `test_version_is_0110`、`__version__ == "0.11.0"` を assert。
+- **`ccd/cli.py`** — `guard` サブパーサ追加（`--repo` / `--base` / `--head` / `--template` / `--allowed` / `--max-prod-diff-lines`）、`main()` のディスパッチに `if args.command == "guard":` 分岐、`_cmd_guard` ハンドラ追加、`import subprocess` 追加、`from ccd.guard import ...` を `from ccd.discover import ...` と `from ccd.integrate import ...` の間に挿入（alphabetical order）。既存サブコマンド（10 個）の挙動・引数・stdout は**完全に保持**（追加のみ）。
+
+### Constraints (spec §3)
+
+- **触ってよい**: `ccd/guard.py`（新規）、`ccd/cli.py`（`guard` サブコマンド）、`tests/test_guard.py`（新規）、`tests/test_smoke.py`（version assert）、`CHANGELOG.md`、`pyproject.toml`、`ccd/__init__.py`。
+- **触っていない**: `ccd/{models,protocol,dispatch,chain,integrate,metrics,dashboard,run_writer,retry,backfill,agent,retrospect,discover,adversarial,ai_review,brief,profile,nightly}.py` のコアロジックは **1 行も変更していない**。`docs/` / `docs/data/*.json` も触らない。
+- **動的検査 R4 / R5 は混入させない**（spec §3、§6 の Open questions）── 本 spec は静的検査ガード単独の実証だけが責務、ループ配線（spec_023）で R1〜R5 を合成する。
+- ガードは git diff を `subprocess` で取得するか、unified diff テキストを引数で受け取る。`result_NNN.md` 等の自己申告は読まない（実装上 `inspect_diff` のシグネチャに `diff: str` しか受け取らないことで機械的に強制）。
+- すべて**追加のみ**。**push しない／ブランチ操作・merge しない**（spec §3）。
+
+
 
 v2 Phase 1 の**最後の spec** — spec_020。発見3チャンネル（spec_013/014/019 ミューテーション、spec_015 敵対的入力、spec_016 AI推論）・朝レポート（spec_017 `ccd brief`）・プロファイル基盤（spec_018 `ccd profile`）が揃った状態で、残る「**スケジューラ骨格**」を追加。`ccd nightly` サブコマンド（10個目）と Windows タスクスケジューラ登録スクリプト・テンプレートを実装し、夜間に無人でプロファイルの有効発見チャンネルを順に走らせ、朝レポートを描画して Windows 側からも読めるパスにミラーコピーする線形オーケストレーションを完成させる。これで v2 Phase 1（発見のみ・自律修正なし）が完成する。
 
