@@ -2,6 +2,68 @@
 
 本プロジェクトの注目すべき変更を記録する。フォーマットは [Keep a Changelog](https://keepachangelog.com/) に準ずる。
 
+## [0.15.1] — 2026-05-25
+
+spec_026 — `ccd nightly` の end-to-end 実走で発覚した 2 つのバグの修正（patch bump）。v2 Phase 2 の機構自体（ガード・翻訳・テンプレ A / B・コスト境界・朝レポート §B Phase 2）は spec_021〜025 で完成しており、本 spec は**ループが正しい修正を実際に完了できる**ようにする後始末。
+
+実走で起きたこと: 自律修正ループは discover → 候補選択 → 翻訳（`spec_auto_001`）→ ブランチ作成（`auto/spec_auto_001`）→ 修正 dispatch まで通り、修正係（CC）は `ccd/protocol.py:46` の生存改変（`continue → break`）を殺す本物のテスト（`test_parse_spec_skips_leading_non_heading_lines`）を書いた。改変ありで失敗 / 原本で成功も実証済みで、自律修正の中身は正しかった。しかし 2 バグでループは修正を完了できなかった:
+
+- **バグ① (偽 HALT)**: 翻訳が生成した `spec_auto_001` には「コミットせよ」という指示が無く、修正係はテストを書いたが**コミットしなかった**。すると `dispatch_one` が「result ファイルあり・commit 0 件」→ `agent_misread` 分類 → ループは正しく書けた修正を HALT した（偽陽性 ── 论点6 の「偽陽性可・偽陰性不可」の安全側ではあるが、このままループは 1 件も修正を完了できない）。
+- **バグ② (HALT の後始末漏れ)**: 修正 dispatch が HALT した後、`tests/test_protocol.py` の未コミット変更が `main` の作業ツリーに残り、`auto/spec_auto_001` ブランチも残骸として残った。HALT 経路がリポジトリをクリーンな状態に戻していなかった。
+
+両方を直す。安全性（失敗修正を merge しない）は守られていた ── 本 spec は「ループが正しい修正を実際に完了できる」ようにする修正。
+
+### Fixed
+
+- **バグ① — `ccd/translate.py` のテンプレ A / B 制約文** — `spec_auto_NNN.md` の §3 制約ブロックに 2 つの新規節を追加（テンプレ A・テンプレ B 両方に独立に）:
+  - **`_CONSTRAINT_COMMIT_REQUIRED`** (テンプレ A) / **`_CONSTRAINT_B_COMMIT_REQUIRED`** (テンプレ B): 「**修正は現在の feature branch（`auto/<このタスクの spec_auto_id>`）に `git commit` せよ**（論理単位で、メッセージは任意）。あなたは既にこの feature branch 上で起動されている ── 作業を書き終えたら、必ずその branch に commit を積むこと（**コミットは禁止ではなく必須**）。commit が 0 件のまま result ファイルだけ書いて終了すると、自律修正ループはこのタスクを `agent_misread` として HALT する（spec_026 §1 の偽 HALT の原因）。」
+  - **`_CONSTRAINT_NO_PUSH_BRANCH_MERGE`** (テンプレ A) / **`_CONSTRAINT_B_NO_PUSH_BRANCH_MERGE`** (テンプレ B): 「**`git push` の実行・別ブランチへの切り替え（`git checkout main` 等）・新規ブランチの作成・`main` への merge は禁止**。push と main への local merge は自律修正ループ側（`ccd/nightly.py` の `GitOps` seam）が行う ── 本タスクの担当範囲は feature branch 上で commit するところまで。ここで禁止しているのは「push しない／他ブランチに移らない／自分で merge しない」のみであって、**「commit しない」ではない**（混同しないこと ── 前者の文言を後者と読み違えるのが spec_026 で直したバグの原因）。」
+  - **同じ workflow なので A / B のテキストはほぼ並列**。spec_022 / spec_024 の docstring に書かれた「A と B の制約定数は独立 ── 一方が他方を流用しない」方針に従い、別の module 定数として並べる（将来片方だけ変えたい時に他方が影響を受けないように）。
+  - 両定数は §3 制約ブロックの**先頭 2 行**に挿入（既存 5 つの制約より前 ── 修正係が最初に読む位置）。
+- **バグ② — `ccd/nightly.py:_run_auto_fix_loop` の全 HALT 経路の作業ツリー復元** — `GitOps` Protocol に 2 つの新規メソッドを追加し、ループの HALT 経路すべてから呼ぶ:
+  - **`GitOps.discard_local_changes(*, repo: Path) -> None`** — `SubprocessGitOps` 実装は `git reset --hard HEAD` + `git clean -fd` の 2 コマンド（tracked-modified と untracked の両方を確実に消す）。
+  - **`GitOps.delete_branch(*, repo: Path, branch: str) -> None`** — `SubprocessGitOps` 実装は `git branch -D <branch>`（未 merge ブランチでも force-delete）。
+  - **`_restore_repo_after_halt(*, gops, repo, branch)`** — 新ヘルパ。3 ステップを順に呼ぶ: (1) `discard_local_changes`（未コミット変更破棄、auto branch 上で）→ (2) `checkout("main")` → (3) `delete_branch`。**各ステップは独立に `try/except` で囲み**、1 つが失敗しても残りが走る（best-effort、git が深く壊れていても朝レポートは描画できる）。
+  - **`_delete_feature_branch_after_merge(*, gops, repo, branch)`** — 新ヘルパ。成功 merge 経路用。merge 自体は既に `main` を最新化して working tree もクリーンなので、branch 削除のみ実行（`discard` / `checkout` は不要）。
+  - 全 HALT 経路（branch 作成失敗 / dispatch exception / dispatch !done / R5 失敗 / R4 失敗 / ガード HALT）から `_restore_repo_after_halt` を呼ぶ ── 以前は dispatch 系の 2 経路で `_safe_checkout_main` のみだったので、本 spec で `_safe_checkout_main` を削除し、より完全な `_restore_repo_after_halt` に置き換え。
+  - 成功 merge 経路では `_delete_feature_branch_after_merge` を呼んで auto ブランチを片付ける（merge コミットは `main` に残る、既存挙動を壊さない）。
+  - HALT 経路の場合、ループ終了後のリポジトリは実行前と実質同一（クリーンな `main`、auto ブランチなし、未コミット変更なし）── 论点7 の pre-flight の「リポジトリがクリーン」前提を構造的に立てる。
+
+### Added (tests)
+
+- **`tests/test_translate.py` (+9 件、30 件 → 39 件)** — spec_026 §2-3 のテスト要件:
+  - **テンプレ A constraint** — body に「feature branch」「commit」「auto/」「コミットは禁止ではなく必須」が含まれる / 「git push」「別ブランチ」「新規ブランチ」「merge」「禁止」が含まれる / 「コミットするな」「コミットしてはならない」等の禁止表現は含まれない（「コミットは禁止」は「ではなく必須」の文脈でのみ許容）/ `_CONSTRAINT_COMMIT_REQUIRED` / `_CONSTRAINT_NO_PUSH_BRANCH_MERGE` が verbatim で本文に出る。
+  - **テンプレ B constraint** — 同じ 4 観点をテンプレ B 側で pin（`_CONSTRAINT_B_COMMIT_REQUIRED` / `_CONSTRAINT_B_NO_PUSH_BRANCH_MERGE`）。
+- **`tests/test_nightly.py` (+8 件、63 件 → 71 件)** — spec_026 §2-3 のテスト要件:
+  - **`_FakeGitOps`** に `discards: list[Path]` / `deletes: list[str]` の 2 フィールド + `discard_local_changes` / `delete_branch` メソッドを追加（既存テストは不変、新規 list は default factory で空）。
+  - **6 つの HALT 経路の復元 assertion** ── dispatch failure（`status="failed"`）/ dispatch exception（dispatcher が raise）/ R5 失敗 / R4 失敗 / ガード HALT / branch 作成失敗 ── 各経路で「`discards != []`」「`"main" in checkouts`」「`branch in deletes`」を独立に pin。各テストは halt_reason の正しさも併せて確認（既存 spec_023 / 024 のテストと同じ流儀）。
+  - **成功 merge 経路の不変保証** ── `test_success_merge_deletes_feature_branch_but_keeps_main` で `merges == [branch]`（既存挙動）+ `branch in deletes`（新規）+ `discards == []`（success path は discard しない）+ `"main" not in checkouts`（success path は明示的な checkout("main") を加えない、merge_branch_into_main が内部で行うので）。
+  - **best-effort 性の保証** ── `test_halt_restore_swallows_exceptions_per_step` ── discard / checkout / delete_branch のすべてが raise する fake GitOps で、それでも `run_nightly` が exception で落ちず brief を描画、halt_reason は元の R5 失敗が surface（cleanup-step の exception ではなく）。
+  - **Protocol surface の保証** ── `test_gitops_protocol_has_spec_026_methods` で `GitOps.discard_local_changes` / `GitOps.delete_branch` の属性 + `SubprocessGitOps` のそれらが callable であることを assert（将来の uncautious 削除を防ぐ）。
+
+### Changed
+
+- `pyproject.toml` / `ccd/__init__.py` version `0.15.0` → **`0.15.1`**（**バグ修正 = patch bump**、spec §2-4）。
+- `tests/test_smoke.py::test_version_is_0150` → **`test_version_is_0151`**、assert を `0.15.1` に。
+- `ccd/nightly.py:_safe_checkout_main` を削除し、機能を強化した `_restore_repo_after_halt` に置き換え（古いヘルパは 1 機能のみだったので、3 ステップ復元には不十分だった ── 完全置換）。
+- `ccd/nightly.py:GitOps` Protocol に `discard_local_changes` / `delete_branch` の 2 メソッドを追加 ── 既存 4 メソッド (`create_and_checkout_branch` / `diff` / `merge_branch_into_main` / `checkout`) は不変。`SubprocessGitOps` も新 2 メソッドを実装、既存 4 メソッドは不変。
+
+### Constraints (spec §3)
+
+- **触ってよい**: `ccd/translate.py`（テンプレ A / B の制約文言）、`ccd/nightly.py`（`_run_auto_fix_loop` の HALT 復元）、`tests/test_translate.py` / `tests/test_nightly.py` / `tests/test_smoke.py`、`CHANGELOG.md`、`pyproject.toml`、`ccd/__init__.py`。
+- **触ってはいけない**: `ccd/{models,protocol,dispatch,chain,integrate,metrics,dashboard,run_writer,retry,backfill,agent,retrospect,discover,adversarial,ai_review,brief,profile,guard}.py` のコアロジック ── すべて遵守（1 行も touch していない）。`docs/` / `docs/data/*.json` ── 触っていない。
+- テストで実 mutmut / 実 claude / 実 git スケジューラを動かさない（注入ベース、`_FakeGitOps` に新 2 メソッドを追加して `discard` / `delete` を仮想化）── 遵守。
+- 実 `ccd nightly` の end-to-end 再実走は本 spec では行わない ── 両修正はユニットテストで固める（spec §3 の指針通り、spec_019 §2-3 の「dispatch 内に実走検証を入れると長時間化する」教訓を踏襲）。
+- 既存サブコマンド・既存挙動（特に成功 merge 経路）は不変 ── `test_success_merge_deletes_feature_branch_but_keeps_main` が「merge コミットが main に残る」を pin。
+- ローカル commit、**push しない／ブランチ操作・merge しない** ── 遵守（本 spec の修正は `feat/spec_026` ブランチ上で 1 件の commit）。
+
+### Verification
+
+- **`pytest -q`**: **503 passed** in 27.94s（486 → +17: translate +9、nightly +8）。spec_013〜025 の既存テスト 486 件すべて green、smoke の version assert 1 件だけ rename + 文字列差し替え（spec §2-4 の要件）。
+- **`ruff check .`**: `All checks passed!`。
+- **`python3 -m ccd --version`** → `ccd 0.15.1`（smoke の subprocess テストが確認）。
+
+
 ## [0.15.0] — 2026-05-25
 
 v2 Phase 2 の最終 spec — spec_025。spec_021〜024 で自律修正ループ（ガード・翻訳・テンプレ A / B）が点火・実証された次の段として、**運用の歯止め**（コスト/停止境界）と**朝レポート §B のアップグレード**を入れて、ループを安全に夜間運用できる状態に仕上げる（`docs/DESIGN.md §9.6` 论点8 / 论点9）。これで v2 Phase 2 が完成する。

@@ -243,13 +243,19 @@ independently of the parser."""
 
 
 class GitOps(Protocol):
-    """The four git operations the autonomous-fix loop needs.
+    """The git operations the autonomous-fix loop needs.
 
     Production is :class:`SubprocessGitOps` (subprocess wrappers around
     ``git``). Tests pass a :class:`FakeGitOps` that just records calls.
     The loop never invokes ``git`` directly — every git side-effect goes
     through this seam so a misconfigured test environment cannot poison
     the live repo.
+
+    spec_026 §2-2 adds two more methods (``discard_local_changes`` and
+    ``delete_branch``) so the loop can fully restore the working tree on
+    every HALT path — without them, a halted run would leave the auto
+    branch + uncommitted edits on the live repo and break the next
+    night's pre-flight.
     """
 
     def create_and_checkout_branch(self, *, repo: Path, branch: str) -> None: ...
@@ -261,6 +267,10 @@ class GitOps(Protocol):
     ) -> None: ...
 
     def checkout(self, *, repo: Path, ref: str) -> None: ...
+
+    def discard_local_changes(self, *, repo: Path) -> None: ...
+
+    def delete_branch(self, *, repo: Path, branch: str) -> None: ...
 
 
 # --------------------------------------------------------------------------- #
@@ -801,6 +811,10 @@ def _run_auto_fix_loop(
     try:
         gops.create_and_checkout_branch(repo=repo, branch=branch)
     except Exception as exc:
+        # The branch may have been partially created (e.g. ref written
+        # but checkout failed); run the same HALT restore the other
+        # paths use so the next night's pre-flight starts clean.
+        _restore_repo_after_halt(gops=gops, repo=repo, branch=branch)
         return AutoFixOutcome(
             skipped=False,
             spec_auto_id=tr.spec_auto_id,
@@ -822,7 +836,7 @@ def _run_auto_fix_loop(
             timeout_s=dispatch_timeout_s,
         )
     except Exception as exc:
-        _safe_checkout_main(gops, repo)
+        _restore_repo_after_halt(gops=gops, repo=repo, branch=branch)
         return AutoFixOutcome(
             skipped=False,
             spec_auto_id=tr.spec_auto_id,
@@ -841,7 +855,7 @@ def _run_auto_fix_loop(
     dispatch_status = dispatch_outcome.status
     dispatch_ok = dispatch_status == "done"
     if not dispatch_ok:
-        _safe_checkout_main(gops, repo)
+        _restore_repo_after_halt(gops=gops, repo=repo, branch=branch)
         reason = dispatch_outcome.halt_reason or _HALT_DISPATCH_FAILED
         return AutoFixOutcome(
             skipped=False,
@@ -910,8 +924,14 @@ def _run_auto_fix_loop(
             guard_reasons=guard_reasons,
         )
 
+    # spec_026 §2-2 — every HALT path restores the repo to its pre-run
+    # state (discard uncommitted edits → main → delete auto branch);
+    # the success path keeps the merge commit on ``main`` but still
+    # deletes the now-redundant feature branch.
     if not merged:
-        _safe_checkout_main(gops, repo)
+        _restore_repo_after_halt(gops=gops, repo=repo, branch=branch)
+    else:
+        _delete_feature_branch_after_merge(gops=gops, repo=repo, branch=branch)
 
     # spec_025: the brief's Phase 2 §B reads ``merge_diff`` so the
     # operator can review the diff without leaving the report. We
@@ -1253,17 +1273,61 @@ def _compose_halt_reason(
     return "; ".join(parts) or "auto-fix did not merge"
 
 
-def _safe_checkout_main(gops: GitOps, repo: Path) -> None:
-    """Best-effort: leave the working tree on ``main`` after a halt.
+def _restore_repo_after_halt(*, gops: GitOps, repo: Path, branch: str) -> None:
+    """spec_026 §2-2 — restore the repo to its pre-execution state on HALT.
 
-    We do not let a checkout failure cascade — if git is in a state
-    where ``main`` cannot be checked out, the morning brief will surface
-    the original halt_reason and the operator can sort the state out by
-    hand. Silently swallowing the error keeps the brief writeable.
+    Every HALT path of the autonomous-fix loop funnels through this
+    helper so the next night's pre-flight sees a clean working tree on
+    ``main`` (论点7: pre-flight assumes "repo is clean"). The three
+    steps run in fixed order and each is wrapped in try/except so a
+    partial failure in one step does not block the others ── if git is
+    in a deeply weird state the morning brief still surfaces the
+    original halt_reason and the operator can sort it out by hand.
+
+    The order matters:
+
+    1. ``discard_local_changes`` — wipe uncommitted edits on the auto
+       branch BEFORE moving off it. ``git reset --hard`` + ``git clean
+       -fd`` together purge tracked-but-modified and untracked files.
+    2. ``checkout("main")`` — leave the working tree on main so the
+       next git operation does not start from a deleted branch.
+    3. ``delete_branch`` — wipe the auto feature branch so it does not
+       linger as a debris commit chain.
+
+    See spec_026 §1: prior to this helper, a HALT (偽 HALT in particular)
+    left the repo dirty and the next ``ccd nightly`` ran on a polluted
+    main — exactly the failure mode this restoration removes.
     """
 
     try:
+        gops.discard_local_changes(repo=repo)
+    except Exception:
+        pass
+    try:
         gops.checkout(repo=repo, ref="main")
+    except Exception:
+        pass
+    try:
+        gops.delete_branch(repo=repo, branch=branch)
+    except Exception:
+        pass
+
+
+def _delete_feature_branch_after_merge(
+    *, gops: GitOps, repo: Path, branch: str
+) -> None:
+    """spec_026 §2-2 — best-effort cleanup of the merged auto branch.
+
+    The success path's ``merge_branch_into_main`` already leaves the
+    working tree on ``main`` with the merge commit in place, so we only
+    need to delete the now-redundant feature branch. Wrapped in
+    try/except — losing the cleanup is non-fatal (the merge commit
+    is still on main); the next pre-flight tolerates stale auto/
+    branches gracefully.
+    """
+
+    try:
+        gops.delete_branch(repo=repo, branch=branch)
     except Exception:
         pass
 
@@ -1590,6 +1654,48 @@ class SubprocessGitOps:
     def checkout(self, *, repo: Path, ref: str) -> None:
         subprocess.run(
             ["git", "checkout", ref],
+            cwd=str(repo),
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+    def discard_local_changes(self, *, repo: Path) -> None:
+        """spec_026 §2-2 — restore the working tree to the current commit.
+
+        ``git reset --hard HEAD`` reverts tracked-file edits (staged or
+        unstaged) and ``git clean -fd`` removes untracked files /
+        directories that the halted fix-task may have left behind. The
+        combination returns the working tree to its pre-execution state
+        on the *current* branch — callers follow with ``checkout("main")``
+        and ``delete_branch`` to fully unwind the auto branch.
+        """
+        subprocess.run(
+            ["git", "reset", "--hard", "HEAD"],
+            cwd=str(repo),
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            ["git", "clean", "-fd"],
+            cwd=str(repo),
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+    def delete_branch(self, *, repo: Path, branch: str) -> None:
+        """spec_026 §2-2 — force-delete a local feature branch.
+
+        ``-D`` (capital) deletes even if the branch is not fully merged
+        — which is the HALT case we care about (the fix didn't merge,
+        but we still want the branch gone from the working tree). For
+        the success path we still use ``-D`` for symmetry; the merge
+        commit lives on ``main`` so no work is lost.
+        """
+        subprocess.run(
+            ["git", "branch", "-D", branch],
             cwd=str(repo),
             check=True,
             capture_output=True,

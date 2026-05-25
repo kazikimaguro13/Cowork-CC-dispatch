@@ -519,6 +519,33 @@ def _why_template_b_does_not_fit(finding: Finding) -> str:
 # can pin the exact wording — these strings ARE the "侵食不能な剛体" the
 # spec calls out (论点5: instruction must not be softened by AI). Renaming
 # any of these is a behaviour change, not a cleanup.
+#
+# spec_026 §2-1 — the autonomous-fix loop's `_run_auto_fix_loop` runs the
+# dispatched fix on a feature branch (``auto/spec_auto_NNN``) and reads
+# the resulting commits as the loop's R4 / R5 / guard input. If the fix
+# agent does not commit (the human-spec idiom "push しない／ブランチ操作・
+# merge しない" can be misread as "don't commit either"), the loop sees
+# "result file present, 0 commits" and HALTs with ``agent_misread``. The
+# COMMIT_REQUIRED / NO_PUSH_BRANCH_MERGE clauses below resolve that
+# ambiguity verbatim: commit IS required, push / branch-switch / new
+# branch / merge are forbidden — but commit is NOT a forbidden git op.
+_CONSTRAINT_COMMIT_REQUIRED = (
+    "**修正は現在の feature branch（`auto/<このタスクの spec_auto_id>`）に "
+    "`git commit` せよ**（論理単位で、メッセージは任意）。あなたは既にこの "
+    "feature branch 上で起動されている ── 新規テストを書き終えたら、必ずその "
+    "branch に commit を積むこと（**コミットは禁止ではなく必須**）。commit が "
+    "0 件のまま result ファイルだけ書いて終了すると、自律修正ループはこのタスクを "
+    "`agent_misread` として HALT する（spec_026 §1 の偽 HALT の原因）。"
+)
+_CONSTRAINT_NO_PUSH_BRANCH_MERGE = (
+    "**`git push` の実行・別ブランチへの切り替え（`git checkout main` 等）・"
+    "新規ブランチの作成・`main` への merge は禁止**。push と main への local "
+    "merge は自律修正ループ側（`ccd/nightly.py` の `GitOps` seam）が行う ── "
+    "本タスクの担当範囲は feature branch 上で commit するところまで。"
+    "ここで禁止しているのは「push しない／他ブランチに移らない／自分で merge "
+    "しない」のみであって、**「commit しない」ではない**（混同しないこと ── "
+    "前者の文言を後者と読み違えるのが spec_026 で直したバグの原因）。"
+)
 _CONSTRAINT_TEST_ONLY = (
     "**テストの追加のみ** が許可される。本番コード（`ccd/` 配下含む、テスト "
     "ディレクトリ外のすべて）は **1 バイトも変更してはならない**。本発見は "
@@ -610,6 +637,8 @@ def _render_template_a(
         "",
         "## 3. 制約（テンプレ A 逐語、本タスクで侵食してはならない）",
         "",
+        f"- {_CONSTRAINT_COMMIT_REQUIRED}",
+        f"- {_CONSTRAINT_NO_PUSH_BRANCH_MERGE}",
         f"- {_CONSTRAINT_TEST_ONLY}",
         f"- {_CONSTRAINT_EXISTING_TESTS_IMMUTABLE}",
         f"- {_CONSTRAINT_NO_SKIP_MARKERS}",
@@ -694,6 +723,31 @@ _TEST_COUNT_GATE_NOTE = (
 # constraints are deliberately distinct from A's (production-fix scope vs
 # test-only scope), so we keep two separate sets rather than parameterizing
 # one set with placeholders.
+#
+# spec_026 §2-1 — same commit-required / no-push-branch-merge clauses as
+# template A. The git workflow is the same for both templates (the loop
+# always dispatches on a feature branch and merges locally), so the
+# wording is parallel; per spec_022/024 docstring policy we keep two
+# separate copies so a future edit to one cannot silently leak into the
+# other.
+_CONSTRAINT_B_COMMIT_REQUIRED = (
+    "**修正（本番コードと再現テストの両方）は現在の feature branch "
+    "（`auto/<このタスクの spec_auto_id>`）に `git commit` せよ**（論理単位で、"
+    "メッセージは任意）。あなたは既にこの feature branch 上で起動されている "
+    "── 修正＋再現テストを書き終えたら、必ずその branch に commit を積むこと "
+    "（**コミットは禁止ではなく必須**）。commit が 0 件のまま result ファイル "
+    "だけ書いて終了すると、自律修正ループはこのタスクを `agent_misread` として "
+    "HALT する（spec_026 §1 の偽 HALT の原因）。"
+)
+_CONSTRAINT_B_NO_PUSH_BRANCH_MERGE = (
+    "**`git push` の実行・別ブランチへの切り替え（`git checkout main` 等）・"
+    "新規ブランチの作成・`main` への merge は禁止**。push と main への local "
+    "merge は自律修正ループ側（`ccd/nightly.py` の `GitOps` seam）が行う ── "
+    "本タスクの担当範囲は feature branch 上で commit するところまで。"
+    "ここで禁止しているのは「push しない／他ブランチに移らない／自分で merge "
+    "しない」のみであって、**「commit しない」ではない**（混同しないこと ── "
+    "前者の文言を後者と読み違えるのが spec_026 で直したバグの原因）。"
+)
 _CONSTRAINT_B_GRACEFUL_FAIL_NOT_ACCEPT = (
     "**「優雅に失敗させる」のであって「成功させる」ではない**。"
     "壊れた入力を **黙って受理してはならない**。修正後の本番コードは、当該の壊れた "
@@ -806,6 +860,8 @@ def _render_template_b(
         "",
         "## 3. 制約（テンプレ B 逐語、本タスクで侵食してはならない）",
         "",
+        f"- {_CONSTRAINT_B_COMMIT_REQUIRED}",
+        f"- {_CONSTRAINT_B_NO_PUSH_BRANCH_MERGE}",
         f"- {_CONSTRAINT_B_GRACEFUL_FAIL_NOT_ACCEPT}",
         f"- {_CONSTRAINT_B_REPRODUCER_GATE}",
         f"- {_CONSTRAINT_B_EXISTING_TESTS_IMMUTABLE}",
