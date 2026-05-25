@@ -2285,3 +2285,511 @@ def test_template_b_one_candidate_per_night(tmp_path: Path) -> None:
     )
     assert len(gops.branches_created) == 1
     assert len(gops.merges) == 1
+
+
+# --------------------------------------------------------------------------- #
+# spec_025 — cost / halt boundaries
+# --------------------------------------------------------------------------- #
+
+
+def test_pause_file_short_circuits_entire_nightly(tmp_path: Path) -> None:
+    """spec_025 §2-1(c) — PAUSE file present → nothing runs.
+
+    With the operator-installed kill switch in place, ``run_nightly``
+    returns ``paused=True`` and ``success=True`` (it's an intentional
+    pause, not an error), and none of the channel runner / fix
+    dispatcher / brief runner / mirror is invoked.
+    """
+
+    pause_file = tmp_path / "_ai_workspace" / "PAUSE"
+    pause_file.parent.mkdir(parents=True)
+    pause_file.write_text("manual brake\n", encoding="utf-8")
+
+    _write_mutation_discover_json(repo=tmp_path)
+    channel_runner = _RecordingChannelRunner()
+    brief_runner, brief_calls = _make_fake_brief_runner()
+    mirror, mirror_calls = _make_recording_mirror()
+    dispatcher = _FakeFixDispatcher()
+    gops = _FakeGitOps()
+
+    result = run_nightly(
+        repo=tmp_path,
+        profile=_autofix_profile(autonomous=True),
+        channel_runner=channel_runner,
+        brief_runner=brief_runner,
+        windows_mirror=mirror,
+        fix_dispatcher=dispatcher,
+        git_ops=gops,
+    )
+
+    assert result.paused is True
+    assert result.success is True
+    assert "PAUSE" in result.halt_reason
+    # Nothing ran.
+    assert channel_runner.calls == []
+    assert brief_calls == []
+    assert mirror_calls == []
+    assert dispatcher.calls == []
+    assert result.auto_fix is None
+    assert result.brief_report_wsl is None
+
+
+def test_pause_file_absent_runs_normally(tmp_path: Path) -> None:
+    """Sanity: no PAUSE → normal nightly run (paused=False)."""
+
+    channel_runner = _RecordingChannelRunner()
+    brief_runner, _ = _make_fake_brief_runner()
+    mirror, _ = _make_recording_mirror()
+
+    result = run_nightly(
+        repo=tmp_path,
+        profile=Profile(discovery=DiscoveryConfig(channels=["mutation"])),
+        channel_runner=channel_runner,
+        brief_runner=brief_runner,
+        windows_mirror=mirror,
+    )
+
+    assert result.paused is False
+    assert result.success is True
+
+
+def test_cli_nightly_prints_paused_line_when_pause_file_present(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """CLI surfaces the pause to operator stdout and exits 0."""
+
+    pause_file = tmp_path / "_ai_workspace" / "PAUSE"
+    pause_file.parent.mkdir(parents=True)
+    pause_file.write_text("", encoding="utf-8")
+
+    rc = cli.main(
+        ["nightly", "--repo", str(tmp_path)],
+        channel_runner=_RecordingChannelRunner(),
+        brief_runner=_make_fake_brief_runner()[0],
+        windows_mirror=lambda _p: None,
+    )
+
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "paused" in out
+    assert "PAUSE" in out
+    # Normal nightly stdout lines must NOT appear.
+    assert "channels executed:" not in out
+
+
+def test_unpushed_backlog_at_limit_blocks_new_dispatch(tmp_path: Path) -> None:
+    """spec_025 §2-1(b) — 3+ un-pushed auto-merges → loop skips with a
+    promote-please reason; dispatcher / git seam never touched."""
+
+    _write_mutation_discover_json(repo=tmp_path)
+    dispatcher = _FakeFixDispatcher()
+    suite = _FakeSuiteRunner()
+    recheck = _FakeMutationRechecker(status="killed")
+    guard = _FakeGuardInspector()
+    gops = _FakeGitOps()
+    brief_runner, _ = _make_fake_brief_runner()
+
+    # Counter says: 3 un-pushed auto-fix commits already on local main.
+    def _counter(_repo: Path) -> int:
+        return 3
+
+    result = run_nightly(
+        repo=tmp_path,
+        profile=_autofix_profile(autonomous=True),
+        channel_runner=_RecordingChannelRunner(),
+        brief_runner=brief_runner,
+        windows_mirror=lambda _p: None,
+        fix_dispatcher=dispatcher,
+        suite_runner=suite,
+        mutation_rechecker=recheck,
+        guard_inspector=guard,
+        git_ops=gops,
+        unpushed_counter=_counter,
+    )
+
+    af = result.auto_fix
+    assert af is not None
+    assert af.skipped is True
+    assert "un-pushed autonomous-fix commits" in af.skip_reason
+    assert "3 un-pushed" in af.skip_reason
+    assert "limit 3" in af.skip_reason
+    assert "git push" in af.skip_reason
+    # No dispatch, no git side effects.
+    assert dispatcher.calls == []
+    assert gops.branches_created == []
+    assert gops.merges == []
+
+
+def test_unpushed_backlog_below_limit_does_not_block(tmp_path: Path) -> None:
+    """2 un-pushed < limit of 3 → loop proceeds normally."""
+
+    _write_mutation_discover_json(repo=tmp_path)
+    dispatcher = _FakeFixDispatcher()
+    suite = _FakeSuiteRunner()
+    recheck = _FakeMutationRechecker(status="killed")
+    guard = _FakeGuardInspector()
+    gops = _FakeGitOps()
+    brief_runner, _ = _make_fake_brief_runner()
+
+    def _counter(_repo: Path) -> int:
+        return 2
+
+    result = run_nightly(
+        repo=tmp_path,
+        profile=_autofix_profile(autonomous=True),
+        channel_runner=_RecordingChannelRunner(),
+        brief_runner=brief_runner,
+        windows_mirror=lambda _p: None,
+        fix_dispatcher=dispatcher,
+        suite_runner=suite,
+        mutation_rechecker=recheck,
+        guard_inspector=guard,
+        git_ops=gops,
+        unpushed_counter=_counter,
+    )
+
+    af = result.auto_fix
+    assert af is not None
+    assert af.skipped is False
+    assert af.merged is True
+    assert dispatcher.calls  # the loop did run
+
+
+def test_unpushed_backlog_custom_limit_is_honored(tmp_path: Path) -> None:
+    """``unpushed_backlog_limit`` overrides the module default."""
+
+    _write_mutation_discover_json(repo=tmp_path)
+    dispatcher = _FakeFixDispatcher()
+    brief_runner, _ = _make_fake_brief_runner()
+
+    result = run_nightly(
+        repo=tmp_path,
+        profile=_autofix_profile(autonomous=True),
+        channel_runner=_RecordingChannelRunner(),
+        brief_runner=brief_runner,
+        windows_mirror=lambda _p: None,
+        fix_dispatcher=dispatcher,
+        unpushed_counter=lambda _repo: 1,
+        unpushed_backlog_limit=1,  # 1 un-pushed already trips it
+    )
+
+    af = result.auto_fix
+    assert af is not None
+    assert af.skipped is True
+    assert "un-pushed autonomous-fix commits" in af.skip_reason
+    assert dispatcher.calls == []
+
+
+def test_unpushed_counter_exception_does_not_block(tmp_path: Path) -> None:
+    """If the counter raises (git missing / weird state), loop proceeds —
+    we don't want a counter failure to silently disable the loop."""
+
+    _write_mutation_discover_json(repo=tmp_path)
+    dispatcher = _FakeFixDispatcher()
+    suite = _FakeSuiteRunner()
+    recheck = _FakeMutationRechecker(status="killed")
+    guard = _FakeGuardInspector()
+    gops = _FakeGitOps()
+    brief_runner, _ = _make_fake_brief_runner()
+
+    def _boom(_repo: Path) -> int:
+        raise RuntimeError("git not found")
+
+    result = run_nightly(
+        repo=tmp_path,
+        profile=_autofix_profile(autonomous=True),
+        channel_runner=_RecordingChannelRunner(),
+        brief_runner=brief_runner,
+        windows_mirror=lambda _p: None,
+        fix_dispatcher=dispatcher,
+        suite_runner=suite,
+        mutation_rechecker=recheck,
+        guard_inspector=guard,
+        git_ops=gops,
+        unpushed_counter=_boom,
+    )
+
+    af = result.auto_fix
+    assert af is not None
+    assert af.skipped is False
+    assert af.merged is True
+
+
+def test_dispatch_timeout_marks_candidate_failed(tmp_path: Path) -> None:
+    """spec_025 §2-1(a) — when dispatch exceeds the timeout, the loop
+    marks the candidate as failed (not merged) and the halt_reason
+    surfaces "timed out" so the morning brief can pinpoint why."""
+
+    import time
+
+    _write_mutation_discover_json(repo=tmp_path)
+
+    def _slow_dispatcher(
+        *,
+        spec_path: Path,  # noqa: ARG001
+        repo: Path,  # noqa: ARG001
+        branch: str,  # noqa: ARG001
+    ) -> FixDispatchOutcome:
+        # Sleep well past the test's tiny timeout.
+        time.sleep(2.0)
+        return FixDispatchOutcome(status="done", commits_made=1)
+
+    suite = _FakeSuiteRunner()
+    recheck = _FakeMutationRechecker(status="killed")
+    guard = _FakeGuardInspector()
+    gops = _FakeGitOps()
+    brief_runner, _ = _make_fake_brief_runner()
+
+    result = run_nightly(
+        repo=tmp_path,
+        profile=_autofix_profile(autonomous=True),
+        channel_runner=_RecordingChannelRunner(),
+        brief_runner=brief_runner,
+        windows_mirror=lambda _p: None,
+        fix_dispatcher=_slow_dispatcher,
+        suite_runner=suite,
+        mutation_rechecker=recheck,
+        guard_inspector=guard,
+        git_ops=gops,
+        dispatch_timeout_s=0.2,
+    )
+
+    af = result.auto_fix
+    assert af is not None
+    assert af.skipped is False
+    assert af.dispatched is True
+    assert af.dispatch_status == "failed"
+    assert af.merged is False
+    assert "timed out" in af.halt_reason
+    assert "spec_025 §2-1(a)" in af.halt_reason
+    # R4/R5/guard not invoked when dispatch failed.
+    assert suite.calls == []
+    assert recheck.calls == []
+    assert guard.calls == []
+    assert gops.merges == []
+
+
+def test_dispatch_timeout_default_is_40_minutes() -> None:
+    """The module's default dispatch timeout is 40 minutes as spec_025
+    §2-1(a) prescribes. We test the constant directly so a careless
+    edit doesn't silently loosen the safety boundary."""
+
+    from ccd.nightly import _AUTO_FIX_DISPATCH_TIMEOUT_S
+
+    assert _AUTO_FIX_DISPATCH_TIMEOUT_S == 40 * 60
+
+
+def test_unpushed_backlog_default_limit_is_three() -> None:
+    """The module's default un-pushed backlog cap is 3 as spec_025
+    §2-1(b) prescribes."""
+
+    from ccd.nightly import _AUTO_FIX_UNPUSHED_BACKLOG_LIMIT
+
+    assert _AUTO_FIX_UNPUSHED_BACKLOG_LIMIT == 3
+
+
+def test_zero_findings_normal_exit_is_success(tmp_path: Path) -> None:
+    """spec_025 §2-1(d) — a night with no actionable findings exits
+    success=True, the auto-fix loop reports skipped, and the brief
+    renders (no error)."""
+
+    dispatcher = _FakeFixDispatcher()
+    brief_runner, brief_calls = _make_fake_brief_runner()
+    mirror, _ = _make_recording_mirror()
+
+    result = run_nightly(
+        repo=tmp_path,
+        profile=_autofix_profile(autonomous=True),
+        channel_runner=_RecordingChannelRunner(),
+        brief_runner=brief_runner,
+        windows_mirror=mirror,
+        fix_dispatcher=dispatcher,
+    )
+
+    assert result.success is True
+    af = result.auto_fix
+    assert af is not None
+    assert af.skipped is True
+    assert "no template-A candidate" in af.skip_reason
+    assert dispatcher.calls == []
+    # Brief still rendered.
+    assert len(brief_calls) == 1
+    assert result.brief_report_wsl is not None
+
+
+def test_merge_diff_captured_on_successful_fix(tmp_path: Path) -> None:
+    """spec_025 — when the loop merges, the diff text is preserved on
+    ``AutoFixOutcome.merge_diff`` so the brief can embed it."""
+
+    _write_mutation_discover_json(repo=tmp_path)
+    dispatcher = _FakeFixDispatcher()
+    suite = _FakeSuiteRunner()
+    recheck = _FakeMutationRechecker(status="killed")
+    guard = _FakeGuardInspector()
+    diff_text = (
+        "diff --git a/tests/test_protocol.py b/tests/test_protocol.py\n"
+        "+++ added a reproducer test\n"
+    )
+    gops = _FakeGitOps(canned_diff=diff_text)
+    brief_runner, _ = _make_fake_brief_runner()
+
+    result = run_nightly(
+        repo=tmp_path,
+        profile=_autofix_profile(autonomous=True),
+        channel_runner=_RecordingChannelRunner(),
+        brief_runner=brief_runner,
+        windows_mirror=lambda _p: None,
+        fix_dispatcher=dispatcher,
+        suite_runner=suite,
+        mutation_rechecker=recheck,
+        guard_inspector=guard,
+        git_ops=gops,
+    )
+
+    af = result.auto_fix
+    assert af is not None
+    assert af.merged is True
+    assert af.merge_diff == diff_text
+
+
+def test_merge_diff_empty_when_not_merged(tmp_path: Path) -> None:
+    """A halted fix's in-progress diff is NOT surfaced via
+    ``merge_diff`` — the brief should never embed an un-merged diff."""
+
+    _write_mutation_discover_json(repo=tmp_path)
+    dispatcher = _FakeFixDispatcher()
+    suite = _FakeSuiteRunner()
+    recheck = _FakeMutationRechecker(status="survived")  # R5 fails → no merge
+    guard = _FakeGuardInspector()
+    gops = _FakeGitOps(canned_diff="diff --git a/x b/x\n")
+    brief_runner, _ = _make_fake_brief_runner()
+
+    result = run_nightly(
+        repo=tmp_path,
+        profile=_autofix_profile(autonomous=True),
+        channel_runner=_RecordingChannelRunner(),
+        brief_runner=brief_runner,
+        windows_mirror=lambda _p: None,
+        fix_dispatcher=dispatcher,
+        suite_runner=suite,
+        mutation_rechecker=recheck,
+        guard_inspector=guard,
+        git_ops=gops,
+    )
+
+    af = result.auto_fix
+    assert af is not None
+    assert af.merged is False
+    assert af.merge_diff == ""
+
+
+def test_brief_phase2_section_b_when_loop_merged(tmp_path: Path) -> None:
+    """End-to-end: when the loop merges, the morning brief's §B is the
+    Phase 2 version — embedded diff, R-result evidence, and push
+    command. We use the REAL brief runner so the rendering path is
+    exercised; the channel runner is a no-op (no discover JSON written
+    in the test), so the brief picks up the auto-fix story only."""
+
+    _write_mutation_discover_json(repo=tmp_path)
+    dispatcher = _FakeFixDispatcher()
+    suite = _FakeSuiteRunner()
+    recheck = _FakeMutationRechecker(status="killed")
+    guard = _FakeGuardInspector()
+    diff_text = (
+        "diff --git a/tests/test_protocol.py b/tests/test_protocol.py\n"
+        "@@ +reproducer test added\n"
+    )
+    gops = _FakeGitOps(canned_diff=diff_text)
+    mirror, _ = _make_recording_mirror()
+
+    result = run_nightly(
+        repo=tmp_path,
+        profile=_autofix_profile(autonomous=True),
+        channel_runner=_RecordingChannelRunner(),
+        # brief_runner left as default — exercises real ccd.brief.run_brief
+        windows_mirror=mirror,
+        fix_dispatcher=dispatcher,
+        suite_runner=suite,
+        mutation_rechecker=recheck,
+        guard_inspector=guard,
+        git_ops=gops,
+        today=date(2026, 5, 25),
+    )
+
+    assert result.success is True
+    assert result.brief_report_wsl is not None
+    md = result.brief_report_wsl.read_text(encoding="utf-8")
+
+    # Phase 2 header + §B title.
+    assert "Phase 2" in md
+    assert "## B. 昨夜の自律修正" in md
+    # Diff embedded.
+    assert "```diff" in md
+    assert "tests/test_protocol.py" in md
+    # Verification evidence.
+    assert "R5" in md and "pass" in md
+    assert "R4" in md
+    assert "ガード" in md
+    # Push command appears.
+    assert "git" in md and "push origin main" in md
+    # Phase 1 §B headline must NOT have replaced §B.
+    assert "## B. 機械的チャンネルの発見" not in md
+
+
+def test_brief_phase1_section_b_when_loop_did_not_merge(
+    tmp_path: Path,
+) -> None:
+    """When the loop ran but did NOT merge (HALT), §B stays Phase 1
+    (mechanical-channel discoveries) — Phase 2 §B is gated on
+    ``auto_fix.merged is True``."""
+
+    _write_mutation_discover_json(repo=tmp_path)
+    dispatcher = _FakeFixDispatcher()
+    suite = _FakeSuiteRunner()
+    recheck = _FakeMutationRechecker(status="survived")  # forces HALT
+    guard = _FakeGuardInspector()
+    gops = _FakeGitOps()
+    mirror, _ = _make_recording_mirror()
+
+    result = run_nightly(
+        repo=tmp_path,
+        profile=_autofix_profile(autonomous=True),
+        channel_runner=_RecordingChannelRunner(),
+        windows_mirror=mirror,
+        fix_dispatcher=dispatcher,
+        suite_runner=suite,
+        mutation_rechecker=recheck,
+        guard_inspector=guard,
+        git_ops=gops,
+        today=date(2026, 5, 25),
+    )
+
+    assert result.brief_report_wsl is not None
+    md = result.brief_report_wsl.read_text(encoding="utf-8")
+
+    # Phase 1 §B stays.
+    assert "## B. 機械的チャンネルの発見" in md
+    # Phase 2 §B does NOT appear.
+    assert "## B. 昨夜の自律修正" not in md
+    # The HALT surfaces in §D (loop ran but didn't merge).
+    assert "自律修正 HALT" in md
+
+
+def test_brief_phase1_section_b_when_no_autofix_at_all(tmp_path: Path) -> None:
+    """Gate OFF → ``auto_fix=None`` → §B is Phase 1 (existing behavior)."""
+
+    # No discover JSON, no auto-fix attempted.
+    brief_runner, _ = _make_fake_brief_runner()
+    mirror, _ = _make_recording_mirror()
+
+    result = run_nightly(
+        repo=tmp_path,
+        profile=Profile(discovery=DiscoveryConfig(channels=["mutation"])),
+        channel_runner=_RecordingChannelRunner(),
+        brief_runner=brief_runner,
+        windows_mirror=mirror,
+    )
+
+    assert result.success is True
+    assert result.auto_fix is None

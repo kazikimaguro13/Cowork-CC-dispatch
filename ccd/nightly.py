@@ -1,13 +1,35 @@
 """ccd nightly — scheduler with optional autonomous-fix loop.
 
 spec_020 wired the Phase-1 skeleton (discover → brief → mirror). spec_023
-added the **autonomous-fix loop** for template A; spec_024 extends it to
-template B (论点 of `docs/DESIGN.md §9.5/§9.7`). When
-``profile.safety.autonomous_fix`` is True, the orchestrator inserts a
-single-candidate fix cycle between discovery and the morning report:
+added the **autonomous-fix loop** for template A; spec_024 extended it
+to template B; spec_025 adds the **cost / halt boundaries**
+(``docs/DESIGN.md §9.6`` 论点8) so the loop is safe to run unattended
+every night. When ``profile.safety.autonomous_fix`` is True, the
+orchestrator inserts a single-candidate fix cycle between discovery and
+the morning report:
 
     discover → [select template → translate → dispatch → R5 verify →
                 R4 verify → guard → local merge] → brief
+
+The spec_025 cost/halt boundaries layered on top:
+
+1. **PAUSE file** — ``<repo>/_ai_workspace/PAUSE`` is the operator's
+   non-emergency brake. When present, ``run_nightly`` does **nothing**
+   that night (no channels, no fix, no brief). The CLI surfaces this
+   via ``result.paused=True`` and a stdout line.
+2. **Un-pushed backlog cap** — when the local ``main`` has accumulated
+   ``_AUTO_FIX_UNPUSHED_BACKLOG_LIMIT`` (3 by default) auto-merge
+   commits not yet pushed to ``origin/main``, the auto-fix loop pauses
+   new dispatches and the morning brief asks the operator to review
+   and push. Discovery + brief still run so the operator sees what
+   else is on the floor.
+3. **Dispatch wall-clock cap** — a single ``claude``-dispatch can
+   trigger a runaway. ``_AUTO_FIX_DISPATCH_TIMEOUT_S`` (40 min by
+   default) bounds it; on timeout the candidate is marked failed and
+   surfaced in the morning brief.
+4. **Zero-finding normal exit** — a night with no actionable findings
+   is not an error; ``run_nightly`` returns ``success=True`` and the
+   brief simply says "今夜は何もなし".
 
 The templates the loop is allowed to process are controlled by
 ``profile.safety.fix_templates`` (default ``["A"]``, spec_024 §2-3 staged
@@ -79,6 +101,7 @@ spec_023 §6 document the open knobs (timeout / branch naming / etc.).
 
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import os
 import shutil
@@ -116,7 +139,24 @@ the nightly orchestrator only inspects ``success`` / ``halt_reason`` /
 ``report_md_path`` / ``report_json_path`` — all common across them."""
 
 BriefRunner = Callable[..., BriefResult]
-"""Same shape as :func:`ccd.brief.run_brief`."""
+"""Same shape as :func:`ccd.brief.run_brief`.
+
+spec_025: the nightly orchestrator forwards the night's
+:class:`AutoFixOutcome` to the brief via the ``auto_fix`` keyword
+argument so the brief can upgrade §B to the Phase 2 version (昨夜の
+自律修正・diff・push コマンド) when the loop actually merged a fix."""
+
+
+UnpushedCounter = Callable[[Path], int]
+"""``(repo) → int``. spec_025 §2-1(b): count auto-merge commits that
+exist on local ``main`` but not on ``origin/main`` (i.e. the autonomous
+fix has merged locally but the operator hasn't reviewed and pushed yet).
+
+The default counter shells out to ``git log origin/main..main`` and
+matches subjects starting with ``auto-merge:`` — that is the prefix
+:class:`SubprocessGitOps` uses when the loop merges a feature branch.
+Repos without an ``origin/main`` ref (fresh clone, no remote) return 0
+— there is nothing to push, so the backlog gate does not apply."""
 
 WindowsMirror = Callable[[Path], Path | None]
 """Copy a WSL report path to a Windows-visible location.
@@ -287,6 +327,10 @@ class AutoFixOutcome:
     guard_halt_reasons: tuple[str, ...] = ()
     merged: bool = False
     halt_reason: str = ""
+    # spec_025 — diff captured at merge time, surfaced by the morning
+    # brief's Phase 2 §B (``run_brief(..., auto_fix=...)``). Empty when
+    # the loop halted before the diff step or when the fix was skipped.
+    merge_diff: str = ""
 
 
 @dataclass
@@ -314,6 +358,10 @@ class NightlyResult:
     brief_report_windows: Path | None = None
     halt_reason: str = ""
     auto_fix: AutoFixOutcome | None = None
+    # spec_025 §2-1(c) — manual kill switch via ``_ai_workspace/PAUSE``.
+    # When True, ``run_nightly`` returned without invoking any channel,
+    # the auto-fix loop, or the brief.
+    paused: bool = False
 
     @property
     def channels_executed(self) -> tuple[str, ...]:
@@ -345,6 +393,10 @@ def run_nightly(
     adversarial_rechecker: AdversarialRechecker | None = None,
     guard_inspector: GuardInspector | None = None,
     git_ops: GitOps | None = None,
+    # spec_025 — cost / halt boundaries
+    unpushed_counter: UnpushedCounter | None = None,
+    unpushed_backlog_limit: int | None = None,
+    dispatch_timeout_s: float | None = None,
 ) -> NightlyResult:
     """Drive one nightly orchestration end-to-end.
 
@@ -374,6 +426,17 @@ def run_nightly(
         if profile is not None
         else load_profile(repo, profile_path)
     )
+
+    # spec_025 §2-1(c) — manual kill switch. The PAUSE file is checked
+    # BEFORE pre-flight; an operator who set PAUSE doesn't want the
+    # orchestrator probing the filesystem at all.
+    if _pause_file_present(repo):
+        return NightlyResult(
+            success=True,
+            profile=effective_profile,
+            paused=True,
+            halt_reason=_HALT_PAUSED,
+        )
 
     pre_halt = _pre_flight(repo)
     if pre_halt:
@@ -409,9 +472,20 @@ def run_nightly(
             adversarial_rechecker=adversarial_rechecker,
             guard_inspector=guard_inspector,
             git_ops=git_ops,
+            unpushed_counter=unpushed_counter,
+            unpushed_backlog_limit=(
+                unpushed_backlog_limit
+                if unpushed_backlog_limit is not None
+                else _AUTO_FIX_UNPUSHED_BACKLOG_LIMIT
+            ),
+            dispatch_timeout_s=(
+                dispatch_timeout_s
+                if dispatch_timeout_s is not None
+                else _AUTO_FIX_DISPATCH_TIMEOUT_S
+            ),
         )
 
-    brief_result = run_brief_fn(repo=repo, today=today)
+    brief_result = run_brief_fn(repo=repo, today=today, auto_fix=auto_fix)
     brief_md = brief_result.report_path if brief_result.success else None
 
     windows_path: Path | None = None
@@ -460,6 +534,23 @@ def _pre_flight(repo: Path) -> str:
     if not os.access(workspace, os.W_OK):
         return f"pre-flight failed: _ai_workspace is not writable: {workspace}"
     return ""
+
+
+def _pause_file_present(repo: Path) -> bool:
+    """spec_025 §2-1(c) — true iff ``<repo>/_ai_workspace/PAUSE`` exists.
+
+    A *file* check, deliberately tolerant: an empty PAUSE file pauses
+    the loop just as well as one with explanatory text. Symlinks /
+    directories also count — anything at that path is a halt signal
+    from the operator. The check never raises; an unreadable
+    ``_ai_workspace`` returns False (pre-flight will then surface the
+    deeper problem instead).
+    """
+
+    try:
+        return (repo / _AUTO_FIX_PAUSE_REL).exists()
+    except OSError:
+        return False
 
 
 # --------------------------------------------------------------------------- #
@@ -538,6 +629,40 @@ _HALT_R5_FAILED_B_SILENT = (
 )
 _HALT_R4_FAILED = "R4 failed: full suite not green"
 _HALT_DISPATCH_FAILED = "dispatch failed"
+# spec_025 anchors.
+_HALT_PAUSED = "paused: _ai_workspace/PAUSE present"
+_HALT_DISPATCH_TIMEOUT = "dispatch timed out"
+# Phrasing the morning brief surfaces verbatim when the un-pushed backlog
+# hits the cap. The test for (b) pins this substring so a rename here
+# also re-acknowledges the operator-facing wording.
+_HALT_UNPUSHED_BACKLOG_PREFIX = (
+    "un-pushed autonomous-fix commits at or above limit"
+)
+
+# spec_025 §2-1 — cost / halt thresholds.
+#
+# These live as module constants (not profile fields) on purpose:
+# - they're a safety invariant of the loop's *physics*, not a per-repo
+#   knob (CCD itself = ON, future client repos = OFF — but both share
+#   the same wall-clock limit and the same un-pushed-review cap);
+# - the docstring at the top of the module is the canonical
+#   documentation of the values, so an operator that wants to widen
+#   them edits the constant + adds a CHANGELOG note rather than
+#   silently changing safety behavior via a profile flip.
+#
+# Callers (``run_nightly`` kwargs) can still override them for tests
+# without touching the constant — the kwargs default to ``None`` and
+# fall back to these values, so production paths read the constants and
+# tests pass concrete numbers.
+_AUTO_FIX_DISPATCH_TIMEOUT_S: float = 40 * 60  # 40 minutes
+_AUTO_FIX_UNPUSHED_BACKLOG_LIMIT: int = 3
+
+# spec_025 §2-1(c) — manual kill switch. The PAUSE file is intentionally
+# under ``_ai_workspace/`` (already gitignored) so it never lands in a
+# commit by accident; the operator drops it manually when something
+# looks off, and the next morning ``ccd nightly`` is a no-op until the
+# file is removed.
+_AUTO_FIX_PAUSE_REL: Path = Path("_ai_workspace") / "PAUSE"
 
 # Template A allowed-file set (test-only). Fixed at module level so the
 # loop physically cannot be coerced to widen it for template A — template
@@ -565,18 +690,54 @@ def _run_auto_fix_loop(
     adversarial_rechecker: AdversarialRechecker | None,
     guard_inspector: GuardInspector | None,
     git_ops: GitOps | None,
+    unpushed_counter: UnpushedCounter | None,
+    unpushed_backlog_limit: int,
+    dispatch_timeout_s: float,
 ) -> AutoFixOutcome:
-    """Drive one autonomous-fix attempt (spec_023 §2-1〜§2-4 + spec_024).
+    """Drive one autonomous-fix attempt (spec_023 §2-1〜§2-4 + spec_024
+    + spec_025 cost/halt boundaries).
 
     Returns an :class:`AutoFixOutcome` describing exactly what happened:
-    skipped (no candidate / translate downgrade), dispatched + halted at
-    R4/R5/guard, or dispatched + merged.
+    skipped (no candidate / translate downgrade / un-pushed backlog cap
+    reached), dispatched + halted at R4/R5/guard/timeout, or
+    dispatched + merged.
 
     One candidate per night (论点3): the first finding that fits one of
     the enabled templates, in priority order (A before B — test-only is
     structurally safer than production-fix). Remaining findings stay in
     discover JSON and surface in the morning brief.
+
+    spec_025 §2-1(b) — before selecting a candidate, count the
+    auto-merge commits on local ``main`` not yet pushed to
+    ``origin/main``. If that count is at or above
+    ``unpushed_backlog_limit``, the loop pauses — discovery still ran,
+    the brief still renders, but no new fix is dispatched. The reason
+    string ``_HALT_UNPUSHED_BACKLOG_PREFIX`` lets the brief render
+    "未push の自律修正が N 件。レビューして push してから続けます".
     """
+
+    # spec_025 §2-1(b) — un-pushed backlog cap.
+    count_unpushed = (
+        unpushed_counter
+        if unpushed_counter is not None
+        else _default_unpushed_counter
+    )
+    try:
+        unpushed = int(count_unpushed(repo))
+    except Exception:
+        # Counter failing (git missing / weird repo state) is treated as
+        # "we can't tell" — fall through to the loop. The morning brief
+        # already surfaces git errors elsewhere.
+        unpushed = 0
+    if unpushed >= unpushed_backlog_limit:
+        return AutoFixOutcome(
+            skipped=True,
+            skip_reason=(
+                f"{_HALT_UNPUSHED_BACKLOG_PREFIX} "
+                f"({unpushed} un-pushed, limit {unpushed_backlog_limit}); "
+                "review and `git push origin main` before the loop resumes"
+            ),
+        )
 
     template, finding, source_report, candidate_count = _select_candidate(
         channels=channels,
@@ -651,12 +812,14 @@ def _run_auto_fix_loop(
             halt_reason=f"branch creation failed: {type(exc).__name__}: {exc}",
         )
 
-    # 4. Dispatch the fix
+    # 4. Dispatch the fix (spec_025 §2-1(a): wall-clock bounded).
     try:
-        dispatch_outcome = dispatcher(
+        dispatch_outcome = _dispatch_with_timeout(
+            dispatcher=dispatcher,
             spec_path=tr.spec_auto_path,
             repo=repo,
             branch=branch,
+            timeout_s=dispatch_timeout_s,
         )
     except Exception as exc:
         _safe_checkout_main(gops, repo)
@@ -710,6 +873,7 @@ def _run_auto_fix_loop(
         r4_passed = False
 
     # 7. Guard
+    diff_text = ""
     try:
         diff_text = gops.diff(repo=repo, base="main", head=branch)
         guard_result = inspect(
@@ -749,6 +913,12 @@ def _run_auto_fix_loop(
     if not merged:
         _safe_checkout_main(gops, repo)
 
+    # spec_025: the brief's Phase 2 §B reads ``merge_diff`` so the
+    # operator can review the diff without leaving the report. We
+    # surface it only when the fix actually merged — a halted fix's
+    # in-progress diff isn't a reviewable artifact.
+    surfaced_diff = diff_text if merged else ""
+
     return AutoFixOutcome(
         skipped=False,
         spec_auto_id=tr.spec_auto_id,
@@ -765,6 +935,7 @@ def _run_auto_fix_loop(
         guard_halt_reasons=guard_reasons,
         merged=merged,
         halt_reason=halt_reason,
+        merge_diff=surfaced_diff,
     )
 
 
@@ -1097,6 +1268,97 @@ def _safe_checkout_main(gops: GitOps, repo: Path) -> None:
         pass
 
 
+def _dispatch_with_timeout(
+    *,
+    dispatcher: FixDispatcher,
+    spec_path: Path,
+    repo: Path,
+    branch: str,
+    timeout_s: float,
+) -> FixDispatchOutcome:
+    """spec_025 §2-1(a) — wall-clock-bounded dispatch.
+
+    The auto-fix loop spends most of its time inside this one call —
+    a misbehaving ``claude`` subprocess can hang for hours. We wrap the
+    dispatcher in a worker thread and let the main thread bail at
+    ``timeout_s``; on timeout the loop records a failed dispatch with
+    a halt_reason that names the cap so the morning brief can surface
+    it.
+
+    Caveat — Python cannot force-kill threads, so the underlying
+    subprocess (if any) may continue running until it hits its own
+    timeout or the OS reaps the parent on schedule rollover. The loop
+    *contract* is "one candidate per night, dispatch_status=failed on
+    timeout" — that contract holds, even if the orphan subprocess
+    lingers a little longer.
+
+    Non-positive ``timeout_s`` disables the timeout (used by tests that
+    explicitly opt out — production callers go through ``run_nightly``
+    which always supplies a positive default).
+    """
+
+    if timeout_s is None or timeout_s <= 0:
+        return dispatcher(spec_path=spec_path, repo=repo, branch=branch)
+
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=1, thread_name_prefix="ccd-dispatch"
+    ) as executor:
+        future = executor.submit(
+            dispatcher,
+            spec_path=spec_path,
+            repo=repo,
+            branch=branch,
+        )
+        try:
+            return future.result(timeout=timeout_s)
+        except concurrent.futures.TimeoutError:
+            future.cancel()
+            return FixDispatchOutcome(
+                status="failed",
+                halt_reason=(
+                    f"{_HALT_DISPATCH_TIMEOUT} after {timeout_s:.0f}s "
+                    "(spec_025 §2-1(a))"
+                ),
+                commits_made=0,
+            )
+
+
+def _default_unpushed_counter(repo: Path) -> int:
+    """spec_025 §2-1(b) production default for :data:`UnpushedCounter`.
+
+    Counts commits on local ``main`` that haven't been pushed to
+    ``origin/main`` whose subject begins with ``"auto-merge:"`` — the
+    prefix :class:`SubprocessGitOps` uses when merging an autonomous-fix
+    feature branch.
+
+    Failure modes that return 0 (i.e., "don't gate the loop"):
+    - ``git`` is not installed
+    - the repo has no ``origin/main`` ref (fresh clone, no remote)
+    - the subprocess otherwise exits non-zero
+
+    The morning brief surfaces the count separately via
+    :data:`AutoFixOutcome.skip_reason` so an operator that intentionally
+    runs without a remote does not get a confusing "0 un-pushed" line —
+    they get the normal Phase 1 §B because there's no backlog to
+    surface.
+    """
+
+    try:
+        completed = subprocess.run(
+            ["git", "log", "origin/main..main", "--pretty=format:%s"],
+            cwd=str(repo),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except FileNotFoundError:
+        return 0
+    if completed.returncode != 0:
+        return 0
+    lines = (completed.stdout or "").strip().splitlines()
+    return sum(1 for line in lines if line.startswith("auto-merge:"))
+
+
 # --------------------------------------------------------------------------- #
 # Default seam implementations
 # --------------------------------------------------------------------------- #
@@ -1413,5 +1675,6 @@ __all__ = [
     "SubprocessGitOps",
     "SuiteOutcome",
     "SuiteRunner",
+    "UnpushedCounter",
     "run_nightly",
 ]
