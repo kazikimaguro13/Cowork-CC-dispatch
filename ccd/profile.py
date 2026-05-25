@@ -138,6 +138,24 @@ KNOWN_WEEKDAYS: tuple[str, ...] = (
 
 DEFAULT_PROFILE_REL = Path("_ai_workspace") / "ccd_profile.toml"
 
+# spec_029 — multi-policy registry. ``_ai_workspace/profiles/*.toml`` is
+# one TOML per *policy* (one client repo /施策); the filename without
+# the ``.toml`` suffix is the policy name. When the directory exists the
+# registry takes over; when it does not, the loader falls back to the
+# legacy single-profile path (``_ai_workspace/ccd_profile.toml``) and
+# the sole policy is named ``"ccd"``. Existing single-profile operation
+# and existing tests are therefore bit-for-bit unchanged.
+PROFILES_DIR_REL = Path("_ai_workspace") / "profiles"
+DEFAULT_FALLBACK_POLICY_NAME = "ccd"
+
+# Policy names appear in directory paths (per-policy discover / nightly
+# sub-directories under CCD's ``_ai_workspace/``) and in the cross-policy
+# index headlines, so we restrict the set of allowed characters to ones
+# that are safe everywhere (no path separators, no shell metachars, no
+# whitespace). The same set the spec_018 mutation_paths / channels
+# validators accept for free-text-style fields, deliberately narrowed.
+_POLICY_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
 _HHMM_RE = re.compile(r"^(?:[01]\d|2[0-3]):[0-5]\d$")
 
 
@@ -492,3 +510,117 @@ def _toml_str_list(items: list[str]) -> str:
     """Render a list[str] as a TOML inline array."""
     body = ", ".join(f'"{s}"' for s in items)
     return f"[{body}]"
+
+
+# --------------------------------------------------------------------------- #
+# Profile registry — spec_029 multi-policy support
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class PolicyEntry:
+    """One row from the profile registry (spec_029 §2-1).
+
+    The policy name is **the TOML filename stem** (so
+    ``_ai_workspace/profiles/samurai.toml`` → ``name="samurai"``). The
+    spec deliberately does NOT carry a ``name`` field inside the TOML to
+    avoid drift between the filename and an embedded label.
+
+    ``source`` is the absolute path of the TOML file the profile came
+    from. In the single-profile fallback (``profiles/`` directory
+    missing) ``source`` is ``None`` when the legacy
+    ``ccd_profile.toml`` was also absent (defaults assembled) and the
+    legacy path otherwise — mirrors :class:`ProfileLoadResult` so the
+    cross-policy index can surface "loaded from" honestly.
+    """
+
+    name: str
+    profile: Profile
+    source: Path | None
+
+
+def load_profile_registry(
+    repo: Path,
+    profiles_dir: Path | None = None,
+) -> list[PolicyEntry]:
+    """Load every policy under ``<repo>/_ai_workspace/profiles/``.
+
+    Returns entries sorted by policy name (deterministic; the morning
+    cross-policy index reads the registry in this order).
+
+    Behaviour matrix:
+
+    - ``profiles/`` directory is present (even when empty) → registry
+      mode. Empty directory yields an empty list — operators who have
+      migrated to the registry but not yet populated it see "no policy
+      to sweep" instead of a silent fallback.
+    - ``profiles/`` directory is absent → **fallback** to the legacy
+      single-profile loader. Returns exactly one entry named ``"ccd"``
+      (spec_029 §2-1 default). This keeps existing single-profile
+      operation bit-for-bit unchanged.
+
+    Validation:
+
+    - The TOML filename stem must match ``[A-Za-z0-9_-]+`` (spec_029
+      §2-1 "施策名のバリデーション"). Filenames containing other
+      characters raise ``ValueError`` — silently skipping them would let
+      a typo'd policy disappear from the sweep without notice.
+    - TOML parse errors and pydantic schema violations are surfaced
+      with the offending file path included (same loud-failure
+      contract as :func:`load_profile`).
+    """
+
+    repo = Path(repo).resolve()
+    resolved_dir = (
+        Path(profiles_dir).resolve()
+        if profiles_dir is not None
+        else (repo / PROFILES_DIR_REL).resolve()
+    )
+
+    if not resolved_dir.is_dir():
+        # Fallback path — registry directory absent. Hand off to the
+        # single-profile loader so a profile-less repo continues to
+        # produce a fully-defaulted Profile() exactly as before.
+        single = load_profile_with_source(repo)
+        return [
+            PolicyEntry(
+                name=DEFAULT_FALLBACK_POLICY_NAME,
+                profile=single.profile,
+                source=single.source,
+            )
+        ]
+
+    entries: list[PolicyEntry] = []
+    for toml_path in sorted(resolved_dir.iterdir()):
+        if toml_path.suffix != ".toml":
+            continue
+        if not toml_path.is_file():
+            continue
+        name = toml_path.stem
+        if not _POLICY_NAME_RE.fullmatch(name):
+            raise ValueError(
+                f"{toml_path}: invalid policy name {name!r} — "
+                f"must match {_POLICY_NAME_RE.pattern!r} "
+                "(English letters, digits, underscore, hyphen only)"
+            )
+        try:
+            with toml_path.open("rb") as f:
+                raw = tomllib.load(f)
+        except tomllib.TOMLDecodeError as exc:
+            raise ValueError(f"{toml_path}: invalid TOML — {exc}") from exc
+        except OSError as exc:
+            raise ValueError(
+                f"{toml_path}: cannot read profile — {exc}"
+            ) from exc
+        try:
+            profile = Profile.model_validate(raw)
+        except ValidationError as exc:
+            raise ValueError(
+                f"{toml_path}: invalid profile — {exc}"
+            ) from exc
+        entries.append(
+            PolicyEntry(name=name, profile=profile, source=toml_path)
+        )
+
+    entries.sort(key=lambda e: e.name)
+    return entries

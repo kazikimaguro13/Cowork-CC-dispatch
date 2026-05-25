@@ -2,6 +2,114 @@
 
 本プロジェクトの注目すべき変更を記録する。フォーマットは [Keep a Changelog](https://keepachangelog.com/) に準ずる。
 
+## [0.18.0] — 2026-05-26
+
+spec_029 — **v2 Phase 3 の 3 本目の spec**。spec_028 で **提案モード (`fix_mode="propose"`)** が入り、CCD のモードが3つ（`auto` / `propose` / `off`）になった。これでクライアント施策の repo に向けられる中身は揃った ── が、CCD は依然 **1 施策 (1 repo) しか相手にできない**（プロファイルは `_ai_workspace/ccd_profile.toml` 1枚、`ccd nightly` は `--repo` を1つ取るだけ）。施策が増えると「タスクを N 個手で登録」になってしまう。
+
+spec_029 は **複数施策の巡回運用** の仕組みを入れる（minor bump = 新機能）:
+
+- 施策ごとに1プロファイルを置けるレジストリ (`_ai_workspace/profiles/`)。
+- 全施策を順に回す新サブコマンド **`ccd nightly-all`**（12個目）。
+- 1施策の失敗が他施策を止めない隔離（论点4）。
+- 施策横断のインデックス（週1、まずこれを見る、`docs/DESIGN.md §9.6` "既定は簡潔" の延長）。
+
+運用イメージ：CCD 自身 (`fix_mode=auto`) ＋サムライ施策 (`fix_mode=propose`) ＋トラベルメール (`fix_mode=propose`) の3プロファイルを `_ai_workspace/profiles/` に置く → 週次タスクが `ccd nightly-all` を1回叩く → 3施策を順に回し、CCD は自分を自律修正し、クライアント施策には修正案を出す → 朝、中島さんが横断インデックスを見て各施策の詳細を確認する。
+
+これで v2 の「夜間自律保守ループ」が**任意の repo にプロファイルで横展開できる**状態になる（`docs/DESIGN.md §9.7` 论点1 のティア概念の完成形）。
+
+### Added
+
+- **`ccd/profile.py` にプロファイルレジストリのローダを追加** (spec_029 §2-1):
+  - `PROFILES_DIR_REL = Path("_ai_workspace") / "profiles"` 定数（`DEFAULT_PROFILE_REL` の隣）。
+  - 新規 `_POLICY_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")` ── ファイル名（＝施策名）のバリデーション。ディレクトリ名・パスの一部になるので英数・ハイフン・アンダースコアのみ許可、それ以外を含むファイルは `ValueError` で顕在化（黙って無視しない）。
+  - 新規 `@dataclass(frozen=True) class PolicyEntry` ── `name: str` / `profile: Profile` / `source: Path | None`。施策名はファイル名 stem、profile TOML に `name` フィールドは**足さない**（ファイル名と中身のズレ事故を避ける、spec §2-1 逐語遵守）。
+  - 新規 `load_profile_registry(repo, profiles_dir=None) -> list[PolicyEntry]`：
+    - `profiles/` ディレクトリが**在ればそれを使う**（`*.toml` 全部を読み、`PolicyEntry` の list を施策名アルファベット順で返す）。
+    - **無ければ従来どおり単一 `ccd_profile.toml` を 1 施策（施策名 `ccd`）として扱う**（spec §2-1 後方互換）── `load_profile_with_source` に委譲して既存挙動 bit-for-bit carry。
+    - 空ディレクトリは**空 registry**（fallback ではない）── 移行途中のオペレータが空 `profiles/` を作って様子見できる。`profiles/` が在るのに silently fallback する怪しい挙動は避ける。
+    - TOML parse / pydantic schema 違反は `ValueError` でファイルパス込みで surface（`load_profile` と同じうるさい契約）。
+  - 既存 `load_profile` / `load_profile_with_source`（単一）は**不変** ── `ccd nightly`（単一施策）と `ccd profile` がそのまま使う（spec §2-1 「不変で残す」遵守）。
+  - `DEFAULT_FALLBACK_POLICY_NAME = "ccd"` 定数を export（テスト + 横断インデックスが参照）。
+- **`ccd/sweep.py` を新規追加（巡回ロジック）** (spec_029 §2-2 / §2-3):
+  - 新規モジュール ── `ccd nightly-all` の中身が肥大しないよう `ccd/nightly.py` に足さず別ファイル（CC 判断、spec §6 「`ccd/sweep.py` 等にするかは CC 判断」）。
+  - 新規 `@dataclass(frozen=True) class PolicyOutcome` ── 施策 1 件分の結果（`name` / `success` / `error` / `result: NightlyResult | None` / `report_path` / `source`）。例外で死んだ施策と内部 halt した施策を区別。
+  - 新規 `@dataclass class SweepResult` ── sweep 全体（`success` / `today` / `policies: list[PolicyOutcome]` / `index_path`）。`success` は全施策を**試行し切ったか**で決まる（個々の失敗では flip しない、论点4）。
+  - 新規 `run_nightly_all(*, repo, profiles_dir=None, today=None, nightly_runner=None, **nightly_kwargs)`：
+    - レジストリを読んで施策を**直列で**処理（spec §2-2 「処理順は直列」逐語遵守）。
+    - 各施策について `discover_dir` / `brief_dir` / `proposal_dir` を **CCD 側の施策名サブディレクトリ**に組み立てて `run_nightly` に渡す → クライアント施策 (`propose`/`off`) の repo には 1 バイトも書かない（spec §2-3 论点3 / プライバシー隔離）。
+    - **失敗隔離**：施策 N が例外を投げたら `PolicyOutcome(success=False, error=...)` に記録して `N+1` 以降を続行（spec §2-2 论点4 「1 施策の事故が他施策を止めない」逐語遵守）。
+    - 全施策を試行し終えたら横断インデックスを書く（後述）。
+  - 新規 `render_index(*, today, policies, fallback_mode=False, ccd_repo=None) -> str`：施策ごと 1 行のサマリ＋詳細リンクの Markdown レンダラ。`merged` / `proposed` / `HALT` / `skipped` / `失敗` / `PAUSE` / `発見のみ` の 7 状態を 1 行で区別。**詳細レポートの再レンダリングはしない** ── 目次＋一言だけ、「既定は簡潔」をインデックスでも守る (`docs/DESIGN.md §9.6`)。
+  - `NightlyRunner = Callable[..., NightlyResult]` 型 ── テストが fake nightly を注入できる seam（実 `run_nightly` を呼ばずに巡回構造だけ exercise）。
+- **`ccd/nightly.py` の `run_nightly` に出力先 override を 3 つ追加** (spec_029 §2-3):
+  - `discover_dir: Path | None = None` ── `_run_channels` 経由で `run_channel` に forward。
+  - `brief_dir: Path | None = None` ── `run_brief_fn` に forward（`run_brief` は既に spec_017 から `brief_dir` を受け取る、API 不変）。
+  - `proposal_dir: Path | None = None` ── `_run_propose_loop` 経由で `_save_proposal_patch` に forward。
+  - 既存 default の `None` は **flat layout 維持**（spec_020 の `<repo>/_ai_workspace/{discover,nightly}/` をそのまま使う）── 単一施策で `ccd nightly` を直接叩く既存運用は bit-for-bit 不変。
+  - sweep が指定するときだけ CCD 側のサブディレクトリ（`<ccd_repo>/_ai_workspace/{discover,nightly}/<施策名>/`）に向く。
+- **`ccd nightly-all` サブコマンド (12 個目)** ── `ccd/cli.py`:
+  - `--repo`（既定 cwd） ── CCD の作業ディレクトリ（`profiles/` を読み、全成果物をここに書く）。
+  - `--profiles-dir`（既定 `<repo>/_ai_workspace/profiles/`） ── テスト用 override。
+  - `main()` に `nightly_runner: Any | None = None` seam を追加 ── テストが fake sweep runner を注入可能。
+  - stdout: `policies processed: N` ＋ `  - <name>: ok|failed (<reason>)` を施策ごと 1 行 ＋ 最後に `cross-policy index: <path>`。
+  - 失敗した施策があっても CLI exit code は 0（sweep itself は「全施策を試行し切った」で正常終了、spec §2-2 「`nightly-all` 自体は全施策を試行し切ったら正常終了」逐語遵守）。
+  - **既存サブコマンド (`ccd nightly` / `ccd profile`) は不変** ── spec §3 遵守、test_cli_nightly_all_keeps_nightly_subcommand_unchanged で構造的に pin（サブコマンド総数 11 → 12）。
+- **`_ai_workspace/register_nightly.ps1` を `ccd nightly-all` 呼び出しに変更** (spec §2-4):
+  - 旧 `ccd nightly --repo $ProjectDir` → 新 `ccd nightly-all --repo $ProjectDir`。
+  - 冒頭コメントを「複数施策の巡回運用」用に追記更新（spec_029 の追加経緯 + `profiles/` が無ければ単一プロファイルに自動 fallback する旨を明記）。
+  - タスク名 `CcdNightlyMaintenance` ・ 週次トリガー (spec_027) ・ WakeToRun / StartWhenAvailable / MultipleInstances IgnoreNew / ExecutionTimeLimit 6h は不変（既登録タスクとの不整合を避ける、spec_027 のポリシーをそのまま継承）。
+
+### Added (tests)
+
+- **`tests/test_sweep.py` (+23 件、新規ファイル)** ── 全テスト注入ベース（実 mutmut / claude / git を動かさない、spec §2-5 / §6）:
+  - レジストリ:
+    - `test_registry_reads_every_toml_in_profiles_dir` ── 複数 `.toml` を置いて全施策が名前つきで読める、ソート順
+    - `test_registry_falls_back_to_single_profile_when_dir_missing` ── `profiles/` 無し → 単一 `ccd_profile.toml` で 1 施策（施策名 `ccd`）
+    - `test_registry_fallback_returns_all_defaults_when_no_legacy_profile` ── `profiles/` も `ccd_profile.toml` も無し → fallback は 1 施策（全 default）
+    - `test_registry_empty_directory_yields_empty_registry` ── `profiles/` 有り＋空 → 空 registry（fallback ではない）
+    - `test_registry_rejects_invalid_policy_name` ── 不正文字のファイル名で `ValueError`
+    - `test_registry_rejects_malformed_toml` ── TOML parse error
+    - `test_registry_rejects_schema_violation` ── pydantic schema error
+    - `test_registry_load_profile_unchanged_by_spec_029` ── 既存 `load_profile`（単一）の挙動 bit-for-bit 不変
+  - sweep 巡回 + 失敗隔離（注入ベース）:
+    - `test_sweep_runs_every_policy_in_order` ── 複数施策を順に処理
+    - `test_sweep_redirects_each_policy_outputs_under_ccd_workspace` ── per-policy `discover_dir` / `brief_dir` / `proposal_dir` が CCD 側の施策名サブディレクトリに向く
+    - `test_sweep_fallback_preserves_legacy_flat_paths` ── 単一プロファイル fallback では path overrides が `None`（spec_020 flat 維持）
+    - `test_sweep_isolates_per_policy_failure_and_continues` ── 施策 N が raise しても N+1 以降が走り、sweep 自体は success=True
+    - `test_sweep_records_internal_halt_as_failure` ── `run_nightly` が `success=False` で返ったケースも記録（次施策続行）
+  - 横断インデックス:
+    - `test_sweep_writes_cross_policy_index` ── `index_YYYY-MM-DD.md` に施策ごと 1 行サマリ + 相対リンク
+    - `test_sweep_index_marks_failed_policies` ── 失敗施策が「**失敗**」で目立つ
+    - `test_sweep_index_fallback_mode_carries_marker` ── 単一プロファイル運用時のインデックスに移行ヒント
+    - `test_index_empty_registry_renders_meaningful_message` ── 0 施策でも index 出力（「処理対象なし」）
+    - `test_render_index_summarises_each_outcome_kind` ── 5 種の outcome（merged / proposed / HALT / 発見のみ / 失敗）の 1 行サマリを直接 pin
+  - CLI:
+    - `test_cli_nightly_all_invokes_sweep` ── `ccd nightly-all --repo <path>` で stdout に施策別行 + index path
+    - `test_cli_nightly_all_surfaces_failure_lines` ── 失敗施策が `<name>: failed (...)` で出るが exit 0
+    - `test_cli_nightly_all_registry_error_exits_nonzero` ── レジストリ・レベルのエラーは exit 1
+    - `test_cli_nightly_all_keeps_nightly_subcommand_unchanged` ── サブコマンド総数 11 → 12、`ccd nightly` も従来どおり
+  - プライバシー隔離:
+    - `test_sweep_does_not_write_to_target_repo_for_propose_off` ── `propose`/`off` 施策の target repo に書き込みが発生しないことを構造的に pin（全 output dir が CCD 側の `_ai_workspace/` に landing する）
+- **`tests/test_smoke.py::test_version_is_0170` → `test_version_is_0180`**、assert を `"0.18.0"` に。
+
+### Constraints (spec §3)
+
+- **触ってよい**: `ccd/profile.py`（レジストリローダ追加）/ `ccd/sweep.py`（新規、巡回ロジック）/ `ccd/nightly.py`（出力先 override 3 引数を追加）/ `ccd/cli.py`（`nightly-all` サブコマンド）/ `_ai_workspace/register_nightly.ps1` / `tests/` / `CHANGELOG.md` / `pyproject.toml` / `ccd/__init__.py` ── すべて遵守。
+- **触ってはいけない（コアロジック）**: `ccd/{models,protocol,dispatch,chain,integrate,metrics,dashboard,run_writer,retry,backfill,agent,retrospect,discover,adversarial,ai_review,translate,guard,brief}.py` ── すべて遵守（**1 行も touch していない**）。
+  - 特に **`ccd/brief.py` 不変** ── 横断インデックスは `ccd/sweep.py` で構築（CC 判断、spec §2-3「`ccd/brief.py` ＋ 巡回ロジック」のうち巡回ロジック側にまとめた、`brief.py` の朝レポートそのものは touch する必要が無い構造）。
+  - 特に **`ccd/translate.py` / `ccd/guard.py` / `ccd/discover.py` / `ccd/adversarial.py` 不変** ── 発見・翻訳・ガード・提案/自律ループの中身は spec_028 までのものをそのまま使う（spec §3 「`nightly-all` は中身を呼ぶだけ」逐語遵守）。
+- 既存サブコマンド・既存挙動は不変。`ccd nightly`（単一施策）・`ccd profile` は API 不変、`run_nightly`（単一）の path override 3 引数は `None` default で既存挙動 bit-for-bit carry。spec_013〜028 の既存テスト（541 件）はすべて不変で green。
+- 安全境界レベル 2 は不変 ── `propose`/`off` 施策は対象 repo に書き込まない（構造的に：sweep が `discover_dir` / `brief_dir` / `proposal_dir` を CCD 側に固定）、`auto` も push しない（GitOps Protocol に push 系メソッドが無い構造も不変）。
+- ローカル commit のみ、**push しない／ブランチ操作・merge しない**（spec §3 逐語遵守）。
+
+### Verification
+
+- **`pytest -q`**: 全テスト green（spec_028 時点の 541 件 + 新規 23 件 - smoke version test 1 件 rename + assert string 更新 = 計 **564 件**）。
+- **`ruff check .`**: `All checks passed!`。
+- **`python3 -m ccd --version`** → `ccd 0.18.0`（smoke の subprocess テストが確認）。
+- **`python3 -m ccd nightly-all --help`** → 新サブコマンドの help が出る。
+
+
 ## [0.17.0] — 2026-05-25
 
 spec_028 — **v2 Phase 3 の 2 本目の spec**。Phase 2（spec_021〜026）で自律修正ループが完成し、spec_027 で **週次ケイデンス**が入った後、Phase 3 の 2 本目として **提案モード（`fix_mode="propose"`）** を導入する（minor bump = 新機能）。
