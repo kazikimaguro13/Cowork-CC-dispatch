@@ -1,4 +1,4 @@
-"""ccd profile — profile model + loader (spec_018, v2 Phase 1; spec_023 ext).
+"""ccd profile — profile model + loader (spec_018, v2 Phase 1; spec_023/028 ext).
 
 The v2 loop is **profile-driven from day one** (``docs/DESIGN.md §9.3``).
 A profile bundles per-repository configuration — target repo, enabled
@@ -21,6 +21,25 @@ cadence — the scheduler template (``_ai_workspace/register_nightly.ps1``)
 is what decides "how often"; ``ccd nightly`` still just runs one loop
 when invoked.
 
+spec_028 (v2 Phase 3 — 2本目) replaces the boolean
+``safety.autonomous_fix`` gate with a 3-value ``safety.fix_mode``:
+
+- ``"auto"`` — the spec_023〜026 autonomous loop (translate → dispatch →
+  R5/R4 → guard → local merge). Same behavior as the old
+  ``autonomous_fix=True`` bit-for-bit.
+- ``"propose"`` — **new**. Translate one finding per night, dispatch the
+  fix inside a disposable isolated clone, run R5/R4 + guard against the
+  clone, capture the diff as a patch file under
+  ``_ai_workspace/nightly/proposals/``, surface it in the morning brief
+  with a ``git apply`` one-liner — but **do NOT merge or touch the live
+  working tree**.
+- ``"off"`` — discovery + morning report only. Same as the old
+  ``autonomous_fix=False``.
+
+Default is ``"off"`` (safe). The legacy boolean ``autonomous_fix`` is
+**removed**; ``extra="forbid"`` makes any stray ``autonomous_fix = ...``
+in a TOML surface as a load error so the migration is loud.
+
 The loader is graceful by design: if no profile file is present, an
 all-defaults ``Profile`` is returned. CCD therefore continues to work
 without any configuration, and a profile only needs to exist when an
@@ -38,18 +57,21 @@ human inspection of the effective profile. Existing subcommands
 Phase 2 fields
 --------------
 
-- ``safety.autonomous_fix`` (spec_023) — the **gate** that ignites the
-  autonomous-fix loop in ``ccd nightly``. Default ``False`` (safe) so a
-  freshly-configured profile only does discovery + morning report; flip
-  to ``True`` in CCD's own profile to let the loop translate one
-  template finding per night and merge the fix locally (`docs/DESIGN.md
-  §9.7` 论点1 tier: CCD itself = ON, future client repos = OFF).
+- ``safety.fix_mode`` (spec_023→028) — the **3-value gate** that selects
+  the nightly behavior in ``ccd nightly``: ``"off"`` (default —
+  discovery + report only), ``"auto"`` (autonomous loop with local
+  merge, CCD's own first-tier mode), or ``"propose"`` (generate a
+  verified diff in an isolated clone and surface it in the brief, do
+  not merge — the client-repo mode).
 - ``safety.fix_templates`` (spec_024) — **which templates the loop is
   allowed to process** (``docs/DESIGN.md §9.7`` risk-tier ramp). Default
   ``["A"]`` (test-only, structurally safest). Operators flip to
   ``["A", "B"]`` once template A is trusted on the repo to let the loop
   also fix adversarial ungraceful crashes (one production file +
-  ``tests/``, R3 prod-diff bound enforced).
+  ``tests/``, R3 prod-diff bound enforced). ``fix_templates`` applies
+  to both ``"auto"`` and ``"propose"`` modes — the templates govern
+  *which findings* are processable, the mode governs *what to do* with
+  the verified outcome.
 
 Phase 2 reserved fields (NOT implemented yet)
 ---------------------------------------------
@@ -81,6 +103,16 @@ KNOWN_CHANNELS: tuple[str, ...] = ("mutation", "adversarial", "ai")
 # ungraceful crash → production-fix + reproducer test (spec_024). Future
 # templates (e.g., ``"C"`` for AI-inference findings) get added here.
 KNOWN_FIX_TEMPLATES: tuple[str, ...] = ("A", "B")
+
+# Modes the nightly fix loop runs in (spec_028 §2-1). ``"off"`` =
+# discovery + morning report only (no translate, no dispatch, no merge).
+# ``"auto"`` = the spec_023〜026 autonomous loop (translate → dispatch →
+# R5/R4 → guard → local merge). ``"propose"`` = generate one verified
+# fix in a disposable isolated clone and surface its diff + patch path
+# in the morning brief — DO NOT merge or touch the live working tree.
+# Default is ``"off"`` so a freshly-configured profile never auto-fixes
+# nor produces proposals by surprise.
+KNOWN_FIX_MODES: tuple[str, ...] = ("auto", "propose", "off")
 
 # Scheduler cadences (spec_027). ``"nightly"`` keeps the legacy
 # every-night trigger; ``"weekly"`` (the new default) runs once per week
@@ -217,16 +249,36 @@ class ScheduleConfig(BaseModel):
 
 
 class SafetyConfig(BaseModel):
-    """Phase 2 safety knobs (spec_023 §2-1; ``fix_templates`` by spec_024).
+    """Phase 2 safety knobs (spec_023 §2-1; ``fix_templates`` by spec_024;
+    ``fix_mode`` 3-value replacement by spec_028).
 
-    ``autonomous_fix`` is the **gate** that ignites the autonomous-fix
-    loop. When ``True``, ``ccd nightly`` runs
-    ``discover → translate → dispatch → verify → guard → local-merge``
-    for one finding per night. When ``False`` (the safe default), ``ccd
-    nightly`` does Phase-1 discovery + morning report only — no
-    translation, no dispatch, no merge. The default is OFF so a
-    freshly-configured client repo never auto-fixes by surprise; only a
-    profile that explicitly opts in flips it on.
+    ``fix_mode`` selects what ``ccd nightly`` does after discovery:
+
+    - ``"off"`` (the safe default) — discovery + morning report only. No
+      translate, no dispatch, no merge, no proposal.
+    - ``"auto"`` — the spec_023〜026 autonomous loop. One candidate per
+      night: translate → dispatch → R5 → R4 → guard → local merge into
+      ``main`` (no push). This is CCD's own first-tier mode; client
+      repos should NOT use ``"auto"`` until a long bake-in (spec §1).
+    - ``"propose"`` — the spec_028 propose mode. Translate one candidate,
+      dispatch the fix **inside a disposable isolated clone**, run R5 +
+      R4 + guard against the clone, capture the diff as a patch file
+      under ``_ai_workspace/nightly/proposals/``, surface the diff and a
+      ``git apply`` one-liner in the morning brief. The live working
+      tree, branches, and commits are NEVER touched — propose mode's
+      core invariant is "实 repo に何も残らない". Failed verification
+      drops the proposal and surfaces a one-line skip note in §D
+      instead of polluting §B with an unverified diff.
+
+    The default is ``"off"`` so a freshly-configured client repo never
+    auto-fixes nor produces proposals by surprise. CCD's own profile
+    flips to ``"auto"`` (论点1 tier); future client repos will flip to
+    ``"propose"`` when wired up by spec_029.
+
+    Migration note (spec_028): the previous boolean ``autonomous_fix``
+    field has been **removed** (no alias kept). ``extra="forbid"`` will
+    make any stray ``autonomous_fix = ...`` line in a TOML surface as a
+    clear load error rather than silently being ignored.
 
     ``fix_templates`` controls **which templates the loop is allowed to
     process** (``docs/DESIGN.md §9.7`` risk-tier ramp). Template A
@@ -237,7 +289,7 @@ class SafetyConfig(BaseModel):
     - ``["A"]`` (default) — only template A. Adversarial findings stay
       report-only. This is the safe default — a client repo gets only
       the structurally-safest autonomous edit even after flipping
-      ``autonomous_fix=True``.
+      ``fix_mode`` away from ``"off"``.
     - ``["A", "B"]`` — both templates. The loop processes mutation AND
       adversarial findings. Enable B only after A is trusted on this
       repo.
@@ -245,13 +297,25 @@ class SafetyConfig(BaseModel):
       would normally keep A enabled too.
 
     Empty lists are rejected; the gate is the right way to disable the
-    loop, not an empty template list.
+    loop, not an empty template list. ``fix_templates`` applies to both
+    ``"auto"`` and ``"propose"`` modes — the templates govern *which
+    findings* are processable, the mode governs *what to do* with the
+    verified outcome.
     """
 
     model_config = ConfigDict(extra="forbid")
 
-    autonomous_fix: bool = False
+    fix_mode: str = "off"
     fix_templates: list[str] = Field(default_factory=lambda: ["A"])
+
+    @field_validator("fix_mode")
+    @classmethod
+    def _fix_mode_known(cls, v: str) -> str:
+        if v not in KNOWN_FIX_MODES:
+            raise ValueError(
+                f"unknown fix_mode {v!r}; allowed: {list(KNOWN_FIX_MODES)!r}"
+            )
+        return v
 
     @field_validator("fix_templates")
     @classmethod
@@ -259,7 +323,7 @@ class SafetyConfig(BaseModel):
         if not v:
             raise ValueError(
                 "fix_templates must list at least one template; "
-                "use safety.autonomous_fix=false to disable the loop "
+                'use safety.fix_mode="off" to disable the loop '
                 "instead of providing an empty fix_templates list"
             )
         bad = [t for t in v if t not in KNOWN_FIX_TEMPLATES]
@@ -419,14 +483,9 @@ def render_profile(result: ProfileLoadResult) -> str:
     lines.append(f'weekly_day = "{p.schedule.weekly_day}"')
     lines.append("")
     lines.append("[safety]")
-    lines.append(f"autonomous_fix = {_toml_bool(p.safety.autonomous_fix)}")
+    lines.append(f'fix_mode = "{p.safety.fix_mode}"')
     lines.append("fix_templates = " + _toml_str_list(p.safety.fix_templates))
     return "\n".join(lines)
-
-
-def _toml_bool(value: bool) -> str:
-    """Render a Python bool as TOML literal (``true`` / ``false``)."""
-    return "true" if value else "false"
 
 
 def _toml_str_list(items: list[str]) -> str:

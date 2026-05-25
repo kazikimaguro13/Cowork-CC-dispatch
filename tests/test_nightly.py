@@ -930,7 +930,26 @@ def _autofix_profile(
             channels=channels if channels is not None else ["mutation"]
         ),
         schedule=ScheduleConfig(),
-        safety=SafetyConfig(autonomous_fix=autonomous),
+        safety=SafetyConfig(fix_mode="auto" if autonomous else "off"),
+    )
+
+
+def _propose_profile(
+    *,
+    channels: list[str] | None = None,
+    fix_templates: list[str] | None = None,
+) -> Profile:
+    """spec_028 — propose-mode profile helper."""
+
+    return Profile(
+        discovery=DiscoveryConfig(
+            channels=channels if channels is not None else ["mutation"]
+        ),
+        schedule=ScheduleConfig(),
+        safety=SafetyConfig(
+            fix_mode="propose",
+            fix_templates=fix_templates if fix_templates is not None else ["A"],
+        ),
     )
 
 
@@ -1501,7 +1520,7 @@ def test_cli_nightly_prints_auto_fix_merged_line(
     profile_path = tmp_path / "ccd_profile.toml"
     profile_path.write_text(
         "[discovery]\nchannels = [\"mutation\"]\n\n"
-        "[safety]\nautonomous_fix = true\n",
+        "[safety]\nfix_mode = \"auto\"\n",
         encoding="utf-8",
     )
 
@@ -1547,7 +1566,7 @@ def test_cli_nightly_prints_auto_fix_halt_line(
     profile_path = tmp_path / "ccd_profile.toml"
     profile_path.write_text(
         "[discovery]\nchannels = [\"mutation\"]\n\n"
-        "[safety]\nautonomous_fix = true\n",
+        "[safety]\nfix_mode = \"auto\"\n",
         encoding="utf-8",
     )
 
@@ -1599,7 +1618,7 @@ def test_cli_nightly_prints_auto_fix_skipped_line(
     profile_path = tmp_path / "ccd_profile.toml"
     profile_path.write_text(
         "[discovery]\nchannels = [\"mutation\"]\n\n"
-        "[safety]\nautonomous_fix = true\n",
+        "[safety]\nfix_mode = \"auto\"\n",
         encoding="utf-8",
     )
 
@@ -1719,7 +1738,8 @@ def _autofix_profile_b(*, autonomous: bool = True) -> Profile:
         ),
         schedule=ScheduleConfig(),
         safety=SafetyConfig(
-            autonomous_fix=autonomous, fix_templates=["A", "B"]
+            fix_mode="auto" if autonomous else "off",
+            fix_templates=["A", "B"],
         ),
     )
 
@@ -2114,7 +2134,7 @@ def test_template_b_no_candidate_when_only_b_enabled_but_no_adversarial_findings
     profile = Profile(
         discovery=DiscoveryConfig(channels=["adversarial"]),
         schedule=ScheduleConfig(),
-        safety=SafetyConfig(autonomous_fix=True, fix_templates=["B"]),
+        safety=SafetyConfig(fix_mode="auto", fix_templates=["B"]),
     )
 
     result = run_nightly(
@@ -3181,3 +3201,618 @@ def test_gitops_protocol_has_spec_026_methods() -> None:
     impl = SubprocessGitOps()
     assert callable(impl.discard_local_changes)
     assert callable(impl.delete_branch)
+
+
+# --------------------------------------------------------------------------- #
+# spec_028 — propose mode
+# --------------------------------------------------------------------------- #
+
+
+def _fake_isolated_workspace_factory(
+    clone_root: Path,
+) -> Callable[[Path], Any]:
+    """Build an ``isolated_workspace`` seam that yields ``clone_root``.
+
+    Records each invocation's ``live_repo`` arg on
+    ``factory.invocations`` so tests can verify the propose loop calls
+    the factory with the live repo path (and *only* the live repo,
+    never the clone).
+    """
+
+    from contextlib import contextmanager
+
+    invocations: list[Path] = []
+
+    @contextmanager
+    def factory(live_repo: Path) -> Any:
+        invocations.append(Path(live_repo))
+        clone_root.mkdir(parents=True, exist_ok=True)
+        yield clone_root
+
+    factory.invocations = invocations  # type: ignore[attr-defined]
+    return factory
+
+
+def _snapshot_live_repo(repo: Path) -> dict[str, Any]:
+    """Capture the live repo's branch + tree state for before/after pins."""
+
+    refs: list[str] = []
+    refs_dir = repo / ".git" / "refs" / "heads"
+    if refs_dir.is_dir():
+        refs = sorted(p.name for p in refs_dir.iterdir() if p.is_file())
+    return {
+        "branches": refs,
+        # Capture the names of top-level files/dirs so a test can pin
+        # "no new files appeared on the live tree".
+        "tree": sorted(p.name for p in repo.iterdir() if p.name != ".git"),
+    }
+
+
+def test_propose_mode_happy_path_writes_patch_without_touching_live(
+    tmp_path: Path,
+) -> None:
+    """spec_028 §2-2 happy path — propose mode dispatches inside the
+    clone, R5/R4/guard all pass against the clone, the diff is captured
+    as a patch file under ``_ai_workspace/nightly/proposals/``, and the
+    live repo tree / branches are unchanged."""
+
+    _write_mutation_discover_json(repo=tmp_path)
+    pre_snapshot = _snapshot_live_repo(tmp_path)
+
+    clone_dir = tmp_path / "_propose_clone"
+    factory = _fake_isolated_workspace_factory(clone_dir)
+    dispatcher = _FakeFixDispatcher(
+        outcome=FixDispatchOutcome(status="done", commits_made=1)
+    )
+    suite = _FakeSuiteRunner(outcome=SuiteOutcome(passed=True))
+    recheck = _FakeMutationRechecker(status="killed")
+    guard = _FakeGuardInspector(
+        result=GuardResult(
+            passed=True,
+            halt_reasons=(),
+            files_touched=("tests/x.py",),
+            template="A",
+        )
+    )
+    diff_text = (
+        "diff --git a/tests/test_protocol.py b/tests/test_protocol.py\n"
+        "+++ added reproducer\n"
+    )
+    gops = _FakeGitOps(canned_diff=diff_text)
+    brief_runner, _ = _make_fake_brief_runner()
+
+    result = run_nightly(
+        repo=tmp_path,
+        profile=_propose_profile(),
+        channel_runner=_RecordingChannelRunner(),
+        brief_runner=brief_runner,
+        windows_mirror=lambda _p: None,
+        fix_dispatcher=dispatcher,
+        suite_runner=suite,
+        mutation_rechecker=recheck,
+        guard_inspector=guard,
+        git_ops=gops,
+        isolated_workspace=factory,
+        today=date(2026, 5, 25),
+    )
+
+    af = result.auto_fix
+    assert isinstance(af, AutoFixOutcome)
+    assert af.mode == "propose"
+    assert af.skipped is False
+    assert af.proposed is True
+    assert af.template == "A"
+    assert af.r5_killed is True
+    assert af.r4_suite_passed is True
+    assert af.guard_passed is True
+    # Propose mode never merges — the loop must not touch the merge seam.
+    assert af.merged is False
+    assert gops.merges == []
+    # The verified diff is what we ought to embed in the brief.
+    assert af.proposal_diff == diff_text
+    # The patch file exists under the live repo's proposals dir.
+    assert af.proposal_patch_path is not None
+    assert af.proposal_patch_path.exists()
+    assert af.proposal_patch_path.parent == (
+        tmp_path / "_ai_workspace" / "nightly" / "proposals"
+    )
+    assert af.proposal_patch_path.read_text(encoding="utf-8") == (
+        diff_text if diff_text.endswith("\n") else diff_text + "\n"
+    )
+
+    # The isolated workspace factory was called once, with the LIVE repo.
+    assert factory.invocations == [tmp_path.resolve()]  # type: ignore[attr-defined]
+    # Every loop seam was pointed at the clone, not the live repo.
+    assert all(call[1] == clone_dir for call in dispatcher.calls)
+    assert suite.calls == [clone_dir]
+    # The mutation rechecker doesn't surface its repo arg via _FakeMutationRechecker,
+    # but the guard inspector records the diff — and the diff came from
+    # gops.diff against the clone. Pin the gops call shape:
+    assert gops.diffs_requested == [("main", af.branch)]
+    assert gops.branches_created == [af.branch]
+    assert af.branch.startswith("propose/")
+
+    # CRITICAL invariant: the live repo's branches and top-level tree
+    # are unchanged (the propose clone dir was created by the test
+    # factory itself, so it appears in the post snapshot — strip it).
+    post_snapshot = _snapshot_live_repo(tmp_path)
+    post_tree = [
+        n for n in post_snapshot["tree"]
+        if n not in (
+            "_ai_workspace",
+            "_propose_clone",
+        )
+    ]
+    pre_tree = [n for n in pre_snapshot["tree"] if n != "_ai_workspace"]
+    assert post_tree == pre_tree
+    assert post_snapshot["branches"] == pre_snapshot["branches"]
+
+
+def test_propose_mode_skipped_when_no_candidate(tmp_path: Path) -> None:
+    """spec_028 — no candidate ⇒ skipped, mode="propose", no patch written."""
+
+    # No discover JSON written.
+    factory = _fake_isolated_workspace_factory(tmp_path / "_clone")
+    dispatcher = _FakeFixDispatcher()
+    brief_runner, _ = _make_fake_brief_runner()
+
+    result = run_nightly(
+        repo=tmp_path,
+        profile=_propose_profile(),
+        channel_runner=_RecordingChannelRunner(),
+        brief_runner=brief_runner,
+        windows_mirror=lambda _p: None,
+        fix_dispatcher=dispatcher,
+        isolated_workspace=factory,
+    )
+
+    af = result.auto_fix
+    assert af is not None
+    assert af.mode == "propose"
+    assert af.skipped is True
+    assert "no template-A candidate" in af.skip_reason
+    assert af.proposed is False
+    assert af.proposal_patch_path is None
+    # Factory was never invoked — propose skipped before reaching the clone.
+    assert factory.invocations == []  # type: ignore[attr-defined]
+    assert dispatcher.calls == []
+
+
+def test_propose_mode_guard_halt_drops_proposal_and_writes_no_patch(
+    tmp_path: Path,
+) -> None:
+    """spec_028 §2-3 — when the guard halts inside the clone, the
+    proposal is dropped: ``proposed=False``, no patch file is written,
+    ``halt_reason`` carries the guard-halt prefix so §D can render
+    a one-liner."""
+
+    _write_mutation_discover_json(repo=tmp_path)
+    clone_dir = tmp_path / "_propose_clone"
+    factory = _fake_isolated_workspace_factory(clone_dir)
+    dispatcher = _FakeFixDispatcher(
+        outcome=FixDispatchOutcome(status="done", commits_made=1)
+    )
+    suite = _FakeSuiteRunner(outcome=SuiteOutcome(passed=True))
+    recheck = _FakeMutationRechecker(status="killed")
+    guard = _FakeGuardInspector(
+        result=GuardResult(
+            passed=False,
+            halt_reasons=("R1: tests/sneaky.py is not allowed",),
+            files_touched=("tests/sneaky.py",),
+            template="A",
+        )
+    )
+    gops = _FakeGitOps(canned_diff="diff --git a/x b/x\n")
+    brief_runner, _ = _make_fake_brief_runner()
+
+    result = run_nightly(
+        repo=tmp_path,
+        profile=_propose_profile(),
+        channel_runner=_RecordingChannelRunner(),
+        brief_runner=brief_runner,
+        windows_mirror=lambda _p: None,
+        fix_dispatcher=dispatcher,
+        suite_runner=suite,
+        mutation_rechecker=recheck,
+        guard_inspector=guard,
+        git_ops=gops,
+        isolated_workspace=factory,
+    )
+
+    af = result.auto_fix
+    assert af is not None
+    assert af.mode == "propose"
+    assert af.skipped is False
+    assert af.proposed is False
+    assert af.proposal_patch_path is None
+    assert af.merged is False
+    assert "proposal guard halted" in af.halt_reason
+    assert "R1: tests/sneaky.py" in af.halt_reason
+    # Merge was NEVER called.
+    assert gops.merges == []
+    # No patch file landed in proposals/.
+    proposals_dir = tmp_path / "_ai_workspace" / "nightly" / "proposals"
+    if proposals_dir.exists():
+        assert list(proposals_dir.iterdir()) == []
+
+
+def test_propose_mode_r5_fail_drops_proposal(tmp_path: Path) -> None:
+    """spec_028 — R5 failure (mutation still survives in clone) → drop
+    proposal, no patch, §D-class halt_reason."""
+
+    _write_mutation_discover_json(repo=tmp_path)
+    clone_dir = tmp_path / "_propose_clone"
+    factory = _fake_isolated_workspace_factory(clone_dir)
+    dispatcher = _FakeFixDispatcher(
+        outcome=FixDispatchOutcome(status="done", commits_made=1)
+    )
+    suite = _FakeSuiteRunner(outcome=SuiteOutcome(passed=True))
+    recheck = _FakeMutationRechecker(status="survived")  # R5 fails
+    guard = _FakeGuardInspector()
+    gops = _FakeGitOps(canned_diff="diff --git a/x b/x\n")
+    brief_runner, _ = _make_fake_brief_runner()
+
+    result = run_nightly(
+        repo=tmp_path,
+        profile=_propose_profile(),
+        channel_runner=_RecordingChannelRunner(),
+        brief_runner=brief_runner,
+        windows_mirror=lambda _p: None,
+        fix_dispatcher=dispatcher,
+        suite_runner=suite,
+        mutation_rechecker=recheck,
+        guard_inspector=guard,
+        git_ops=gops,
+        isolated_workspace=factory,
+    )
+
+    af = result.auto_fix
+    assert af is not None
+    assert af.mode == "propose"
+    assert af.proposed is False
+    assert af.r5_killed is False
+    assert "proposal R5 failed" in af.halt_reason
+    assert af.proposal_patch_path is None
+
+
+def test_propose_mode_r4_fail_drops_proposal(tmp_path: Path) -> None:
+    """spec_028 — R4 suite failure inside clone → drop proposal."""
+
+    _write_mutation_discover_json(repo=tmp_path)
+    clone_dir = tmp_path / "_propose_clone"
+    factory = _fake_isolated_workspace_factory(clone_dir)
+    dispatcher = _FakeFixDispatcher(
+        outcome=FixDispatchOutcome(status="done", commits_made=1)
+    )
+    suite = _FakeSuiteRunner(outcome=SuiteOutcome(passed=False))  # R4 fails
+    recheck = _FakeMutationRechecker(status="killed")
+    guard = _FakeGuardInspector()
+    gops = _FakeGitOps(canned_diff="diff --git a/x b/x\n")
+    brief_runner, _ = _make_fake_brief_runner()
+
+    result = run_nightly(
+        repo=tmp_path,
+        profile=_propose_profile(),
+        channel_runner=_RecordingChannelRunner(),
+        brief_runner=brief_runner,
+        windows_mirror=lambda _p: None,
+        fix_dispatcher=dispatcher,
+        suite_runner=suite,
+        mutation_rechecker=recheck,
+        guard_inspector=guard,
+        git_ops=gops,
+        isolated_workspace=factory,
+    )
+
+    af = result.auto_fix
+    assert af is not None
+    assert af.mode == "propose"
+    assert af.proposed is False
+    assert af.r4_suite_passed is False
+    assert "proposal R4 failed" in af.halt_reason
+    assert af.proposal_patch_path is None
+
+
+def test_propose_mode_dispatch_failed_drops_proposal(tmp_path: Path) -> None:
+    """spec_028 — dispatch failed inside clone → drop proposal."""
+
+    _write_mutation_discover_json(repo=tmp_path)
+    clone_dir = tmp_path / "_propose_clone"
+    factory = _fake_isolated_workspace_factory(clone_dir)
+    dispatcher = _FakeFixDispatcher(
+        outcome=FixDispatchOutcome(
+            status="failed", halt_reason="claude_error"
+        )
+    )
+    brief_runner, _ = _make_fake_brief_runner()
+
+    result = run_nightly(
+        repo=tmp_path,
+        profile=_propose_profile(),
+        channel_runner=_RecordingChannelRunner(),
+        brief_runner=brief_runner,
+        windows_mirror=lambda _p: None,
+        fix_dispatcher=dispatcher,
+        suite_runner=_FakeSuiteRunner(),
+        mutation_rechecker=_FakeMutationRechecker(),
+        guard_inspector=_FakeGuardInspector(),
+        git_ops=_FakeGitOps(),
+        isolated_workspace=factory,
+    )
+
+    af = result.auto_fix
+    assert af is not None
+    assert af.mode == "propose"
+    assert af.proposed is False
+    assert "proposal dispatch failed" in af.halt_reason
+    assert "claude_error" in af.halt_reason
+    assert af.proposal_patch_path is None
+
+
+def test_propose_mode_never_calls_merge_or_unpushed_counter(
+    tmp_path: Path,
+) -> None:
+    """spec §2-2 / §3 — propose mode never merges and does not consult
+    the un-pushed backlog counter (spec_025 (b) is auto-only)."""
+
+    _write_mutation_discover_json(repo=tmp_path)
+    clone_dir = tmp_path / "_propose_clone"
+    factory = _fake_isolated_workspace_factory(clone_dir)
+    dispatcher = _FakeFixDispatcher(
+        outcome=FixDispatchOutcome(status="done", commits_made=1)
+    )
+    suite = _FakeSuiteRunner(outcome=SuiteOutcome(passed=True))
+    recheck = _FakeMutationRechecker(status="killed")
+    guard = _FakeGuardInspector()
+    gops = _FakeGitOps(canned_diff="diff --git a/x b/x\n")
+    brief_runner, _ = _make_fake_brief_runner()
+
+    counter_calls: list[Path] = []
+
+    def boom_counter(repo: Path) -> int:
+        counter_calls.append(repo)
+        # If propose mode somehow consulted this, the limit (0) would
+        # trip the skip; but it must NOT be consulted at all.
+        raise RuntimeError("propose mode must not consult un-pushed counter")
+
+    run_nightly(
+        repo=tmp_path,
+        profile=_propose_profile(),
+        channel_runner=_RecordingChannelRunner(),
+        brief_runner=brief_runner,
+        windows_mirror=lambda _p: None,
+        fix_dispatcher=dispatcher,
+        suite_runner=suite,
+        mutation_rechecker=recheck,
+        guard_inspector=guard,
+        git_ops=gops,
+        isolated_workspace=factory,
+        unpushed_counter=boom_counter,
+        unpushed_backlog_limit=0,
+    )
+
+    assert counter_calls == []
+    assert gops.merges == []
+
+
+def test_propose_mode_off_fix_mode_no_loop_runs(tmp_path: Path) -> None:
+    """spec_028 — ``fix_mode="off"`` should never invoke the propose loop
+    (or the auto loop). ``auto_fix`` is ``None`` and no seam is touched."""
+
+    _write_mutation_discover_json(repo=tmp_path)
+    factory = _fake_isolated_workspace_factory(tmp_path / "_clone")
+    dispatcher = _FakeFixDispatcher()
+    brief_runner, _ = _make_fake_brief_runner()
+
+    profile = Profile(
+        discovery=DiscoveryConfig(channels=["mutation"]),
+        safety=SafetyConfig(fix_mode="off"),
+    )
+
+    result = run_nightly(
+        repo=tmp_path,
+        profile=profile,
+        channel_runner=_RecordingChannelRunner(),
+        brief_runner=brief_runner,
+        windows_mirror=lambda _p: None,
+        fix_dispatcher=dispatcher,
+        isolated_workspace=factory,
+    )
+
+    assert result.auto_fix is None
+    assert factory.invocations == []  # type: ignore[attr-defined]
+    assert dispatcher.calls == []
+
+
+def test_propose_mode_template_b_happy_path(tmp_path: Path) -> None:
+    """spec_028 — template B in propose mode: adversarial finding,
+    dispatch + R5 (graceful_error) + R4 + guard all pass in clone →
+    proposal patch written."""
+
+    _write_adversarial_discover_json(repo=tmp_path)
+    clone_dir = tmp_path / "_propose_clone"
+    factory = _fake_isolated_workspace_factory(clone_dir)
+    dispatcher = _FakeFixDispatcher(
+        outcome=FixDispatchOutcome(status="done", commits_made=1)
+    )
+    suite = _FakeSuiteRunner(outcome=SuiteOutcome(passed=True))
+    adv_recheck = _FakeAdversarialRechecker(status="graceful_error")
+    guard = _FakeGuardInspector(
+        result=GuardResult(
+            passed=True,
+            halt_reasons=(),
+            files_touched=("ccd/protocol.py", "tests/test_protocol.py"),
+            template="B",
+        )
+    )
+    diff_text = (
+        "diff --git a/ccd/protocol.py b/ccd/protocol.py\n"
+        "diff --git a/tests/test_protocol.py b/tests/test_protocol.py\n"
+    )
+    gops = _FakeGitOps(canned_diff=diff_text)
+    brief_runner, _ = _make_fake_brief_runner()
+
+    result = run_nightly(
+        repo=tmp_path,
+        profile=_propose_profile(
+            channels=["adversarial"], fix_templates=["A", "B"]
+        ),
+        channel_runner=_RecordingChannelRunner(),
+        brief_runner=brief_runner,
+        windows_mirror=lambda _p: None,
+        fix_dispatcher=dispatcher,
+        suite_runner=suite,
+        adversarial_rechecker=adv_recheck,
+        guard_inspector=guard,
+        git_ops=gops,
+        isolated_workspace=factory,
+        today=date(2026, 5, 25),
+    )
+
+    af = result.auto_fix
+    assert af is not None
+    assert af.mode == "propose"
+    assert af.template == "B"
+    assert af.proposed is True
+    assert af.r5_killed is True  # template-B "graceful_error" → R5 pass
+    assert af.proposal_patch_path is not None
+    assert af.proposal_patch_path.exists()
+
+
+def test_propose_mode_cli_stdout_surfaces_propose_line(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """spec_028 — ``ccd nightly`` stdout surfaces a ``propose: proposed``
+    line when the proposal lands; helps the operator see the headline
+    before opening the brief."""
+
+    _write_mutation_discover_json(repo=tmp_path)
+    profile_path = tmp_path / "ccd_profile.toml"
+    profile_path.write_text(
+        "[discovery]\nchannels = [\"mutation\"]\n\n"
+        "[safety]\nfix_mode = \"propose\"\n",
+        encoding="utf-8",
+    )
+    clone_dir = tmp_path / "_propose_clone"
+    factory = _fake_isolated_workspace_factory(clone_dir)
+    dispatcher = _FakeFixDispatcher(
+        outcome=FixDispatchOutcome(status="done", commits_made=1)
+    )
+    suite = _FakeSuiteRunner()
+    recheck = _FakeMutationRechecker(status="killed")
+    guard = _FakeGuardInspector()
+    gops = _FakeGitOps(canned_diff="diff --git a/x b/x\n")
+    brief_runner, _ = _make_fake_brief_runner()
+
+    rc = cli.main(
+        [
+            "nightly",
+            "--repo",
+            str(tmp_path),
+            "--profile",
+            str(profile_path),
+        ],
+        channel_runner=_RecordingChannelRunner(),
+        brief_runner=brief_runner,
+        windows_mirror=lambda _p: None,
+        fix_dispatcher=dispatcher,
+        suite_runner=suite,
+        mutation_rechecker=recheck,
+        guard_inspector=guard,
+        git_ops=gops,
+        isolated_workspace=factory,
+    )
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "propose: proposed" in out
+    assert "patch=" in out
+
+
+def test_propose_mode_passes_finding_to_brief(tmp_path: Path) -> None:
+    """spec_028 — the AutoFixOutcome handed to ``run_brief`` carries the
+    propose-mode bits so the brief can render the propose §B."""
+
+    _write_mutation_discover_json(repo=tmp_path)
+    clone_dir = tmp_path / "_propose_clone"
+    factory = _fake_isolated_workspace_factory(clone_dir)
+    dispatcher = _FakeFixDispatcher(
+        outcome=FixDispatchOutcome(status="done", commits_made=1)
+    )
+    suite = _FakeSuiteRunner(outcome=SuiteOutcome(passed=True))
+    recheck = _FakeMutationRechecker(status="killed")
+    guard = _FakeGuardInspector()
+    gops = _FakeGitOps(canned_diff="diff --git a/x b/x\n")
+
+    brief_invocations: list[dict[str, Any]] = []
+
+    def inspecting_brief_runner(
+        *, repo: Path, today: date | None = None, **kwargs: Any
+    ) -> BriefResult:
+        brief_invocations.append({"repo": repo, "today": today, **kwargs})
+        nightly_dir = Path(repo) / "_ai_workspace" / "nightly"
+        nightly_dir.mkdir(parents=True, exist_ok=True)
+        day = today or date(2026, 5, 25)
+        report_path = nightly_dir / f"report_{day.isoformat()}.md"
+        report_path.write_text("# fake\n", encoding="utf-8")
+        return BriefResult(
+            success=True,
+            report_path=report_path,
+            summary=BriefSummary(
+                channels_picked=(),
+                channels_missing=(),
+                mutation_actionable=0,
+                adversarial_ungraceful=0,
+                ai_findings=0,
+                mechanical_findings_total=0,
+            ),
+        )
+
+    run_nightly(
+        repo=tmp_path,
+        profile=_propose_profile(),
+        channel_runner=_RecordingChannelRunner(),
+        brief_runner=inspecting_brief_runner,
+        windows_mirror=lambda _p: None,
+        fix_dispatcher=dispatcher,
+        suite_runner=suite,
+        mutation_rechecker=recheck,
+        guard_inspector=guard,
+        git_ops=gops,
+        isolated_workspace=factory,
+    )
+
+    assert brief_invocations
+    auto_fix = brief_invocations[0].get("auto_fix")
+    assert auto_fix is not None
+    assert auto_fix.mode == "propose"
+    assert auto_fix.proposed is True
+
+
+def test_propose_default_isolated_workspace_is_disposable_clone(
+    tmp_path: Path,
+) -> None:
+    """spec_028 — when no ``isolated_workspace`` seam is injected, the
+    propose loop falls back to ``_default_isolated_workspace``, which
+    wraps ``_isolated_clone`` (the spec_014 disposable, remoteless
+    clone). We assert the default is exported and is a context manager
+    that yields a directory != the live repo."""
+
+    from ccd.nightly import _default_isolated_workspace
+
+    # Build a tiny fake repo so the clone has *something* to copy.
+    (tmp_path / "README.md").write_text("x\n", encoding="utf-8")
+
+    with _default_isolated_workspace(tmp_path) as workspace:
+        assert isinstance(workspace, Path)
+        assert workspace != tmp_path.resolve()
+        assert workspace.exists()
+        # README copied in.
+        assert (workspace / "README.md").exists()
+        # _ai_workspace is excluded — pin it by writing one to the live
+        # repo before the with-block? Already past that, so just confirm
+        # the workspace path is a fresh tmp dir.
+        assert str(workspace).startswith("/tmp/") or "/tmp/" in str(workspace)
+    # After exit, the workspace was rmtree-d.
+    assert not workspace.exists()

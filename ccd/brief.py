@@ -1,4 +1,4 @@
-"""ccd brief — morning report renderer (spec_017, v2 Phase 1 + spec_025).
+"""ccd brief — morning report renderer (spec_017, v2 Phase 1 + spec_025/028).
 
 The morning report is Loop β's single human-facing artifact
 (``docs/DESIGN.md §9.6``). spec_017's job is the **renderer**: it reads
@@ -17,11 +17,25 @@ the operator runs after reviewing the diff. Nights without an
 autonomous-fix merge keep the Phase 1 §B (mechanical-channel
 discoveries only).
 
+spec_028 — §B propose variant
+-----------------------------
+When the night included a successful **proposal** (``fix_mode="propose"``
++ R5 + R4 + guard all passed in the isolated clone), §B switches to a
+third layout: same finding → action narrative, the same R-evidence,
+the verified diff embedded inline, plus a ``git apply`` one-liner and
+the patch file path. No merge happened — the operator decides whether
+to adopt. When the propose loop ran but verification rejected the
+candidate (R5/R4 fail or guard HALT), §B stays Phase 1 and the
+rejection surfaces as a one-line note in §D — the propose mode
+promise is "動くと確認済みの修正案だけを出す" (spec_028 §2-3), and
+showing an unverified diff would break that.
+
 To stay aligned with ``docs/DESIGN.md §9.6`` ("既定は簡潔・例外時のみ
 伸びる"), the Phase 2 §B is only rendered when ``auto_fix`` is present
-and reports ``merged=True``. Skipped / halted nights still see the
-Phase 1 §B — those nights have nothing additional worth surfacing in
-the brief's body that isn't already in §D (halt / skip).
+and reports either ``merged=True`` (auto) or ``proposed=True``
+(propose). Skipped / halted nights still see the Phase 1 §B — those
+nights have nothing additional worth surfacing in the brief's body
+that isn't already in §D (halt / skip).
 
 What this module is NOT
 -----------------------
@@ -358,13 +372,18 @@ def _render_md(
     repo: Path | None = None,
 ) -> str:
     by_channel = {c.channel: c for c in channels}
-    phase2_active = (
+    phase2_merge_active = (
         auto_fix is not None
         and not auto_fix.skipped
         and auto_fix.merged
     )
+    propose_active = (
+        auto_fix is not None
+        and not auto_fix.skipped
+        and getattr(auto_fix, "proposed", False)
+    )
 
-    if phase2_active:
+    if phase2_merge_active:
         header = (
             f"# 朝レポート {today.isoformat()} — "
             "ccd v2 Phase 2 (昨夜の自律修正あり)"
@@ -376,6 +395,21 @@ def _render_md(
             "ローカルに 1 件マージしました。§B に修正の diff と検証証拠と "
             "push コマンドを掲載 ── レビューしてから手動で push してください "
             "(spec_025 §2-2、安全境界レベル 2)。"
+        )
+    elif propose_active:
+        header = (
+            f"# 朝レポート {today.isoformat()} — "
+            "ccd v2 Phase 3 (修正案あり — 提案モード)"
+        )
+        preamble = (
+            "> Loop β の発見3チャンネル "
+            "(`mutation` / `adversarial` / `ai`) に加え、"
+            "**提案モード** (`fix_mode=\"propose\"`, spec_028) が "
+            "1 件の **動くと確認済みの修正案**を生成しました。"
+            "§B に修正案の diff と検証証拠 (R5/R4/ガード) と "
+            "`git apply` ワンライナーを掲載 ── 採用するなら 1 コマンドで "
+            "適用できる状態です。実 repo には何も変更を加えていません "
+            "(隔離クローン内で生成、merge も commit も push もしません)。"
         )
     else:
         header = (
@@ -396,9 +430,12 @@ def _render_md(
         "",
     ]
     parts.extend(_render_section_a(summary, auto_fix=auto_fix))
-    if phase2_active:
-        assert auto_fix is not None  # narrowed by phase2_active above
+    if phase2_merge_active:
+        assert auto_fix is not None  # narrowed by phase2_merge_active above
         parts.extend(_render_section_b_phase2(auto_fix=auto_fix, repo=repo))
+    elif propose_active:
+        assert auto_fix is not None  # narrowed by propose_active above
+        parts.extend(_render_section_b_propose(auto_fix=auto_fix, repo=repo))
     else:
         parts.extend(_render_section_b(by_channel))
     parts.extend(_render_section_c(by_channel))
@@ -416,24 +453,36 @@ def _render_section_a(
 ) -> list[str]:
     bits: list[str] = []
 
-    # spec_025 — surface the auto-fix outcome on the front page so the
-    # operator gets the headline before scrolling. Three states matter:
-    # merged (Phase 2 §B will follow), skipped (no candidate / paused /
-    # un-pushed backlog), halted (loop ran but did not merge).
+    # spec_025/028 — surface the auto-fix / proposal outcome on the
+    # front page so the operator gets the headline before scrolling.
+    # States: merged (auto §B follows), proposed (propose §B follows),
+    # skipped (no candidate / paused / un-pushed backlog),
+    # halted (loop ran but did not merge / propose).
     if auto_fix is not None:
+        mode = getattr(auto_fix, "mode", "auto")
+        proposed = getattr(auto_fix, "proposed", False)
         if not auto_fix.skipped and auto_fix.merged:
             bits.append(
                 f"**昨夜の自律修正 1 件をローカル merge** "
                 f"(template {auto_fix.template}, "
                 f"`{auto_fix.spec_auto_id}`) — §B に diff と push コマンド"
             )
-        elif not auto_fix.skipped and not auto_fix.merged:
+        elif not auto_fix.skipped and proposed:
             bits.append(
-                f"**自律修正 HALT** ({auto_fix.spec_auto_id or 'no spec'}) — "
+                f"**昨夜の修正案 1 件を生成 (提案モード)** "
+                f"(template {auto_fix.template}, "
+                f"`{auto_fix.spec_auto_id}`) — §B に diff と "
+                "`git apply` ワンライナー（実 repo は無変更）"
+            )
+        elif not auto_fix.skipped and not auto_fix.merged:
+            label = "提案モード HALT" if mode == "propose" else "自律修正 HALT"
+            bits.append(
+                f"**{label}** ({auto_fix.spec_auto_id or 'no spec'}) — "
                 f"{auto_fix.halt_reason or '理由不明'}"
             )
         elif auto_fix.skipped and auto_fix.skip_reason:
-            bits.append(f"**自律修正 skip**: {auto_fix.skip_reason}")
+            label = "提案モード skip" if mode == "propose" else "自律修正 skip"
+            bits.append(f"**{label}**: {auto_fix.skip_reason}")
 
     if not summary.channels_picked:
         bits.append(
@@ -662,6 +711,140 @@ def _render_section_b_phase2(
     return lines
 
 
+def _render_section_b_propose(
+    *,
+    auto_fix: AutoFixOutcome,
+    repo: Path | None,
+) -> list[str]:
+    """spec_028 §2-3 — render §B as the propose-mode story.
+
+    Only invoked when ``auto_fix.proposed is True`` (R5 + R4 + guard
+    all passed in the isolated clone and the diff was captured as a
+    patch file). Surfaces the same four artifacts as the Phase 2
+    auto §B, but **does not** suggest ``git push`` — propose mode
+    never merged; the operator's action is ``git apply`` on the patch
+    file (then commit / review as they see fit).
+
+    Failure cases (R5/R4 fail, guard HALT, no diff) DO NOT render
+    here — they surface in §D as a one-line note, per spec §2-3
+    "弾かれた夜は §B 提案版にしない".
+    """
+
+    template = auto_fix.template or "?"
+    if template == "A":
+        template_desc = "テンプレ A (ミューテーション生存 → test-only fix)"
+    elif template == "B":
+        template_desc = (
+            "テンプレ B (敵対的入力 ungraceful → 本番修正 + 再現テスト)"
+        )
+    else:
+        template_desc = f"テンプレ {template}"
+
+    lines: list[str] = [
+        "## B. 昨夜の修正案 (提案モード — `spec_028`)",
+        "",
+        "隔離クローン内で **R5 / R4 / ガードを通過した** 修正案を 1 件 "
+        "生成しました。**実 repo には何も変更を加えていません** "
+        "(merge / commit / push のいずれもしていません)。下記の "
+        "`git apply` ワンライナーで採用できます。",
+        "",
+        "### 発見と修正案",
+        "",
+        f"- **テンプレ**: {template_desc}",
+        f"- **signature**: `{auto_fix.finding_signature or '(不明)'}`",
+        f"- **spec_auto**: `{auto_fix.spec_auto_id or '(不明)'}` "
+        f"({auto_fix.candidate_count} 候補中 1 件を選択)",
+        f"- **使い捨てブランチ (クローン内)**: "
+        f"`{auto_fix.branch or '(不明)'}` (クローン破棄済み — "
+        "実 repo には残らない)",
+        "",
+        "### 検証の証拠",
+        "",
+    ]
+    if template == "A":
+        r5_label = "R5 (target mutation killed in clone)"
+    elif template == "B":
+        r5_label = "R5 (parser now raises a graceful error in clone)"
+    else:
+        r5_label = "R5"
+    lines.append(
+        f"- {r5_label}: **{'pass' if auto_fix.r5_killed else 'fail'}**"
+    )
+    lines.append(
+        f"- R4 (`pytest -q` 全件 green in clone): "
+        f"**{'pass' if auto_fix.r4_suite_passed else 'fail'}**"
+    )
+    if auto_fix.guard_passed:
+        lines.append("- ガード (R1〜R3): **pass**")
+    else:
+        reasons_text = "; ".join(auto_fix.guard_halt_reasons) or "理由不明"
+        lines.append(f"- ガード: **HALT** — {reasons_text}")
+
+    lines.append("")
+    lines.append("### 修正案の diff")
+    lines.append("")
+    diff = auto_fix.proposal_diff or ""
+    if not diff:
+        lines.append(
+            "_(diff が記録されていません — loop の seam が "
+            "`proposal_diff` を埋めなかった構造的ケース。)_"
+        )
+    else:
+        truncated = len(diff) > _PHASE2_DIFF_CAP
+        body = diff[:_PHASE2_DIFF_CAP] if truncated else diff
+        lines.append("```diff")
+        lines.extend(body.rstrip("\n").splitlines() or [""])
+        lines.append("```")
+        if truncated:
+            lines.append("")
+            lines.append(
+                f"_(diff は {_PHASE2_DIFF_CAP} byte で切り詰めました — "
+                "全体はパッチファイルでご確認ください。)_"
+            )
+
+    lines.append("")
+    lines.append("### 採用方法 (`git apply` ワンライナー)")
+    lines.append("")
+    lines.append(
+        "レビューして問題なければコピーして実行してください "
+        "(propose モードはここでは適用していません):"
+    )
+    lines.append("")
+    lines.append("```bash")
+    lines.append(_compose_apply_command(repo, auto_fix.proposal_patch_path))
+    lines.append("```")
+    if auto_fix.proposal_patch_path is not None:
+        lines.append("")
+        lines.append(
+            f"パッチファイル: `{_rel_or_absolute(auto_fix.proposal_patch_path)}`"
+        )
+    lines.append("")
+    return lines
+
+
+def _compose_apply_command(
+    repo: Path | None,
+    patch_path: Path | None,
+) -> str:
+    """Build the ``git apply`` one-liner for the propose-§B body.
+
+    Embeds an absolute patch path so the operator can paste from any
+    cwd; uses ``git -C <repo>`` when the repo is known so they don't
+    even have to be in the repo directory.
+    """
+
+    if patch_path is None:
+        return "git apply <path-to-proposal.patch>"
+    patch_str = str(patch_path)
+    if repo is not None:
+        try:
+            repo_str = str(Path(repo).resolve())
+        except OSError:
+            repo_str = str(repo)
+        return f"git -C {repo_str} apply {patch_str}"
+    return f"git apply {patch_str}"
+
+
 def _compose_push_command(repo: Path | None) -> str:
     """Produce the ``git push origin main`` one-liner for the brief.
 
@@ -755,12 +938,27 @@ def _render_section_d(
             label = _CHANNEL_LABEL.get(channel, channel)
             items.append(f"- **{label}** halt: {halt}")
 
-    # spec_025 — surface autonomous-fix halts and structural skips so
-    # the operator sees them in §D alongside channel halts. A *merged*
-    # auto-fix isn't a halt; §B Phase 2 owns that story.
+    # spec_025/028 — surface autonomous-fix / propose halts and
+    # structural skips so the operator sees them in §D alongside
+    # channel halts. A *merged* auto-fix and a *proposed* propose
+    # outcome aren't halts; §B owns those stories.
     if auto_fix is not None:
+        mode = getattr(auto_fix, "mode", "auto")
+        proposed = getattr(auto_fix, "proposed", False)
         if auto_fix.skipped and auto_fix.skip_reason:
-            items.append(f"- **自律修正 skipped**: {auto_fix.skip_reason}")
+            label = "提案モード skipped" if mode == "propose" else "自律修正 skipped"
+            items.append(f"- **{label}**: {auto_fix.skip_reason}")
+        elif not auto_fix.skipped and mode == "propose" and not proposed:
+            # spec_028 §2-3 — propose generated a candidate but
+            # verification or guard rejected it. One-line note only;
+            # §B stays Phase 1 (no unverified diff in the body).
+            items.append(
+                f"- **提案モード rejected** "
+                f"(`{auto_fix.spec_auto_id or 'no spec'}`, "
+                f"template {auto_fix.template or '?'}): "
+                f"提案を生成したが検証/ガードで弾いた — "
+                f"{auto_fix.halt_reason or '理由不明'}"
+            )
         elif not auto_fix.skipped and not auto_fix.merged:
             items.append(
                 f"- **自律修正 HALT** "
@@ -830,6 +1028,11 @@ def _render_section_f(
         and not auto_fix.skipped
         and auto_fix.merged
     )
+    proposed = (
+        auto_fix is not None
+        and not auto_fix.skipped
+        and getattr(auto_fix, "proposed", False)
+    )
 
     lines = ["## F. 起きなかったこと (正直さの節)", ""]
     if phase2_merge:
@@ -838,6 +1041,23 @@ def _render_section_f(
             "**ローカル merge まで**。`origin/main` へは反映していない "
             "(spec_025 §3、安全境界レベル 2 — 論点 2: 朝に人間が diff を "
             "見て手動 push)。"
+        )
+        lines.append(
+            "- **次の発見チャンネルは走らせていない** — spec_017 は純粋な"
+            "レンダラ。チャンネル実行は別経路 (人手 / `ccd nightly`)。"
+        )
+    elif proposed:
+        lines.append(
+            "- **merge / commit / push のいずれも実行していない** — "
+            "提案モード (spec_028) は修正案を **使い捨ての隔離クローン内**で"
+            "生成・検証し、diff をパッチファイルに保存しただけ。"
+            "実 repo の作業ツリー・ブランチ・main の HEAD は無変更。"
+        )
+        lines.append(
+            "- **採用判断は人間** — `git apply` で適用するかどうか、"
+            "適用するならどの粒度で commit するかは中島さん判断。"
+            "本レポートは「動くと確認済みの修正案」を提示しただけで、"
+            "勝手に適用はしません。"
         )
         lines.append(
             "- **次の発見チャンネルは走らせていない** — spec_017 は純粋な"

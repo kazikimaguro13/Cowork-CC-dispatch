@@ -1,15 +1,31 @@
-"""ccd nightly — scheduler with optional autonomous-fix loop.
+"""ccd nightly — scheduler with optional autonomous-fix / propose loop.
 
 spec_020 wired the Phase-1 skeleton (discover → brief → mirror). spec_023
 added the **autonomous-fix loop** for template A; spec_024 extended it
 to template B; spec_025 adds the **cost / halt boundaries**
 (``docs/DESIGN.md §9.6`` 论点8) so the loop is safe to run unattended
-every night. When ``profile.safety.autonomous_fix`` is True, the
-orchestrator inserts a single-candidate fix cycle between discovery and
-the morning report:
+every night. spec_028 replaces the boolean ``profile.safety.autonomous_fix``
+gate with a 3-value ``profile.safety.fix_mode`` (``"off"`` / ``"auto"`` /
+``"propose"``). The orchestrator picks one of three behaviors after
+discovery:
 
-    discover → [select template → translate → dispatch → R5 verify →
-                R4 verify → guard → local merge] → brief
+- ``fix_mode="off"`` — discovery + morning report only. No translate,
+  no dispatch, no merge, no proposal (the spec_020 default behavior).
+- ``fix_mode="auto"`` — the spec_023〜026 autonomous-fix loop, behavior
+  unchanged from the old ``autonomous_fix=True``:
+
+      discover → [select template → translate → dispatch → R5 verify →
+                  R4 verify → guard → local merge] → brief
+
+- ``fix_mode="propose"`` — spec_028 propose mode. Translate one
+  candidate, run dispatch + R5 + R4 + guard **inside a disposable
+  isolated clone** of the live repo, capture the verified diff as a
+  patch file under ``_ai_workspace/nightly/proposals/``, surface it in
+  the morning brief with a ``git apply`` one-liner. The live working
+  tree, branches, and commits are NEVER touched — propose mode's
+  invariant is "实 repo に何も残らない". Failed verification drops the
+  proposal entirely and surfaces a one-line skip note in §D instead of
+  polluting §B with an unverified diff.
 
 The spec_025 cost/halt boundaries layered on top:
 
@@ -106,7 +122,8 @@ import json
 import os
 import shutil
 import subprocess
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -118,6 +135,7 @@ from ccd.discover import (
     DEFAULT_DISCOVER_DIR_REL,
     MutationRunner,
     MutmutRunner,
+    _isolated_clone,
     run_channel,
     run_discovery,
 )
@@ -242,6 +260,21 @@ canned GuardResult so they can pin guard-pass vs guard-HALT branches
 independently of the parser."""
 
 
+IsolatedWorkspace = Callable[[Path], Any]
+"""``(live_repo) → ContextManager[Path]`` — spec_028 propose-mode seam.
+
+Yields a disposable workspace path the propose loop runs the dispatcher,
+R5/R4 verifiers, and the guard against. The default wraps
+:func:`ccd.discover._isolated_clone` (spec_014 disposable clone with all
+git remotes stripped). Tests inject a stub that yields a tmp dir without
+copying the full tree so the live repo is provably never touched.
+
+The yielded path must be a directory that already has a ``.git``
+directory if the dispatcher / git_ops will call git inside it — the
+default ``_isolated_clone`` provides this. Tests using fake git_ops
+do not need a real git checkout."""
+
+
 class GitOps(Protocol):
     """The git operations the autonomous-fix loop needs.
 
@@ -298,7 +331,7 @@ class ChannelOutcome:
 
 @dataclass(frozen=True)
 class AutoFixOutcome:
-    """One autonomous-fix attempt's outcome (spec_023 §2-5).
+    """One autonomous-fix attempt's outcome (spec_023 §2-5; mode by spec_028).
 
     Always populated on :class:`NightlyResult` so the morning brief and
     tests can read the same shape regardless of what happened. The
@@ -306,8 +339,8 @@ class AutoFixOutcome:
     (no candidate, gate off, etc.) from "the loop ran end-to-end and
     either merged or halted".
 
-    When ``skipped`` is True, only ``skip_reason`` carries meaning;
-    other fields are zero / empty / False. When False:
+    When ``skipped`` is True, only ``skip_reason`` (and ``mode``) carry
+    meaning; other fields are zero / empty / False. When False:
 
     - ``spec_auto_id`` / ``spec_auto_path`` — the translated fix-spec.
     - ``finding_signature`` — the target mutation's signature.
@@ -317,8 +350,21 @@ class AutoFixOutcome:
     - ``r4_suite_passed`` — the full suite is green (spec §2-2).
     - ``guard_passed`` / ``guard_halt_reasons`` — static-guard verdict
       (spec §2-3).
-    - ``merged`` — local ``main`` merge happened (spec §2-4).
-    - ``halt_reason`` — non-empty iff the loop ran but did NOT merge.
+    - ``merged`` — local ``main`` merge happened (auto mode only).
+    - ``halt_reason`` — non-empty iff the loop ran but did NOT
+      merge / produce a proposal.
+
+    spec_028 adds:
+
+    - ``mode`` — ``"auto"`` (default — bit-for-bit spec_023 behavior),
+      ``"propose"`` (new), or ``"off"`` (gate off, not invoked).
+    - ``proposed`` — propose mode produced a verified proposal (R5 + R4
+      + guard all passed, diff captured).
+    - ``proposal_patch_path`` — where the patch file was written under
+      ``<live_repo>/_ai_workspace/nightly/proposals/``. ``None`` when
+      no proposal was produced (or in auto mode).
+    - ``proposal_diff`` — the verified diff embedded in the morning
+      brief's §B propose variant. Empty in auto mode.
     """
 
     skipped: bool
@@ -341,6 +387,11 @@ class AutoFixOutcome:
     # brief's Phase 2 §B (``run_brief(..., auto_fix=...)``). Empty when
     # the loop halted before the diff step or when the fix was skipped.
     merge_diff: str = ""
+    # spec_028 — mode + propose-mode artifacts.
+    mode: str = "auto"
+    proposed: bool = False
+    proposal_patch_path: Path | None = None
+    proposal_diff: str = ""
 
 
 @dataclass
@@ -407,10 +458,12 @@ def run_nightly(
     unpushed_counter: UnpushedCounter | None = None,
     unpushed_backlog_limit: int | None = None,
     dispatch_timeout_s: float | None = None,
+    # spec_028 — propose-mode workspace seam
+    isolated_workspace: IsolatedWorkspace | None = None,
 ) -> NightlyResult:
     """Drive one nightly orchestration end-to-end.
 
-    The linear flow (spec_020 + spec_023):
+    The linear flow (spec_020 + spec_023 + spec_028):
 
     1. **Profile** — accept an injected ``profile`` for tests, otherwise
        load via :func:`ccd.profile.load_profile`.
@@ -419,13 +472,17 @@ def run_nightly(
     3. **Discovery channels** — one call per enabled channel in
        ``profile.discovery.channels`` order. Per-channel halts are
        recorded but do not stop the loop.
-    4. **Autonomous-fix loop (spec_023)** — runs *only* when
-       ``profile.safety.autonomous_fix`` is True. One template-A
-       candidate per night: translate → branch → dispatch →
-       R5 (mutation killed) → R4 (suite green) → guard → local merge.
-       Any failure halts before merge; the result is recorded as
-       :class:`AutoFixOutcome`. Gate off ⇒ ``auto_fix=None``,
-       preserving the spec_020 behavior bit-for-bit.
+    4. **Fix loop** — dispatched by ``profile.safety.fix_mode``:
+
+       - ``"off"`` → ``auto_fix=None``, preserves spec_020 behavior
+         bit-for-bit (no translate / dispatch / merge).
+       - ``"auto"`` → spec_023〜026 autonomous-fix loop (translate →
+         branch → dispatch → R5 → R4 → guard → local merge). Behavior
+         bit-for-bit identical to the old ``autonomous_fix=True``.
+       - ``"propose"`` → spec_028 propose loop. Translate → run
+         dispatch + R5 + R4 + guard inside a disposable isolated clone
+         → capture diff as a patch under ``_ai_workspace/nightly/proposals/``.
+         The live working tree is NEVER written to.
     5. **Brief** — render the morning report.
     6. **Windows mirror** — copy to ``/mnt/c/...`` (soft fail).
     """
@@ -468,7 +525,8 @@ def run_nightly(
     )
 
     auto_fix: AutoFixOutcome | None = None
-    if effective_profile.safety.autonomous_fix:
+    fix_mode = effective_profile.safety.fix_mode
+    if fix_mode == "auto":
         auto_fix = _run_auto_fix_loop(
             repo=repo,
             channels=channel_outcomes,
@@ -488,6 +546,27 @@ def run_nightly(
                 if unpushed_backlog_limit is not None
                 else _AUTO_FIX_UNPUSHED_BACKLOG_LIMIT
             ),
+            dispatch_timeout_s=(
+                dispatch_timeout_s
+                if dispatch_timeout_s is not None
+                else _AUTO_FIX_DISPATCH_TIMEOUT_S
+            ),
+        )
+    elif fix_mode == "propose":
+        auto_fix = _run_propose_loop(
+            repo=repo,
+            channels=channel_outcomes,
+            fix_templates=tuple(effective_profile.safety.fix_templates),
+            today=today,
+            agent_runner=agent_runner,
+            mutation_runner=mutation_runner,
+            fix_dispatcher=fix_dispatcher,
+            suite_runner=suite_runner,
+            mutation_rechecker=mutation_rechecker,
+            adversarial_rechecker=adversarial_rechecker,
+            guard_inspector=guard_inspector,
+            git_ops=git_ops,
+            isolated_workspace=isolated_workspace,
             dispatch_timeout_s=(
                 dispatch_timeout_s
                 if dispatch_timeout_s is not None
@@ -956,6 +1035,452 @@ def _run_auto_fix_loop(
         merged=merged,
         halt_reason=halt_reason,
         merge_diff=surfaced_diff,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Propose loop (spec_028)
+# --------------------------------------------------------------------------- #
+
+
+# Where verified proposal patches land under the live repo. Per spec §2-2
+# step 4 / §6, ``_ai_workspace/nightly/proposals/`` is the recommended
+# location and the morning brief points the operator at this directory.
+_PROPOSAL_DIR_REL: Path = Path("_ai_workspace") / "nightly" / "proposals"
+
+# Halt anchors specific to propose mode. Auto-mode anchors above stay
+# unchanged so spec_023〜026 tests keep matching their exact substrings.
+_HALT_PROPOSE_DISPATCH_FAILED = "proposal dispatch failed"
+_HALT_PROPOSE_R5_FAILED = "proposal R5 failed"
+_HALT_PROPOSE_R4_FAILED = "proposal R4 failed"
+_HALT_PROPOSE_GUARD_HALT = "proposal guard halted"
+_HALT_PROPOSE_NO_DIFF = (
+    "proposal produced no diff — dispatcher did not modify the clone"
+)
+
+
+@contextmanager
+def _default_isolated_workspace(repo: Path) -> Iterator[Path]:
+    """Production default for :data:`IsolatedWorkspace` — wraps spec_014's
+    ``_isolated_clone``.
+
+    The clone copies everything under ``repo`` except the
+    ``_ISOLATION_IGNORE`` set (``_ai_workspace``, caches, venvs); git
+    remotes are stripped so the clone cannot push. Returns the clone
+    path; the caller is responsible for copying the spec_auto.md into
+    the clone explicitly (because ``_ai_workspace`` is excluded from
+    the copy).
+    """
+
+    with _isolated_clone(repo) as workspace:
+        yield workspace
+
+
+def _run_propose_loop(
+    *,
+    repo: Path,
+    channels: list[ChannelOutcome],
+    fix_templates: tuple[str, ...],
+    today: date | None,
+    agent_runner: AgentRunner | None,
+    mutation_runner: MutationRunner | None,
+    fix_dispatcher: FixDispatcher | None,
+    suite_runner: SuiteRunner | None,
+    mutation_rechecker: MutationRechecker | None,
+    adversarial_rechecker: AdversarialRechecker | None,
+    guard_inspector: GuardInspector | None,
+    git_ops: GitOps | None,
+    isolated_workspace: IsolatedWorkspace | None,
+    dispatch_timeout_s: float,
+) -> AutoFixOutcome:
+    """Drive one propose-mode attempt (spec_028 §2-2).
+
+    Mirrors :func:`_run_auto_fix_loop` but runs all the write-bearing
+    steps **inside a disposable isolated clone** of the live repo; on
+    success, captures the diff as a patch file under
+    ``<repo>/_ai_workspace/nightly/proposals/`` and returns the
+    :class:`AutoFixOutcome` with ``mode="propose"`` /
+    ``proposed=True`` / ``proposal_patch_path`` populated.
+
+    Core invariant (spec §1, §2-2): the live working tree, branches,
+    and commits are NEVER touched. All dispatch / verification /
+    guard operations target the clone; the only live-repo write is
+    the patch file under ``proposals/`` (and the spec_auto.md the
+    translator already writes to the live ``bridge/inbox/`` — that
+    is the audit trail and is shared with auto mode).
+
+    Failed verification or guard HALT → the proposal is discarded
+    (no patch written) and surfaces in §D, NOT §B. The promise of
+    propose mode is "動くと確認済みの修正案だけを出す" (spec §2-3) —
+    surfacing an unverified diff as a "proposal" would break that.
+    """
+
+    # 1. Select candidate. Same logic as auto mode (the templates
+    # filter findings, not modes).
+    template, finding, source_report, candidate_count = _select_candidate(
+        channels=channels,
+        repo=repo,
+        fix_templates=fix_templates,
+    )
+    if finding is None:
+        return AutoFixOutcome(
+            skipped=True,
+            skip_reason=_compose_no_candidate_reason(fix_templates),
+            mode="propose",
+        )
+
+    # 2. Translate against the LIVE repo. The spec_auto.md is the audit
+    # artifact even in propose mode (so the brief can link the
+    # proposal to a spec_auto_NNN.md exactly as auto mode does).
+    tr = translate_finding(
+        finding,
+        repo=repo,
+        source_report=str(source_report) if source_report else "",
+        today=today,
+    )
+    if not tr.success:
+        return AutoFixOutcome(
+            skipped=True,
+            skip_reason=tr.halt_reason,
+            finding_signature=finding.signature,
+            candidate_count=candidate_count,
+            mode="propose",
+        )
+
+    assert tr.spec_auto_path is not None  # success ⇒ path exists
+
+    # 3. Resolve seams.
+    gops = git_ops if git_ops is not None else SubprocessGitOps()
+    dispatcher = (
+        fix_dispatcher
+        if fix_dispatcher is not None
+        else _build_default_fix_dispatcher(agent_runner)
+    )
+    run_suite = suite_runner if suite_runner is not None else _default_suite_runner
+    recheck_mutation = (
+        mutation_rechecker
+        if mutation_rechecker is not None
+        else _build_default_mutation_rechecker(mutation_runner)
+    )
+    recheck_adversarial = (
+        adversarial_rechecker
+        if adversarial_rechecker is not None
+        else _default_adversarial_rechecker
+    )
+    inspect = guard_inspector if guard_inspector is not None else _default_guard_inspector
+    workspace_factory = (
+        isolated_workspace
+        if isolated_workspace is not None
+        else _default_isolated_workspace
+    )
+
+    if template == "A":
+        allowed_files = list(_AUTO_FIX_ALLOWED_FILES_A)
+    else:
+        allowed_files = [finding.file, "tests/"]
+
+    branch = f"propose/{tr.spec_auto_id}"
+
+    # 4. Enter the disposable clone. All writes from here on land in
+    # the clone, which is rmtree-d on context exit (spec_014 §2-1).
+    try:
+        with workspace_factory(repo) as clone:
+            clone_path = Path(clone)
+            spec_auto_in_clone = _copy_spec_auto_into_clone(
+                spec_auto_live=tr.spec_auto_path,
+                live_repo=repo,
+                clone=clone_path,
+            )
+
+            try:
+                gops.create_and_checkout_branch(
+                    repo=clone_path, branch=branch
+                )
+            except Exception as exc:
+                return _propose_halt_outcome(
+                    template=template,
+                    finding=finding,
+                    tr=tr,
+                    candidate_count=candidate_count,
+                    branch=branch,
+                    halt_reason=(
+                        "propose: branch creation failed in clone: "
+                        f"{type(exc).__name__}: {exc}"
+                    ),
+                )
+
+            try:
+                dispatch_outcome = _dispatch_with_timeout(
+                    dispatcher=dispatcher,
+                    spec_path=spec_auto_in_clone,
+                    repo=clone_path,
+                    branch=branch,
+                    timeout_s=dispatch_timeout_s,
+                )
+            except Exception as exc:
+                return _propose_halt_outcome(
+                    template=template,
+                    finding=finding,
+                    tr=tr,
+                    candidate_count=candidate_count,
+                    branch=branch,
+                    halt_reason=(
+                        f"{_HALT_PROPOSE_DISPATCH_FAILED}: "
+                        f"{type(exc).__name__}: {exc}"
+                    ),
+                )
+
+            dispatch_status = dispatch_outcome.status
+            if dispatch_status != "done":
+                reason = dispatch_outcome.halt_reason or "no reason"
+                return _propose_halt_outcome(
+                    template=template,
+                    finding=finding,
+                    tr=tr,
+                    candidate_count=candidate_count,
+                    branch=branch,
+                    dispatched=True,
+                    dispatch_status=dispatch_status,
+                    halt_reason=f"{_HALT_PROPOSE_DISPATCH_FAILED}: {reason}",
+                )
+
+            # 5. R5 — same verifier as auto, but pointed at the clone.
+            r5_killed, _r5_status = _verify_r5(
+                template=template,
+                finding=finding,
+                recheck_mutation=recheck_mutation,
+                recheck_adversarial=recheck_adversarial,
+                repo=clone_path,
+            )
+
+            # 6. R4 — full suite green in the clone.
+            try:
+                suite_outcome = run_suite(repo=clone_path)
+                r4_passed = bool(suite_outcome.passed)
+            except Exception:
+                r4_passed = False
+
+            # 7. Guard — capture the diff against ``main`` in the clone,
+            # then run the same inspector auto mode uses.
+            diff_text = ""
+            try:
+                diff_text = gops.diff(
+                    repo=clone_path, base="main", head=branch
+                )
+                guard_result = inspect(
+                    diff=diff_text,
+                    allowed_files=allowed_files,
+                    template=template,
+                )
+                guard_passed = bool(guard_result.passed)
+                guard_reasons = tuple(guard_result.halt_reasons)
+            except Exception as exc:
+                guard_passed = False
+                guard_reasons = (
+                    f"guard inspection failed: {type(exc).__name__}: {exc}",
+                )
+
+            # 8. Decide: propose the diff or HALT (no patch saved).
+            if not (r5_killed and r4_passed and guard_passed):
+                halt_reason = _compose_propose_halt_reason(
+                    r5_killed=r5_killed,
+                    r4_passed=r4_passed,
+                    guard_passed=guard_passed,
+                    guard_reasons=guard_reasons,
+                )
+                return AutoFixOutcome(
+                    skipped=False,
+                    spec_auto_id=tr.spec_auto_id,
+                    spec_auto_path=tr.spec_auto_path,
+                    finding_signature=finding.signature,
+                    candidate_count=candidate_count,
+                    template=template,
+                    branch=branch,
+                    dispatched=True,
+                    dispatch_status=dispatch_status,
+                    r5_killed=r5_killed,
+                    r4_suite_passed=r4_passed,
+                    guard_passed=guard_passed,
+                    guard_halt_reasons=guard_reasons,
+                    merged=False,
+                    halt_reason=halt_reason,
+                    mode="propose",
+                    proposed=False,
+                )
+
+            # 9. Diff must be non-empty — a "verified proposal" with no
+            # actual changes is incoherent (guard would normally catch
+            # this via R0, but defend in depth).
+            if not diff_text.strip():
+                return AutoFixOutcome(
+                    skipped=False,
+                    spec_auto_id=tr.spec_auto_id,
+                    spec_auto_path=tr.spec_auto_path,
+                    finding_signature=finding.signature,
+                    candidate_count=candidate_count,
+                    template=template,
+                    branch=branch,
+                    dispatched=True,
+                    dispatch_status=dispatch_status,
+                    r5_killed=r5_killed,
+                    r4_suite_passed=r4_passed,
+                    guard_passed=guard_passed,
+                    guard_halt_reasons=guard_reasons,
+                    merged=False,
+                    halt_reason=_HALT_PROPOSE_NO_DIFF,
+                    mode="propose",
+                    proposed=False,
+                )
+
+            # 10. Save the patch — the only live-repo write of propose
+            # mode (and it lands under ``_ai_workspace/`` which is
+            # gitignored, so the live git state is untouched).
+            patch_path = _save_proposal_patch(
+                live_repo=repo,
+                spec_auto_id=tr.spec_auto_id,
+                diff_text=diff_text,
+                today=today,
+            )
+
+            return AutoFixOutcome(
+                skipped=False,
+                spec_auto_id=tr.spec_auto_id,
+                spec_auto_path=tr.spec_auto_path,
+                finding_signature=finding.signature,
+                candidate_count=candidate_count,
+                template=template,
+                branch=branch,
+                dispatched=True,
+                dispatch_status=dispatch_status,
+                r5_killed=r5_killed,
+                r4_suite_passed=r4_passed,
+                guard_passed=guard_passed,
+                guard_halt_reasons=guard_reasons,
+                merged=False,
+                halt_reason="",
+                mode="propose",
+                proposed=True,
+                proposal_patch_path=patch_path,
+                proposal_diff=diff_text,
+            )
+    except Exception as exc:
+        return _propose_halt_outcome(
+            template=template,
+            finding=finding,
+            tr=tr,
+            candidate_count=candidate_count,
+            branch=branch,
+            halt_reason=(
+                f"propose: workspace setup failed: "
+                f"{type(exc).__name__}: {exc}"
+            ),
+        )
+
+
+def _copy_spec_auto_into_clone(
+    *,
+    spec_auto_live: Path,
+    live_repo: Path,
+    clone: Path,
+) -> Path:
+    """Copy the translated spec_auto.md from the live ``bridge/inbox/``
+    into the clone's matching location.
+
+    Necessary because ``_isolated_clone`` excludes ``_ai_workspace`` (the
+    clone never inherits the live bridge content). Returns the in-clone
+    path the dispatcher should be pointed at.
+    """
+
+    try:
+        rel = spec_auto_live.relative_to(live_repo)
+    except ValueError:
+        rel = Path("_ai_workspace") / "bridge" / "inbox" / spec_auto_live.name
+    target = clone / rel
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(spec_auto_live, target)
+    return target
+
+
+def _save_proposal_patch(
+    *,
+    live_repo: Path,
+    spec_auto_id: str,
+    diff_text: str,
+    today: date | None,
+) -> Path:
+    """Write the verified diff under ``_ai_workspace/nightly/proposals/``.
+
+    Filename includes both the date and the spec_auto id so multiple
+    proposals on the same day (rare under the weekly cadence, possible
+    under nightly) don't collide. Adds a trailing newline if the diff
+    didn't already have one — ``git apply`` tolerates either, but a
+    canonical newline keeps editor diffs clean.
+    """
+
+    today_d = today if today is not None else _utc_today()
+    proposals_dir = live_repo / _PROPOSAL_DIR_REL
+    proposals_dir.mkdir(parents=True, exist_ok=True)
+    patch_path = proposals_dir / (
+        f"proposal_{today_d.isoformat()}_{spec_auto_id}.patch"
+    )
+    body = diff_text if diff_text.endswith("\n") else diff_text + "\n"
+    patch_path.write_text(body, encoding="utf-8")
+    return patch_path
+
+
+def _compose_propose_halt_reason(
+    *,
+    r5_killed: bool,
+    r4_passed: bool,
+    guard_passed: bool,
+    guard_reasons: tuple[str, ...],
+) -> str:
+    """Compose the §D one-liner when propose verification failed.
+
+    Mirrors :func:`_compose_halt_reason` but uses propose-specific
+    anchors so the brief can distinguish "auto loop halted before
+    merge" from "propose loop generated a candidate but verification
+    rejected it".
+    """
+
+    parts: list[str] = []
+    if not guard_passed:
+        suffix = f": {guard_reasons[0]}" if guard_reasons else ""
+        parts.append(f"{_HALT_PROPOSE_GUARD_HALT}{suffix}")
+    if not r5_killed:
+        parts.append(_HALT_PROPOSE_R5_FAILED)
+    if not r4_passed:
+        parts.append(_HALT_PROPOSE_R4_FAILED)
+    return "; ".join(parts) or "propose: verification failed"
+
+
+def _propose_halt_outcome(
+    *,
+    template: str,
+    finding: Finding,
+    tr: Any,
+    candidate_count: int,
+    branch: str,
+    halt_reason: str,
+    dispatched: bool = False,
+    dispatch_status: str = "",
+) -> AutoFixOutcome:
+    """Build a propose-mode HALT outcome (no merge, no proposal)."""
+
+    return AutoFixOutcome(
+        skipped=False,
+        spec_auto_id=tr.spec_auto_id,
+        spec_auto_path=tr.spec_auto_path,
+        finding_signature=finding.signature,
+        candidate_count=candidate_count,
+        template=template,
+        branch=branch,
+        dispatched=dispatched,
+        dispatch_status=dispatch_status,
+        merged=False,
+        halt_reason=halt_reason,
+        mode="propose",
+        proposed=False,
     )
 
 
@@ -1776,6 +2301,7 @@ __all__ = [
     "FixDispatcher",
     "GitOps",
     "GuardInspector",
+    "IsolatedWorkspace",
     "MutationRechecker",
     "NightlyResult",
     "SubprocessGitOps",
