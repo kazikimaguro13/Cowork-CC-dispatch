@@ -428,22 +428,96 @@ def test_cli_profile_invalid_toml_exits_non_zero(
 
 
 # --------------------------------------------------------------------------- #
-# Phase 2 — safety.autonomous_fix gate (spec_023)
+# Phase 2 — safety.fix_mode gate (spec_023 → 3-value by spec_028)
 # --------------------------------------------------------------------------- #
 
 
-def test_safety_default_is_autonomous_fix_off() -> None:
-    """An absent profile / freshly-built ``Profile()`` must default to
-    ``safety.autonomous_fix=False`` (spec_023 §2-1 论点1: safe default)."""
+def test_safety_default_fix_mode_is_off() -> None:
+    """spec_028 §2-1: an absent profile / freshly-built ``Profile()``
+    must default to ``safety.fix_mode="off"`` (safe — newly configured
+    profiles do not auto-fix and do not produce proposals by surprise)."""
 
     profile = Profile()
 
-    assert profile.safety.autonomous_fix is False
+    assert profile.safety.fix_mode == "off"
 
 
-def test_safety_autonomous_fix_can_be_enabled_via_toml(tmp_path: Path) -> None:
-    """Operator opts in by writing ``[safety]\\nautonomous_fix = true`` —
-    the loader must surface that as ``profile.safety.autonomous_fix=True``."""
+def test_safety_fix_mode_auto_via_toml(tmp_path: Path) -> None:
+    """spec_028: operator opts into auto by writing
+    ``fix_mode = "auto"`` — the loader surfaces it on ``safety.fix_mode``."""
+
+    profile_path = tmp_path / "_ai_workspace" / "ccd_profile.toml"
+    profile_path.parent.mkdir(parents=True)
+    profile_path.write_text(
+        dedent(
+            """
+            [safety]
+            fix_mode = "auto"
+            """
+        ).strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    profile = load_profile(tmp_path)
+
+    assert profile.safety.fix_mode == "auto"
+
+
+def test_safety_fix_mode_propose_via_toml(tmp_path: Path) -> None:
+    """spec_028: ``fix_mode = "propose"`` is accepted."""
+
+    profile_path = tmp_path / "_ai_workspace" / "ccd_profile.toml"
+    profile_path.parent.mkdir(parents=True)
+    profile_path.write_text(
+        dedent(
+            """
+            [safety]
+            fix_mode = "propose"
+            """
+        ).strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    profile = load_profile(tmp_path)
+
+    assert profile.safety.fix_mode == "propose"
+
+
+def test_safety_fix_mode_unknown_value_raises_value_error(
+    tmp_path: Path,
+) -> None:
+    """spec_028 §2-1: unknown ``fix_mode`` values must error (no silent
+    fallback to default)."""
+
+    profile_path = tmp_path / "_ai_workspace" / "ccd_profile.toml"
+    profile_path.parent.mkdir(parents=True)
+    profile_path.write_text(
+        dedent(
+            """
+            [safety]
+            fix_mode = "suggest"
+            """
+        ).strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError) as excinfo:
+        load_profile(tmp_path)
+
+    assert "suggest" in str(excinfo.value)
+
+
+def test_safety_legacy_autonomous_fix_field_now_rejected(
+    tmp_path: Path,
+) -> None:
+    """spec_028 §2-1: the boolean ``autonomous_fix`` field was removed
+    (no backwards-compatible alias). Any TOML still carrying it must
+    surface as a clear load error via ``extra="forbid"`` so the
+    migration is loud rather than silent. This pin keeps the
+    'migration leak' from regressing into a silent ignore."""
 
     profile_path = tmp_path / "_ai_workspace" / "ccd_profile.toml"
     profile_path.parent.mkdir(parents=True)
@@ -458,9 +532,10 @@ def test_safety_autonomous_fix_can_be_enabled_via_toml(tmp_path: Path) -> None:
         encoding="utf-8",
     )
 
-    profile = load_profile(tmp_path)
+    with pytest.raises(ValueError) as excinfo:
+        load_profile(tmp_path)
 
-    assert profile.safety.autonomous_fix is True
+    assert "autonomous_fix" in str(excinfo.value)
 
 
 def test_safety_unknown_subfield_raises_value_error(tmp_path: Path) -> None:
@@ -474,7 +549,7 @@ def test_safety_unknown_subfield_raises_value_error(tmp_path: Path) -> None:
         dedent(
             """
             [safety]
-            autonomous_fix = true
+            fix_mode = "auto"
             push = "yes-please"
             """
         ).strip()
@@ -500,17 +575,17 @@ def test_safety_section_appears_in_render_profile(
     assert rc == 0
     out = capsys.readouterr().out
     assert "[safety]" in out
-    assert "autonomous_fix = false" in out
+    assert 'fix_mode = "off"' in out
 
 
-def test_safety_section_renders_true_when_enabled(
+def test_safety_section_renders_fix_mode_when_enabled(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     profile_path = tmp_path / "_ai_workspace" / "ccd_profile.toml"
     profile_path.parent.mkdir(parents=True)
     profile_path.write_text(
-        "[safety]\nautonomous_fix = true\n",
+        '[safety]\nfix_mode = "auto"\n',
         encoding="utf-8",
     )
 
@@ -518,7 +593,7 @@ def test_safety_section_renders_true_when_enabled(
 
     assert rc == 0
     out = capsys.readouterr().out
-    assert "autonomous_fix = true" in out
+    assert 'fix_mode = "auto"' in out
 
 
 # --------------------------------------------------------------------------- #
@@ -547,7 +622,7 @@ def test_safety_fix_templates_a_and_b_enable_template_b(tmp_path: Path) -> None:
         dedent(
             """
             [safety]
-            autonomous_fix = true
+            fix_mode = "auto"
             fix_templates = ["A", "B"]
             """
         ).strip()
@@ -558,7 +633,7 @@ def test_safety_fix_templates_a_and_b_enable_template_b(tmp_path: Path) -> None:
     profile = load_profile(tmp_path)
 
     assert profile.safety.fix_templates == ["A", "B"]
-    assert profile.safety.autonomous_fix is True
+    assert profile.safety.fix_mode == "auto"
 
 
 def test_safety_fix_templates_unknown_value_raises_value_error(
@@ -589,8 +664,8 @@ def test_safety_fix_templates_unknown_value_raises_value_error(
 def test_safety_fix_templates_empty_list_raises_value_error(
     tmp_path: Path,
 ) -> None:
-    """An empty list is rejected — disable the loop via ``autonomous_fix
-    = false``, not by stripping the template list."""
+    """An empty list is rejected — disable the loop via
+    ``fix_mode = "off"`` (spec_028), not by stripping the template list."""
 
     profile_path = tmp_path / "_ai_workspace" / "ccd_profile.toml"
     profile_path.parent.mkdir(parents=True)
@@ -860,8 +935,9 @@ def test_schedule_cadence_missing_in_toml_yields_weekly_default(
 ) -> None:
     """**Backward-compatibility pin** (spec_027 §4): a TOML written
     against spec_018–026 (no ``cadence`` field) must load cleanly and
-    end up with ``cadence="weekly"``. This is the existing deployed
-    ``_ai_workspace/ccd_profile.toml`` shape — it must not break."""
+    end up with ``cadence="weekly"``. spec_028 updates this fixture to
+    use ``fix_mode = "auto"`` (the post-spec_028 shape of the deployed
+    ``_ai_workspace/ccd_profile.toml``)."""
 
     profile_path = tmp_path / "_ai_workspace" / "ccd_profile.toml"
     profile_path.parent.mkdir(parents=True)
@@ -878,7 +954,7 @@ def test_schedule_cadence_missing_in_toml_yields_weekly_default(
             nightly_at = "02:00"
 
             [safety]
-            autonomous_fix = true
+            fix_mode = "auto"
             fix_templates = ["A"]
             """
         ).strip()
@@ -1035,7 +1111,7 @@ def test_render_profile_round_trip_preserves_schedule(tmp_path: Path) -> None:
             weekly_day = "Saturday"
 
             [safety]
-            autonomous_fix = true
+            fix_mode = "auto"
             fix_templates = ["A", "B"]
             """
         ).strip()

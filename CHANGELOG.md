@@ -2,6 +2,99 @@
 
 本プロジェクトの注目すべき変更を記録する。フォーマットは [Keep a Changelog](https://keepachangelog.com/) に準ずる。
 
+## [0.17.0] — 2026-05-25
+
+spec_028 — **v2 Phase 3 の 2 本目の spec**。Phase 2（spec_021〜026）で自律修正ループが完成し、spec_027 で **週次ケイデンス**が入った後、Phase 3 の 2 本目として **提案モード（`fix_mode="propose"`）** を導入する（minor bump = 新機能）。
+
+経緯: Phase 2 完成版の挙動は「発見 → 修正 → ガード → 検証 → **ローカル merge**」。これは CCD 自身に対しては妥当だが、**クライアント施策の repo に勝手に merge させるのは強すぎる**。一方で「問題を見つけて報告するだけ」では物足りない ── 「ここが問題、こう直すといい」という**修正案まで**出してほしい（中島さんの希望）。そこで **3 つ目のモード「提案（propose）」** を入れる ── 隔離クローン内で修正案を生成し、R5/R4/ガードを通したうえで朝レポートに **diff + `git apply` ワンライナー + パッチファイル**を載せる。**適用はしない**（merge / commit / push のいずれもしない）。
+
+これで CCD のモードは 3 つ:
+
+| モード | 挙動 | 想定ティア |
+|---|---|---|
+| `auto` | 発見→修正→検証→ガード→**ローカル merge**（適用する） | 第 1 ティア（CCD 自身） |
+| `propose` | 発見→修正案生成→検証→ガード→**レポートに diff**（適用しない） | クライアント施策 |
+| `off` | 発見→報告のみ | 最小構成 |
+
+### Changed (BREAKING — schema migration)
+
+- **`SafetyConfig.autonomous_fix` (bool) を `SafetyConfig.fix_mode` (str 3 値) に置き換え**（spec_028 §2-1）:
+  - 新フィールド: `fix_mode: str = "off"`、許容値 `KNOWN_FIX_MODES = ("auto", "propose", "off")`、不正値は `field_validator` で `ValueError`。
+  - **default は `"off"`**（安全側 ── 新規プロファイルは勝手に修正も提案もしない）。
+  - **旧 `autonomous_fix` フィールドは削除**（後方互換エイリアスなし）── `extra="forbid"` なので旧フィールドが TOML に残っていれば明示エラーになり、移行漏れが顕在化する。これは意図どおりの「うるさい移行」。
+  - 移行マッピング: 旧 `autonomous_fix = true` → 新 `fix_mode = "auto"`、旧 `autonomous_fix = false` → 新 `fix_mode = "off"`。意味論的に等価。
+  - 検証用プロファイル `_ai_workspace/ccd_profile.toml` を `fix_mode = "auto"` に追従（さもないと次回 `ccd nightly` 実走でロードエラー）。
+  - `render_profile` の `[safety]` セクションも `autonomous_fix = ...` を `fix_mode = "..."` に差し替え。
+- **`pyproject.toml` / `ccd/__init__.py` version `0.16.0` → `0.17.0`**（新機能 = minor bump、spec §2-5）。
+- **`tests/test_smoke.py::test_version_is_0160` → `test_version_is_0170`**、assert を `"0.17.0"` に。
+
+### Added
+
+- **`ccd/nightly.py` に提案モード (`_run_propose_loop`) を追加**（spec_028 §2-2）:
+  - `run_nightly` が `profile.safety.fix_mode` の 3 値で分岐: `"off"` → 何もしない（spec_020 挙動を bit-for-bit 維持）/ `"auto"` → 既存 `_run_auto_fix_loop`（挙動不変・merge する）/ `"propose"` → 新規 `_run_propose_loop`（merge しない）。
+  - **propose loop の核心**: 発見→翻訳までは auto と共有（`_select_candidate` / `translate_finding` は両モード共通）。その後 **`_isolated_clone` (spec_014 の使い捨てクローン) の中で**修正係を dispatch し、R5/R4/guard を**クローン内のパス**に対して走らせる。検証＋ガードが通れば、`git diff main..<branch>` を採取して `<live_repo>/_ai_workspace/nightly/proposals/proposal_YYYY-MM-DD_<spec_auto_id>.patch` に保存。クローンは context-manager exit で破棄。
+  - **核心の不変条件**: 提案モード実行後、**実 repo にはブランチも未コミット変更も一切残らない**。クローンに対する `create_and_checkout_branch` / `dispatch` / `diff` / `merge` 系のすべての書き込みは破棄される。実 repo への唯一の書き込みはパッチファイル 1 件（gitignored な `_ai_workspace/` 配下）。
+  - **検証/ガード失敗時**: 提案を破棄（パッチ書き出しなし、merge も呼ばない）。`AutoFixOutcome.proposed=False`、`halt_reason` に「proposal guard halted」「proposal R5 failed」「proposal R4 failed」等の anchor 文字列。朝レポート §D で 1 行表示される。
+  - **既存コスト境界**: dispatch 実時間上限 40 分・`PAUSE` キルスイッチ・「発見ゼロは正常終了」は propose モードでも有効（同じ `_dispatch_with_timeout` を流用、`PAUSE` は `run_nightly` の入口で短絡）。**未 push バックログ停止 (spec_025 (b)) は auto 専用のまま** ── propose モードは merge しないので未 push の自律修正が溜まらない（テストで pin）。
+- **`AutoFixOutcome` に 4 フィールド追加**:
+  - `mode: str = "auto"` ── `"auto"` / `"propose"` / (skipped の場合は) `"off"`。auto モード既存挙動は default で carry。
+  - `proposed: bool = False` ── propose モードが verified proposal を生成した。
+  - `proposal_patch_path: Path | None = None` ── 保存されたパッチファイルの絶対パス（`<live_repo>/_ai_workspace/nightly/proposals/...`）。
+  - `proposal_diff: str = ""` ── 朝レポート §B 提案版に埋め込む verified diff。
+  - 既存フィールド・既存テスト（spec_023〜026）に対しては default 値で carry されるので bit-for-bit 不変。
+- **`IsolatedWorkspace` seam を追加** ── `Callable[[Path], ContextManager[Path]]`。production default は `_default_isolated_workspace`（`ccd.discover._isolated_clone` をそのままラップ）。テストは fake factory を注入して使い捨てクローンの中身を制御。
+- **`ccd/brief.py` に §B 提案版 (`_render_section_b_propose`) を追加**（spec_028 §2-3）:
+  - `auto_fix.proposed=True` のとき §B を提案版に切り替え: テンプレ / signature / spec_auto / branch (クローン内) / R5/R4/ガード / **`proposal_diff` 埋め込み** / **`git apply` ワンライナー** / **パッチファイルパス**。
+  - `auto_fix.proposed=False`（propose ループ走ったが verification 弾いた）のとき: §B は Phase 1 版のまま、§D に「**提案モード rejected** (...): 提案を生成したが検証/ガードで弾いた — 〜」の 1 行のみ。**unverified な diff は §B body に絶対出さない**（spec §2-3「動くと確認済みの修正案だけを出す」）。
+  - §A 一行判定にも propose 用ヘッドラインを追加（merged / proposed / HALT / skipped の 4 状態を区別）。
+  - §F honesty section に提案モード専用の文言を追加（「merge / commit / push のいずれも実行していない」「採用判断は人間」）。
+  - **auto モードの §B Phase 2 版（spec_025）は不変** ── テスト `test_phase2_auto_brief_unchanged_by_spec_028` で構造的に pin。
+- **`ccd/cli.py` の `ccd nightly` stdout** に propose 用の 3 行を追加: `propose: proposed <spec_auto_id> (patch=..., signature=...)` / `propose: HALT ... — <reason>` / `propose: skipped (...)`。auto モードの既存 3 行は不変。
+
+### Added (tests)
+
+- **`tests/test_profile.py` (+5 件)**:
+  - `test_safety_default_fix_mode_is_off` ── default が `"off"`
+  - `test_safety_fix_mode_auto_via_toml` / `test_safety_fix_mode_propose_via_toml` ── 各値の受理
+  - `test_safety_fix_mode_unknown_value_raises_value_error` ── 不正値で `ValueError`
+  - **`test_safety_legacy_autonomous_fix_field_now_rejected`** ── 旧 `autonomous_fix` TOML は `extra="forbid"` で明示エラー（移行漏れ pin）
+  - 既存 5 件は `fix_mode` 化に追従して書き換え（`test_safety_section_appears_in_render_profile` の assert を `'fix_mode = "off"'` 等に更新）。
+- **`tests/test_nightly.py` (+12 件)** ── 注入ベース（実 mutmut / claude / git を動かさない）:
+  - `test_propose_mode_happy_path_writes_patch_without_touching_live` ── happy path 全部入り pin（**実 repo のブランチ・top-level tree が実行前と同一**を構造的に assert）
+  - `test_propose_mode_skipped_when_no_candidate` / `test_propose_mode_off_fix_mode_no_loop_runs`
+  - `test_propose_mode_guard_halt_drops_proposal_and_writes_no_patch` ── guard HALT で **merge ゼロ・パッチゼロ・§D 情報のみ**
+  - `test_propose_mode_r5_fail_drops_proposal` / `test_propose_mode_r4_fail_drops_proposal` / `test_propose_mode_dispatch_failed_drops_proposal`
+  - `test_propose_mode_never_calls_merge_or_unpushed_counter` ── spec_025 (b) は auto 専用、propose は consult しない
+  - `test_propose_mode_template_b_happy_path` ── 敵対的 finding でも propose 経路が回る
+  - `test_propose_mode_cli_stdout_surfaces_propose_line` ── `ccd nightly` stdout に `propose: proposed` が出る
+  - `test_propose_mode_passes_finding_to_brief` ── `AutoFixOutcome` が `auto_fix=...` 経由で brief に届く
+  - `test_propose_default_isolated_workspace_is_disposable_clone` ── production default seam が `_isolated_clone` を包んで使い捨て / yields a fresh tmp dir / exit で rmtree
+  - 既存 71 件は不変で green。auto モードの 4 経路 (PAUSE / merged / HALT / skipped) shape は spec_023〜026 のまま。
+- **`tests/test_brief.py` (+5 件)**:
+  - `test_section_b_propose_rendered_when_proposed` ── 修正案・diff・R-evidence・`git apply` ワンライナー・パッチパスが §B に出る、§F に「merge していない」
+  - `test_section_b_propose_includes_apply_command_with_repo` ── `git -C <abs_repo> apply <abs_patch>` 形式
+  - `test_section_d_includes_rejected_proposal_one_liner` ── 弾かれた夜は §B は Phase 1、§D に 1 行
+  - `test_section_a_surfaces_propose_headline` ── §A の一行判定にも propose ヘッドライン
+  - `test_phase2_auto_brief_unchanged_by_spec_028` ── auto モードの §B Phase 2 版は不変 pin（push origin main 健在 / git apply は出ない）
+
+### Constraints (spec §3)
+
+- **触ってよい**: `ccd/profile.py`（`fix_mode` 化）/ `ccd/nightly.py`（モード分岐 + 提案ループ）/ `ccd/brief.py`（§B 提案版 + §D）/ `ccd/cli.py`（stdout + seam 配線）/ `_ai_workspace/ccd_profile.toml`（`fix_mode="auto"` 追従）/ `tests/` / `CHANGELOG.md` / `pyproject.toml` / `ccd/__init__.py` ── すべて遵守。
+- **触ってはいけない（コアロジック）**: `ccd/{models,protocol,dispatch,chain,integrate,metrics,dashboard,run_writer,retry,backfill,agent,retrospect,discover,adversarial,ai_review,translate,guard}.py` ── すべて遵守（1 行も touch していない）。特に:
+  - **`ccd/translate.py` 不変** ── `spec_auto` の中身はモード非依存（auto も propose も同じ修正指示を使う、spec §3 逐語遵守）。
+  - **`ccd/guard.py` 不変** ── 提案モードでもガードは同じものを diff に対して走らせる（強制であって指示でない、の思想は不変）。
+  - **`ccd/discover.py` 不変** ── 隔離クローンのヘルパ `_isolated_clone` を `nightly.py` から **import するだけ**（spec §3 で明示的に許可された使い方）。共有モジュールへの切り出しは行わなかった ── import で十分（Open question 1 参照）。
+- **`docs/`** / **`docs/data/*.json`** ── 触っていない。Phase 3 全体の `docs/DESIGN.md` 更新は別 spec の責務（spec_027 の補足 6 と同じ精神）。
+- 安全境界レベル 2 は不変 ── 提案モードは merge も push もしない（auto モードの merge も従来どおり push しない）。`GitOps` Protocol に push 系が無い構造も不変。
+- 既存サブコマンド・既存挙動（特に `fix_mode="auto"` ＝旧 `autonomous_fix=True` の経路）は bit-for-bit 不変 ── spec_023〜026 の既存テスト 71 件が無修正 (autonomous_fix → fix_mode の API 移行のみ) で green。
+
+### Verification
+
+- **`pytest -q`**: **541 passed** in ≈25s（spec_027 時点の 524 件から、profile 既存の `autonomous_fix` 5 件を `fix_mode` 5 件に置き換え + 5 新規 propose 関連 / nightly +12 propose / brief +5 propose で正味 +17）。spec_013〜027 の既存テストはすべて不変で green。smoke の version assert 1 件は rename + 文字列差し替え。
+- **`ruff check .`**: `All checks passed!`。
+- **`python3 -m ccd --version`** → `ccd 0.17.0`（smoke の subprocess テストが確認）。
+
+
 ## [0.16.0] — 2026-05-25
 
 spec_027 — **v2 Phase 3 の最初の spec**。Phase 2 (spec_021〜026) で自律修正ループが完成し、`ccd nightly` の end-to-end 実走で「ループが自分のテスト隙間を発見し、正しい修正を書き、ガード・検証を通してローカル merge する」ところまで実証できた次の段として、**ケイデンス（実行頻度）** をプロファイルに導入する（minor bump = 新機能）。

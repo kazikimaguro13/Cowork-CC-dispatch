@@ -470,6 +470,8 @@ def main(
     unpushed_counter: Any | None = None,
     unpushed_backlog_limit: int | None = None,
     dispatch_timeout_s: float | None = None,
+    # spec_028 — propose-mode workspace seam (forwarded to ``ccd nightly``).
+    isolated_workspace: Any | None = None,
 ) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -507,6 +509,7 @@ def main(
             unpushed_counter=unpushed_counter,
             unpushed_backlog_limit=unpushed_backlog_limit,
             dispatch_timeout_s=dispatch_timeout_s,
+            isolated_workspace=isolated_workspace,
         )
     if args.command == "guard":
         return _cmd_guard(args)
@@ -780,6 +783,7 @@ def _cmd_nightly(
     unpushed_counter: Any | None = None,
     unpushed_backlog_limit: int | None = None,
     dispatch_timeout_s: float | None = None,
+    isolated_workspace: Any | None = None,
 ) -> int:
     repo = _resolve_repo(args.repo)
     profile_path = getattr(args, "profile_path", None)
@@ -801,6 +805,7 @@ def _cmd_nightly(
         unpushed_counter=unpushed_counter,
         unpushed_backlog_limit=unpushed_backlog_limit,
         dispatch_timeout_s=dispatch_timeout_s,
+        isolated_workspace=isolated_workspace,
     )
 
     # spec_025 §2-1(c) — PAUSE short-circuit. Surface the pause and
@@ -816,18 +821,36 @@ def _cmd_nightly(
 
     if result.auto_fix is not None:
         af = result.auto_fix
-        if af.skipped:
-            print(f"auto-fix: skipped ({af.skip_reason or 'no reason'})")
-        elif af.merged:
-            print(
-                f"auto-fix: merged {af.spec_auto_id} "
-                f"(branch={af.branch}, signature={af.finding_signature})"
-            )
+        if af.mode == "propose":
+            label = "propose"
+            if af.skipped:
+                print(f"{label}: skipped ({af.skip_reason or 'no reason'})")
+            elif af.proposed:
+                print(
+                    f"{label}: proposed {af.spec_auto_id} "
+                    f"(patch={af.proposal_patch_path}, "
+                    f"signature={af.finding_signature})"
+                )
+            else:
+                print(
+                    f"{label}: HALT {af.spec_auto_id} "
+                    f"(branch={af.branch}) — "
+                    f"{af.halt_reason or 'no reason'}"
+                )
         else:
-            print(
-                f"auto-fix: HALT {af.spec_auto_id} "
-                f"(branch={af.branch}) — {af.halt_reason or 'no reason'}"
-            )
+            if af.skipped:
+                print(f"auto-fix: skipped ({af.skip_reason or 'no reason'})")
+            elif af.merged:
+                print(
+                    f"auto-fix: merged {af.spec_auto_id} "
+                    f"(branch={af.branch}, signature={af.finding_signature})"
+                )
+            else:
+                print(
+                    f"auto-fix: HALT {af.spec_auto_id} "
+                    f"(branch={af.branch}) — "
+                    f"{af.halt_reason or 'no reason'}"
+                )
 
     if result.brief_report_wsl is not None:
         print(f"morning report (wsl):     {result.brief_report_wsl}")
