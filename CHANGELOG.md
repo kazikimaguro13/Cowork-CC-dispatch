@@ -2,6 +2,66 @@
 
 本プロジェクトの注目すべき変更を記録する。フォーマットは [Keep a Changelog](https://keepachangelog.com/) に準ずる。
 
+## [0.14.0] — 2026-05-25
+
+v2 Phase 2 のリスク傾斜後半 — spec_024。spec_023 で**テンプレ A（ミューテーション → test-only）**の自律修正ループが点火・実証された次の段として、**テンプレ B（敵対的入力の ungraceful クラッシュ → 本番コード修正＋再現テスト）** を自律化（`docs/DESIGN.md §9.5/§9.7`）。テンプレ B は**本番コードに触る**ため A より一段リスクが高い ── だから A が信用できてから点火する（§9.7 リスク傾斜）。
+
+実弾：Phase 1 で敵対的入力チャンネルが発見した `UnicodeDecodeError` 漏洩（4 パーサすべてが `read_text(encoding="utf-8")` を wrap していない）。これがテンプレ B が直す最初の対象。
+
+段階有効化：**プロファイル `safety.fix_templates` で対象テンプレを `["A"]` / `["A", "B"]` と指定可能**。既定は安全側（`["A"]` のみ）── 新規リポジトリでは `autonomous_fix=true` にしてもテンプレ B は走らない、operator が明示的に `["A", "B"]` に書き換えてから点火する設計（论点1 tier × §9.7 リスク傾斜）。
+
+テンプレ A→B の優先順位：両テンプレ有効でも **A 優先**（test-only は構造的に安全）── A 候補があれば A、なければ B にフォールスルー。B 候補は朝レポートに必ず surface、明日の夜に拾える。
+
+「**優雅に失敗させる**のであって**成功させる**ではない」── テンプレ B の最重要制約。修正後のパーサが当該の壊れた入力を**黙って受理**したら R5 は失敗（`graceful_success` ≠ `graceful_error`）。
+
+### Added
+
+- **`ccd/translate.py` 拡張** — テンプレ B（spec_024）。
+  - **エントリ関数の振り分け** — `finding.channel` でテンプレを選ぶ。`"mutation"` → テンプレ A、`"adversarial"` → テンプレ B、その他 → 報告専用降格。各テンプレは独立した fit-check (`_why_template_*_does_not_fit`) + レンダラ (`_render_template_*`) を持ち、一方が他方を流用しない（後で片方の制約が変わっても他方が誤って影響を受けない）。
+  - **`Finding` 拡張** — `parser` / `case_name` / `exception_type` / `exception_message` の 4 フィールドを optional で追加（既定 `""`）。mutation 用 Finding はこれらが空のまま spec_022 と shape 不変。adversarial 用は `Finding._from_adversarial_dict(payload, source_report=...)` で `discover_NNN.json` の `findings` エントリから組み立てる ── `file` は `parser` の dotted-name から `_parser_dotted_to_file` で導出（`ccd.protocol.parse_spec` → `ccd/protocol.py`）、`line=0`、`status="ungraceful"` を埋める。
+  - **テンプレ B 本文構造** — テンプレ A と同じ 7 セクション骨格、内容はテンプレ B 用:
+    1. **§1 文脈** — parser × case × exception_type、exception_message を引用、現行 main で再現する事実を明記。
+    2. **§2 やってほしいこと** — (1) `<file>` の `<parser>` を修正、許可リスト例外をクリーンに raise、(2) 再現テストを 1 本だけ追加（黙って受理は禁止）。
+    3. **§3 制約（テンプレ B 逐語）** — 5 つの制約をモジュール定数 `_CONSTRAINT_B_GRACEFUL_FAIL_NOT_ACCEPT` / `_CONSTRAINT_B_REPRODUCER_GATE` / `_CONSTRAINT_B_EXISTING_TESTS_IMMUTABLE` / `_CONSTRAINT_B_NO_SKIP_MARKERS` / `_CONSTRAINT_B_ALLOWED_SET` から逐語で焼き込み。`test_template_b_constraint_phrases_are_verbatim` がモジュール定数と spec 本文の包含関係を直接 assert（一方を書き換えるともう一方とズレてテストが赤くなる）。
+    4. **§4 検証要件** — 再現テスト fail-then-pass / 黙って受理しない / `pytest -q` 緑 / `ruff check .` clean / `ccd guard --template B --allowed <file> tests/` HALT-free（R3＝本番 diff サイズ上限あり）。
+    5. **§5 許可ファイル集合** — `<file>` ＋ `tests/` の 2 つのみ、`<file>` 以外の `ccd/` 配下のすべての本番コードを禁止。
+    6. **§6 出力先** — `_ai_workspace/bridge/outbox/result_auto_NNN.md`（A と同形）。
+    7. **§7 メタ情報** — provenance（signature・parser・case・exception）、別名前空間・AI 不使用。
+  - **`_parser_dotted_to_file`** — dotted-name → 源ファイル path 変換（`ccd.protocol.parse_spec` → `ccd/protocol.py`）。失敗時（空 / dot なし / 空セグメント）は `""` を返してテンプレ B の fit-check で halt。
+- **`ccd/profile.py` 拡張** — `safety.fix_templates` 段階有効化（spec_024）。
+  - **`SafetyConfig.fix_templates: list[str] = ["A"]`** — `["A"]`（既定）/ `["A", "B"]` / `["B"]` を受ける、空リスト / 重複 / 未知の文字（`"Q"`）は ValueError。`KNOWN_FIX_TEMPLATES = ("A", "B")` を module-level constant に。
+  - **既定 `["A"]`** ── 新規プロファイルは template B 無効、operator が明示的に `["A", "B"]` に書き換えてから B が走る（论点1 tier × §9.7 リスク傾斜の実装）。
+  - **`render_profile` 拡張** — `[safety]` セクションに `fix_templates = ["A"]` を追加。
+- **`ccd/nightly.py` 拡張** — テンプレ B 経路 + R5 検証 + ガード設定。
+  - **`AdversarialRechecker` 型 + seam** — テンプレ B の R5 verification。`(repo, parser, case_name) → "graceful_error" | "graceful_success" | "ungraceful" | "unknown"` の 4 値分類。**`"graceful_error"` のみ R5 pass** ── `"graceful_success"`（黙って受理、spec_024 §3 禁止）と `"ungraceful"`（まだ壊れている）と `"unknown"`（parser/case が見つからない、保守的に halt）はすべて R5 失敗。
+  - **`_default_adversarial_rechecker`** — `ccd.adversarial.default_cases()` から fixture を再構成して `default_parsers()` の named parser を in-process で呼ぶ。`GRACEFUL_EXCEPTIONS` → `graceful_error`、`UNGRACEFUL_OVERRIDES`（UnicodeError 系）→ `ungraceful`、その他 `Exception` → `ungraceful`、例外なし → `graceful_success`。実 mutmut / 実 claude / live-repo write 一切なし。
+  - **`_run_auto_fix_loop` 拡張** — `fix_templates: tuple[str, ...]` を引数に。`_select_candidate` が priority order（A→B）で候補を選ぶ ── A 有効かつ候補あれば A、なければ B 有効かつ候補あれば B。**A 優先**: test-only は構造的に安全、B 候補は朝レポートに retained。
+  - **`_select_template_b_candidate`** — 候補解決順序: ① adversarial channel outcome の `report_json_path` → ② `<repo>/_ai_workspace/discover/discover_*.json` のうち `channel="adversarial"` を持つ最新。`findings` リストを舐めて pre-filter（parser / case_name / exception_type / file 全部非空）を通る最初の 1 件。
+  - **`_latest_discover_json(want_channel=...)`** — disk fallback が channel を判別。mutation JSON（top-level `channel` キーなし）と adversarial JSON（`channel: "adversarial"`）を取り違えない ── これがないと sequence number が高い adversarial JSON が誤って mutation 候補解決の入力になりうる（`test_disk_fallback_distinguishes_mutation_vs_adversarial_json` で pin）。
+  - **テンプレ別の allowed_files / R3** — テンプレ A は `_AUTO_FIX_ALLOWED_FILES_A = ("tests/",)` 固定、テンプレ B は `[finding.file, "tests/"]` 動的、`guard_inspector(..., template=template)` で R3（本番 diff サイズ上限）が template="B" 時のみ enforced。
+  - **`_verify_r5` template-aware** — テンプレ A は `mutation_rechecker(...)` → `"killed"`、テンプレ B は `adversarial_rechecker(...)` → `"graceful_error"`。各テンプレが自分の R5 を呼ぶ。
+  - **HALT 文言の固定 anchor 拡張** — `_HALT_R5_FAILED_B`（"adversarial case did not become a graceful error"）/ `_HALT_R5_FAILED_B_SILENT`（"parser silently accepted the broken input"、spec_024 §3 明示）/ `_HALT_NO_CANDIDATE`（template-A-only の歴史的 anchor を保持、A+B の場合は `_compose_no_candidate_reason` が "template-A or template-B" を生成）。
+  - **`AutoFixOutcome.template`** ── `"A"` / `"B"` を埋める（spec_023 で常に `"A"` だったのを動的化）。
+- **`ccd/cli.py` 拡張** — `main()` / `_cmd_nightly` シグネチャに `adversarial_rechecker: Any | None = None` を追加。既存 5 seam (`fix_dispatcher` / `suite_runner` / `mutation_rechecker` / `guard_inspector` / `git_ops`) と同じ流儀で `ccd nightly` に forward。CLI からは `cli.main(..., adversarial_rechecker=...)` で注入、production CLI 利用では自動的に default が使われる。`auto-fix:` stdout 行の shape は不変。
+- **`tests/test_translate.py` (+15 件、31 件 → 46 件)** ── テンプレ B happy path / verbatim constraints / dict input / 採番 / 決定性 / 降格（parser/case/exception missing、unparseable parser）/ `parse_spec` round-trip / `_parser_dotted_to_file` 4 known parsers + 4 broken shapes / A→B sequence sharing。
+- **`tests/test_nightly.py` (+12 件、34 件 → 46 件)** ── テンプレ B の gate（A only でスキップ）/ happy path（B merge）/ R5 silent_success halt / R5 ungraceful halt / guard R3 halt with B template / guard R1 halt with named-file allowed-set / A priority over B / B fallthrough when no A / B-only no-candidate / disk fallback by channel / 1晩1候補 / default adversarial rechecker 4 分類。
+- **`tests/test_profile.py` (+7 件、26 件 → 33 件)** ── `fix_templates` default `["A"]` / `["A", "B"]` enable / unknown letter ValueError / empty list ValueError / duplicate ValueError / `[safety]` render に `fix_templates = ["A"]` / 両テンプレ enable で render に `["A", "B"]`。
+
+### Changed
+
+- `pyproject.toml` / `ccd/__init__.py` version `0.13.0` → **`0.14.0`**（**新機能 = minor bump**、spec §2-5）。
+- `tests/test_smoke.py::test_version_is_0130` → **`test_version_is_0140`**、assert を `0.14.0` に。
+
+### Constraints (spec §3)
+
+- **触ってよい**: `ccd/translate.py`（テンプレ B 追加）、`ccd/nightly.py`（テンプレ B 経路 + adversarial_rechecker seam）、`ccd/profile.py`（`SafetyConfig.fix_templates`、`KNOWN_FIX_TEMPLATES`）、`ccd/cli.py`（adversarial_rechecker seam forwarding）、`tests/test_translate.py` / `tests/test_nightly.py` / `tests/test_profile.py` / `tests/test_smoke.py`、`CHANGELOG.md`、`pyproject.toml`、`ccd/__init__.py`。
+- **触っていない**: `ccd/{models,protocol,dispatch,chain,integrate,metrics,dashboard,run_writer,retry,backfill,agent,retrospect,discover,adversarial,ai_review,brief,guard}.py` のコアロジックは **1 行も変更していない**（spec §3 で明示）。再利用は import 経由のみ（`run_channel` / `dispatch_with_retry` / `inspect_diff` / `translate_finding` / `parse_spec` / `MutmutRunner` / `run_discovery` / `default_parsers` / `default_cases` / `GRACEFUL_EXCEPTIONS` / `UNGRACEFUL_OVERRIDES` を読み取りのみ）。`docs/` も触らない。
+- **テンプレ A（spec_023）の挙動は不変** ── spec_013〜023 の既存 427 テストはすべて green。default `Profile()` は `safety.fix_templates=["A"]` を持ち、spec_023 の loop は同じ shape で走る。
+- **`spec_024` 自身（CC の今回の dispatch）はパーサのコードを書き換えない** ── ループ機構を作るだけ。実弾の `protocol.py` / `run_writer.py` の UnicodeDecodeError 漏洩は、本 spec 完了後にプロファイルを `["A", "B"]` に切り替えた `ccd nightly` の実行が（spec_auto 経由で）直す（spec §3 注）。
+- 安全境界レベル2：**ローカル merge まで、push しない**。`GitOps` Protocol が push 系メソッドを持たないので構造的に push 不能（spec_023 から継承）。
+- **テストで実 mutmut・実 claude を呼ばない** — テンプレ B の R5 は `_FakeAdversarialRechecker` で注入、production default は `default_parsers` / `default_cases` を import して in-process で呼ぶだけ（subprocess なし）。
+- すべて**追加のみ**。ローカル commit のみ、**push しない／ブランチ操作・merge しない**（spec §3）。
+
 ## [0.13.0] — 2026-05-25
 
 v2 Phase 2 の本丸 — spec_023。spec_021 で**インチキ修正ガード**（`ccd/guard.py`）、spec_022 で**翻訳器**（`ccd/translate.py`）が揃った次の段として、**自律修正ループを閉じる** ── 発見を無人で直す `[発見]→[翻訳]→[修正]→[検証]→[ローカルmerge]→[朝レポート]` を `ccd nightly` に組み込む（`docs/DESIGN.md §9.5/§9.7`）。

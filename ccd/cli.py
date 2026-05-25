@@ -462,6 +462,8 @@ def main(
     fix_dispatcher: Any | None = None,
     suite_runner: Any | None = None,
     mutation_rechecker: Any | None = None,
+    # spec_024 — template-B R5 seam (forwarded to ``ccd nightly``).
+    adversarial_rechecker: Any | None = None,
     guard_inspector: Any | None = None,
     git_ops: Any | None = None,
 ) -> int:
@@ -495,6 +497,7 @@ def main(
             fix_dispatcher=fix_dispatcher,
             suite_runner=suite_runner,
             mutation_rechecker=mutation_rechecker,
+            adversarial_rechecker=adversarial_rechecker,
             guard_inspector=guard_inspector,
             git_ops=git_ops,
         )
@@ -764,6 +767,7 @@ def _cmd_nightly(
     fix_dispatcher: Any | None = None,
     suite_runner: Any | None = None,
     mutation_rechecker: Any | None = None,
+    adversarial_rechecker: Any | None = None,
     guard_inspector: Any | None = None,
     git_ops: Any | None = None,
 ) -> int:
@@ -781,6 +785,7 @@ def _cmd_nightly(
         fix_dispatcher=fix_dispatcher,
         suite_runner=suite_runner,
         mutation_rechecker=mutation_rechecker,
+        adversarial_rechecker=adversarial_rechecker,
         guard_inspector=guard_inspector,
         git_ops=git_ops,
     )

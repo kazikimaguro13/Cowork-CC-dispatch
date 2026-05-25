@@ -516,3 +516,151 @@ def test_safety_section_renders_true_when_enabled(
     assert rc == 0
     out = capsys.readouterr().out
     assert "autonomous_fix = true" in out
+
+
+# --------------------------------------------------------------------------- #
+# Phase 2 — safety.fix_templates staged enablement (spec_024)
+# --------------------------------------------------------------------------- #
+
+
+def test_safety_fix_templates_default_is_a_only() -> None:
+    """spec_024 §2-3: 'A を一定期間信用してから B を足す'. The default
+    must keep template B disabled so a freshly-built ``Profile()`` runs
+    only the structurally-safest autonomous edit (test-only)."""
+
+    profile = Profile()
+
+    assert profile.safety.fix_templates == ["A"]
+
+
+def test_safety_fix_templates_a_and_b_enable_template_b(tmp_path: Path) -> None:
+    """Operator opts into template B by writing
+    ``fix_templates = ["A", "B"]`` — the loader must preserve order so
+    the loop's priority (A before B) stays as written."""
+
+    profile_path = tmp_path / "_ai_workspace" / "ccd_profile.toml"
+    profile_path.parent.mkdir(parents=True)
+    profile_path.write_text(
+        dedent(
+            """
+            [safety]
+            autonomous_fix = true
+            fix_templates = ["A", "B"]
+            """
+        ).strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    profile = load_profile(tmp_path)
+
+    assert profile.safety.fix_templates == ["A", "B"]
+    assert profile.safety.autonomous_fix is True
+
+
+def test_safety_fix_templates_unknown_value_raises_value_error(
+    tmp_path: Path,
+) -> None:
+    """An unknown template letter (``"Q"``) must error rather than be
+    silently dropped — same pattern as the discovery-channels validator."""
+
+    profile_path = tmp_path / "_ai_workspace" / "ccd_profile.toml"
+    profile_path.parent.mkdir(parents=True)
+    profile_path.write_text(
+        dedent(
+            """
+            [safety]
+            fix_templates = ["A", "Q"]
+            """
+        ).strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError) as excinfo:
+        load_profile(tmp_path)
+
+    assert "Q" in str(excinfo.value)
+
+
+def test_safety_fix_templates_empty_list_raises_value_error(
+    tmp_path: Path,
+) -> None:
+    """An empty list is rejected — disable the loop via ``autonomous_fix
+    = false``, not by stripping the template list."""
+
+    profile_path = tmp_path / "_ai_workspace" / "ccd_profile.toml"
+    profile_path.parent.mkdir(parents=True)
+    profile_path.write_text(
+        dedent(
+            """
+            [safety]
+            fix_templates = []
+            """
+        ).strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError) as excinfo:
+        load_profile(tmp_path)
+
+    assert "at least one template" in str(excinfo.value)
+
+
+def test_safety_fix_templates_duplicate_raises_value_error(
+    tmp_path: Path,
+) -> None:
+    """``["A", "A"]`` is a typo, not intent — reject so the operator
+    notices and rewrites."""
+
+    profile_path = tmp_path / "_ai_workspace" / "ccd_profile.toml"
+    profile_path.parent.mkdir(parents=True)
+    profile_path.write_text(
+        dedent(
+            """
+            [safety]
+            fix_templates = ["A", "A"]
+            """
+        ).strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError) as excinfo:
+        load_profile(tmp_path)
+
+    assert "duplicate" in str(excinfo.value)
+
+
+def test_safety_fix_templates_appears_in_render_profile(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """``ccd profile`` surfaces the staged-enablement knob alongside the
+    gate so an operator can copy-paste the block as a starting point."""
+
+    rc = cli.main(["profile", "--repo", str(tmp_path)])
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "[safety]" in out
+    assert 'fix_templates = ["A"]' in out
+
+
+def test_safety_fix_templates_renders_with_both_when_enabled(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    profile_path = tmp_path / "_ai_workspace" / "ccd_profile.toml"
+    profile_path.parent.mkdir(parents=True)
+    profile_path.write_text(
+        '[safety]\nfix_templates = ["A", "B"]\n',
+        encoding="utf-8",
+    )
+
+    rc = cli.main(["profile", "--repo", str(tmp_path)])
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert 'fix_templates = ["A", "B"]' in out

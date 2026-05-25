@@ -1,16 +1,28 @@
 """ccd nightly — scheduler with optional autonomous-fix loop.
 
 spec_020 wired the Phase-1 skeleton (discover → brief → mirror). spec_023
-adds the **autonomous-fix loop** (论点 of `docs/DESIGN.md §9.5/§9.7`):
-when ``profile.safety.autonomous_fix`` is True, the orchestrator inserts a
+added the **autonomous-fix loop** for template A; spec_024 extends it to
+template B (论点 of `docs/DESIGN.md §9.5/§9.7`). When
+``profile.safety.autonomous_fix`` is True, the orchestrator inserts a
 single-candidate fix cycle between discovery and the morning report:
 
-    discover → [translate → dispatch → R5 verify → R4 verify → guard →
-                local merge] → brief
+    discover → [select template → translate → dispatch → R5 verify →
+                R4 verify → guard → local merge] → brief
 
-The loop is **template A only** (mutation-survivor → test-only fix) ──
-template B is spec_024. Safety-boundary level 2: local ``main`` merge,
-**no push**.
+The templates the loop is allowed to process are controlled by
+``profile.safety.fix_templates`` (default ``["A"]``, spec_024 §2-3 staged
+enablement):
+
+- **Template A** (mutation-survivor → test-only fix) — `_AUTO_FIX_ALLOWED_FILES
+  = ("tests/",)`. R5 = the target mutant is now killed. Structurally safest
+  (cannot touch production code).
+- **Template B** (adversarial ungraceful crash → production-fix +
+  reproducer test) — allowed = one named production file + ``tests/``,
+  R3 (production-diff bound) is enforced. R5 = the broken input now
+  produces a CCD allow-listed exception (NOT silent acceptance, NOT the
+  original ungraceful crash).
+
+Safety-boundary level 2: local ``main`` merge, **no push**.
 
 The gate is a per-profile field (spec_018 → spec_023): the default profile
 is OFF so any newly-configured repo only does Phase 1 discovery + report.
@@ -31,11 +43,11 @@ What ``run_nightly`` does NOT do
 - It does not retry the same candidate (论点4 layer 5 — 1 try, then halt
   and ask a human). Re-discovery the next night picks up survivors again,
   but the loop is not allowed to keep banging on the same finding.
-- It does not implement template B. Template-B findings (adversarial
-  ungraceful crashes) flow through translate as "not fitting template A"
-  and stay report-only here.
 - It does not run mutmut / claude / pytest in tests — the seams below
   let tests inject fakes. Production defaults shell out.
+- It does not enable templates the profile didn't opt into. A profile
+  with ``fix_templates=["A"]`` never picks up adversarial findings even
+  when they are present in discover JSON.
 
 Injection seams (tests / future)
 --------------------------------
@@ -48,8 +60,12 @@ Injection seams (tests / future)
   the spec_auto. Default wraps :func:`ccd.retry.dispatch_with_retry`.
 - ``suite_runner`` — R4 (full suite green). Default shells out to
   ``pytest -q``.
-- ``mutation_rechecker`` — R5 (target mutation now killed). Default runs
-  the production mutation channel against the target file alone.
+- ``mutation_rechecker`` — R5 for template A (target mutation now killed).
+  Default runs the production mutation channel against the target file
+  alone.
+- ``adversarial_rechecker`` — R5 for template B (the broken input now
+  produces a graceful error, *not* silent acceptance). Default re-runs
+  the named parser against the named adversarial case (spec_024).
 - ``guard_inspector`` — wraps :func:`ccd.guard.inspect_diff`. Tests can
   substitute one that returns a canned GuardResult.
 - ``git_ops`` — the four git operations the loop needs (create branch,
@@ -151,10 +167,32 @@ stay green after the fix lands. Default shells out to ``pytest -q``."""
 MutationRechecker = Callable[..., str]
 """``(repo, file, line, mutation, signature) → "killed"|"survived"|"unknown"``.
 
-R5 (spec_023 §2-2): the target mutant — identified by signature — must
-have flipped from ``survived`` to ``killed`` after the fix lands. The
-default runs the production mutation channel against the target file
-alone (spec_019's iso-venv) and reads the cache for the signature."""
+R5 for template A (spec_023 §2-2): the target mutant — identified by
+signature — must have flipped from ``survived`` to ``killed`` after the
+fix lands. The default runs the production mutation channel against the
+target file alone (spec_019's iso-venv) and reads the cache for the
+signature."""
+
+
+AdversarialRechecker = Callable[..., str]
+"""``(repo, parser, case_name) → "graceful_error"|"graceful_success"|"ungraceful"|"unknown"``.
+
+R5 for template B (spec_024 §2-2): the target (parser × adversarial case)
+must now produce a **graceful error** — a CCD allow-listed exception
+(``ValueError`` / ``pydantic.ValidationError`` / ``json.JSONDecodeError`` /
+``FileNotFoundError``). The other three statuses all fail R5:
+
+- ``"graceful_success"`` — the parser silently accepted the broken input
+  (spec_024 §3 forbids this; the fix must error, not succeed).
+- ``"ungraceful"`` — the original crash (or a different ungraceful
+  exception) still leaks.
+- ``"unknown"`` — the rechecker could not locate the parser/case (parser
+  name mistyped, fixture catalog drifted) — loop halts conservatively.
+
+The default rebuilds the named fixture from ``ccd.adversarial.default_cases()``
+and calls the named parser in-process. False positives are preferred over
+false negatives — when in doubt, return ``"unknown"`` and let the loop
+halt."""
 
 
 GuardInspector = Callable[..., GuardResult]
@@ -303,6 +341,8 @@ def run_nightly(
     fix_dispatcher: FixDispatcher | None = None,
     suite_runner: SuiteRunner | None = None,
     mutation_rechecker: MutationRechecker | None = None,
+    # spec_024 — template B R5 seam
+    adversarial_rechecker: AdversarialRechecker | None = None,
     guard_inspector: GuardInspector | None = None,
     git_ops: GitOps | None = None,
 ) -> NightlyResult:
@@ -359,12 +399,14 @@ def run_nightly(
         auto_fix = _run_auto_fix_loop(
             repo=repo,
             channels=channel_outcomes,
+            fix_templates=tuple(effective_profile.safety.fix_templates),
             today=today,
             agent_runner=agent_runner,
             mutation_runner=mutation_runner,
             fix_dispatcher=fix_dispatcher,
             suite_runner=suite_runner,
             mutation_rechecker=mutation_rechecker,
+            adversarial_rechecker=adversarial_rechecker,
             guard_inspector=guard_inspector,
             git_ops=git_ops,
         )
@@ -481,46 +523,70 @@ def _coerce_path(p: Any) -> Path | None:
 # Anchor strings for the morning brief / tests to grep for. Lifted to
 # module-level constants so a rename is one place, mirroring the
 # constraint-phrase pattern in ccd/translate.py.
+# Kept as the historical spec_023 anchor (test still pins this exact
+# substring for template-A only profiles). Composed via
+# ``_compose_no_candidate_reason`` to extend cleanly to template B.
 _HALT_NO_CANDIDATE = "no template-A candidate available"
 _HALT_GUARD_HALT = "guard halted the fix"
 _HALT_R5_FAILED = "R5 failed: target mutation not killed"
+_HALT_R5_FAILED_B = (
+    "R5 failed: adversarial case did not become a graceful error"
+)
+_HALT_R5_FAILED_B_SILENT = (
+    "R5 failed: parser silently accepted the broken input "
+    "(spec_024 §3 — fix must error gracefully, not succeed)"
+)
 _HALT_R4_FAILED = "R4 failed: full suite not green"
 _HALT_DISPATCH_FAILED = "dispatch failed"
-_AUTO_FIX_ALLOWED_FILES: tuple[str, ...] = ("tests/",)
+
+# Template A allowed-file set (test-only). Fixed at module level so the
+# loop physically cannot be coerced to widen it for template A — template
+# B computes its allowed set dynamically from the finding's target file.
+_AUTO_FIX_ALLOWED_FILES_A: tuple[str, ...] = ("tests/",)
+
+# spec_022 kept the constant name ``_AUTO_FIX_ALLOWED_FILES``. We keep the
+# old name pointing at template A's set as a backwards-compatible alias so
+# any downstream debug code referencing it still works; new code should
+# use ``_AUTO_FIX_ALLOWED_FILES_A`` for explicit-ness.
+_AUTO_FIX_ALLOWED_FILES = _AUTO_FIX_ALLOWED_FILES_A
 
 
 def _run_auto_fix_loop(
     *,
     repo: Path,
     channels: list[ChannelOutcome],
+    fix_templates: tuple[str, ...],
     today: date | None,
     agent_runner: AgentRunner | None,
     mutation_runner: MutationRunner | None,
     fix_dispatcher: FixDispatcher | None,
     suite_runner: SuiteRunner | None,
     mutation_rechecker: MutationRechecker | None,
+    adversarial_rechecker: AdversarialRechecker | None,
     guard_inspector: GuardInspector | None,
     git_ops: GitOps | None,
 ) -> AutoFixOutcome:
-    """Drive one template-A autonomous-fix attempt (spec_023 §2-1〜§2-4).
+    """Drive one autonomous-fix attempt (spec_023 §2-1〜§2-4 + spec_024).
 
     Returns an :class:`AutoFixOutcome` describing exactly what happened:
     skipped (no candidate / translate downgrade), dispatched + halted at
     R4/R5/guard, or dispatched + merged.
 
-    One candidate per night (论点3): the first actionable mutation finding
-    that fits template A. The remaining findings stay in the discover JSON
-    and surface in the morning brief.
+    One candidate per night (论点3): the first finding that fits one of
+    the enabled templates, in priority order (A before B — test-only is
+    structurally safer than production-fix). Remaining findings stay in
+    discover JSON and surface in the morning brief.
     """
 
-    finding, source_report, candidate_count = _select_template_a_candidate(
+    template, finding, source_report, candidate_count = _select_candidate(
         channels=channels,
         repo=repo,
+        fix_templates=fix_templates,
     )
     if finding is None:
         return AutoFixOutcome(
             skipped=True,
-            skip_reason=_HALT_NO_CANDIDATE,
+            skip_reason=_compose_no_candidate_reason(fix_templates),
         )
 
     # 1. Translate
@@ -553,7 +619,21 @@ def _run_auto_fix_loop(
         if mutation_rechecker is not None
         else _build_default_mutation_rechecker(mutation_runner)
     )
+    recheck_adversarial = (
+        adversarial_rechecker
+        if adversarial_rechecker is not None
+        else _default_adversarial_rechecker
+    )
     inspect = guard_inspector if guard_inspector is not None else _default_guard_inspector
+
+    # Per-template guard config
+    if template == "A":
+        allowed_files = list(_AUTO_FIX_ALLOWED_FILES_A)
+    else:  # "B"
+        # Allow the named production file + tests/ — and only those. The
+        # guard's R3 (production-diff bound) is in effect for template B
+        # so a sprawling diff inside the named file still halts.
+        allowed_files = [finding.file, "tests/"]
 
     # 3. Branch
     branch = f"auto/{tr.spec_auto_id}"
@@ -566,7 +646,7 @@ def _run_auto_fix_loop(
             spec_auto_path=tr.spec_auto_path,
             finding_signature=finding.signature,
             candidate_count=candidate_count,
-            template="A",
+            template=template,
             branch=branch,
             halt_reason=f"branch creation failed: {type(exc).__name__}: {exc}",
         )
@@ -586,7 +666,7 @@ def _run_auto_fix_loop(
             spec_auto_path=tr.spec_auto_path,
             finding_signature=finding.signature,
             candidate_count=candidate_count,
-            template="A",
+            template=template,
             branch=branch,
             dispatched=False,
             halt_reason=(
@@ -606,25 +686,21 @@ def _run_auto_fix_loop(
             spec_auto_path=tr.spec_auto_path,
             finding_signature=finding.signature,
             candidate_count=candidate_count,
-            template="A",
+            template=template,
             branch=branch,
             dispatched=True,
             dispatch_status=dispatch_status,
             halt_reason=f"{_HALT_DISPATCH_FAILED}: {reason}",
         )
 
-    # 5. R5: target mutation now killed?
-    try:
-        recheck_status = recheck_mutation(
-            repo=repo,
-            file=finding.file,
-            line=finding.line,
-            mutation=finding.mutation,
-            signature=finding.signature,
-        )
-    except Exception as exc:
-        recheck_status = f"error: {type(exc).__name__}: {exc}"
-    r5_killed = recheck_status == "killed"
+    # 5. R5: template-specific verification
+    r5_killed, r5_status = _verify_r5(
+        template=template,
+        finding=finding,
+        recheck_mutation=recheck_mutation,
+        recheck_adversarial=recheck_adversarial,
+        repo=repo,
+    )
 
     # 6. R4: full suite green?
     try:
@@ -638,8 +714,8 @@ def _run_auto_fix_loop(
         diff_text = gops.diff(repo=repo, base="main", head=branch)
         guard_result = inspect(
             diff=diff_text,
-            allowed_files=list(_AUTO_FIX_ALLOWED_FILES),
-            template="A",
+            allowed_files=allowed_files,
+            template=template,
         )
         guard_passed = bool(guard_result.passed)
         guard_reasons = tuple(guard_result.halt_reasons)
@@ -662,7 +738,9 @@ def _run_auto_fix_loop(
             )
     else:
         halt_reason = _compose_halt_reason(
+            template=template,
             r5_killed=r5_killed,
+            r5_status=r5_status,
             r4_passed=r4_passed,
             guard_passed=guard_passed,
             guard_reasons=guard_reasons,
@@ -677,7 +755,7 @@ def _run_auto_fix_loop(
         spec_auto_path=tr.spec_auto_path,
         finding_signature=finding.signature,
         candidate_count=candidate_count,
-        template="A",
+        template=template,
         branch=branch,
         dispatched=True,
         dispatch_status=dispatch_status,
@@ -688,6 +766,104 @@ def _run_auto_fix_loop(
         merged=merged,
         halt_reason=halt_reason,
     )
+
+
+def _verify_r5(
+    *,
+    template: str,
+    finding: Finding,
+    recheck_mutation: MutationRechecker,
+    recheck_adversarial: AdversarialRechecker,
+    repo: Path,
+) -> tuple[bool, str]:
+    """Run the template-specific R5 verification.
+
+    Returns ``(passed, status)`` — ``status`` is the raw rechecker output
+    (or an error sentinel) so the morning brief can show *why* R5 failed
+    (e.g. ``"graceful_success"`` ≠ ``"ungraceful"``, both fail R5 but for
+    structurally different reasons).
+    """
+
+    if template == "A":
+        try:
+            status = recheck_mutation(
+                repo=repo,
+                file=finding.file,
+                line=finding.line,
+                mutation=finding.mutation,
+                signature=finding.signature,
+            )
+        except Exception as exc:
+            return False, f"error: {type(exc).__name__}: {exc}"
+        return status == "killed", status
+
+    # template == "B"
+    try:
+        status = recheck_adversarial(
+            repo=repo,
+            parser=finding.parser,
+            case_name=finding.case_name,
+        )
+    except Exception as exc:
+        return False, f"error: {type(exc).__name__}: {exc}"
+    # ONLY "graceful_error" passes — "graceful_success" is silent
+    # acceptance (spec_024 §3 forbids it).
+    return status == "graceful_error", status
+
+
+def _select_candidate(
+    *,
+    channels: list[ChannelOutcome],
+    repo: Path,
+    fix_templates: tuple[str, ...],
+) -> tuple[str, Finding | None, Path | None, int]:
+    """Pick the first candidate honoring the profile's enabled templates.
+
+    Returns ``(template, finding, source_path, total_actionable_count)``.
+    ``finding`` is ``None`` when no enabled template has a candidate
+    available; the caller distinguishes that case via the missing finding.
+
+    Priority order is **A before B**: template A is structurally safer
+    (cannot touch production code), so when both are enabled we exhaust A
+    candidates before considering B. This matches spec_024 §2-3's "A を
+    一定期間信用してから B を足す" intent — even with B enabled, we don't
+    starve A.
+    """
+
+    if "A" in fix_templates:
+        finding_a, source_a, count_a = _select_template_a_candidate(
+            channels=channels,
+            repo=repo,
+        )
+        if finding_a is not None:
+            return "A", finding_a, source_a, count_a
+
+    if "B" in fix_templates:
+        finding_b, source_b, count_b = _select_template_b_candidate(
+            channels=channels,
+            repo=repo,
+        )
+        if finding_b is not None:
+            return "B", finding_b, source_b, count_b
+
+    return "", None, None, 0
+
+
+def _compose_no_candidate_reason(fix_templates: tuple[str, ...]) -> str:
+    """Build the "no candidate available" skip reason.
+
+    Composes a reason that names *which* templates were attempted so the
+    morning brief can distinguish "loop tried A and there was nothing"
+    from "loop tried A+B and both came up empty". For backwards
+    compatibility with spec_023 tests, the template-A-only case still
+    surfaces the historical exact phrase ``_HALT_NO_CANDIDATE``.
+    """
+
+    if fix_templates == ("A",):
+        return _HALT_NO_CANDIDATE
+    parts = [f"template-{t}" for t in fix_templates]
+    joined = " or ".join(parts)
+    return f"no {joined} candidate available"
 
 
 def _select_template_a_candidate(
@@ -750,41 +926,157 @@ def _resolve_mutation_report_path(
     channels: list[ChannelOutcome],
     repo: Path,
 ) -> Path | None:
-    """Find the mutation channel's discover JSON, falling back to disk."""
+    """Find the mutation channel's discover JSON, falling back to disk.
+
+    Disk fallback only picks files whose contents announce ``channel ==
+    "mutation"`` (mutation JSONs do not carry a top-level ``channel`` key
+    in the spec_013 schema, so we conservatively treat the *absence* of a
+    ``channel`` key as "mutation" since adversarial JSON explicitly sets
+    ``channel: "adversarial"``). That keeps an adversarial latest report
+    from being mistaken for a mutation report under fallback.
+    """
 
     for co in channels:
         if co.channel == "mutation" and co.report_json_path is not None:
             return co.report_json_path
 
+    return _latest_discover_json(repo=repo, want_channel="mutation")
+
+
+def _select_template_b_candidate(
+    *,
+    channels: list[ChannelOutcome],
+    repo: Path,
+) -> tuple[Finding | None, Path | None, int]:
+    """Pick the first template-B candidate from this night's findings.
+
+    Mirrors :func:`_select_template_a_candidate` but reads the adversarial
+    channel's discover JSON (``findings`` list instead of ``actionable``).
+    Returns ``(finding, source_path, total_finding_count)``. Pre-filters on
+    the obvious required fields (parser / case / exception_type / file)
+    so an ill-shaped entry doesn't consume the night's slot.
+    """
+
+    source = _resolve_adversarial_report_path(channels=channels, repo=repo)
+    if source is None or not source.exists():
+        return None, None, 0
+
+    try:
+        payload = json.loads(source.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None, source, 0
+
+    findings = payload.get("findings") or []
+    if not isinstance(findings, list):
+        return None, source, 0
+
+    count = len(findings)
+    for entry in findings:
+        if not isinstance(entry, dict):
+            continue
+        finding = Finding.from_dict(
+            entry,
+            channel="adversarial",
+            source_report=str(source),
+        )
+        # Mirror translate's _why_template_b_does_not_fit so a half-shaped
+        # entry never consumes the spec_auto seq.
+        if (
+            finding.parser
+            and finding.case_name
+            and finding.exception_type
+            and finding.file
+        ):
+            return finding, source, count
+
+    return None, source, count
+
+
+def _resolve_adversarial_report_path(
+    *,
+    channels: list[ChannelOutcome],
+    repo: Path,
+) -> Path | None:
+    """Find the adversarial channel's discover JSON, falling back to disk."""
+
+    for co in channels:
+        if co.channel == "adversarial" and co.report_json_path is not None:
+            return co.report_json_path
+
+    return _latest_discover_json(repo=repo, want_channel="adversarial")
+
+
+def _latest_discover_json(*, repo: Path, want_channel: str) -> Path | None:
+    """Walk ``_ai_workspace/discover/`` and return the latest JSON whose
+    contents match ``want_channel``.
+
+    "match" means: top-level ``channel`` key equals ``want_channel`` for
+    adversarial; or absent (mutation JSON has no such key) for mutation.
+    Files that fail to load JSON-cleanly are skipped (not raised) — the
+    loop runs as best-effort.
+    """
+
     discover_dir = repo / DEFAULT_DISCOVER_DIR_REL
     if not discover_dir.exists():
         return None
-    latest: tuple[int, Path] | None = None
+    matches: list[tuple[int, Path]] = []
     for p in discover_dir.glob("discover_*.json"):
         m = p.stem.removeprefix("discover_")
         if not m.isdigit():
             continue
         n = int(m)
-        if latest is None or n > latest[0]:
-            latest = (n, p)
-    return latest[1] if latest is not None else None
+        try:
+            payload = json.loads(p.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        channel = payload.get("channel")
+        if want_channel == "mutation":
+            # Mutation JSONs have no top-level "channel" key (spec_013).
+            if channel is not None and channel != "mutation":
+                continue
+        else:
+            if channel != want_channel:
+                continue
+        matches.append((n, p))
+    if not matches:
+        return None
+    matches.sort(key=lambda t: t[0])
+    return matches[-1][1]
 
 
 def _compose_halt_reason(
     *,
+    template: str,
     r5_killed: bool,
+    r5_status: str,
     r4_passed: bool,
     guard_passed: bool,
     guard_reasons: tuple[str, ...],
 ) -> str:
-    """Build the morning-brief-friendly halt reason for a non-merged fix."""
+    """Build the morning-brief-friendly halt reason for a non-merged fix.
+
+    Template A surfaces the spec_023 anchor ``_HALT_R5_FAILED`` ("target
+    mutation not killed"). Template B distinguishes silent acceptance
+    (the parser succeeded, spec_024 §3 says this is forbidden) from
+    "still ungraceful / unknown" — both fail R5 but for structurally
+    different reasons the operator wants to see in the morning brief.
+    """
 
     parts: list[str] = []
     if not guard_passed:
         suffix = f": {guard_reasons[0]}" if guard_reasons else ""
         parts.append(f"{_HALT_GUARD_HALT}{suffix}")
     if not r5_killed:
-        parts.append(_HALT_R5_FAILED)
+        if template == "B":
+            if r5_status == "graceful_success":
+                parts.append(_HALT_R5_FAILED_B_SILENT)
+            else:
+                # "ungraceful" / "unknown" / "error: ..." all surface here.
+                parts.append(f"{_HALT_R5_FAILED_B} (status={r5_status!r})")
+        else:
+            parts.append(_HALT_R5_FAILED)
     if not r4_passed:
         parts.append(_HALT_R4_FAILED)
     return "; ".join(parts) or "auto-fix did not merge"
@@ -910,6 +1202,72 @@ def _default_guard_inspector(
         allowed_files=allowed_files,
         template=template,
     )
+
+
+def _default_adversarial_rechecker(
+    *,
+    repo: Path,  # noqa: ARG001 — present for signature parity with the seam
+    parser: str,
+    case_name: str,
+) -> str:
+    """Production default for the template-B R5 recheck (spec_024).
+
+    Reconstructs the named adversarial fixture from
+    :func:`ccd.adversarial.default_cases` and calls the named parser in
+    process. The four-way classification matches the seam contract:
+
+    - allowlist exception (``ValueError`` / ``ValidationError`` /
+      ``json.JSONDecodeError`` / ``FileNotFoundError``) → ``"graceful_error"``
+    - any ``UnicodeError`` subclass → ``"ungraceful"`` (spec_015's
+      override — codec-layer leak is below the parser's intent)
+    - any other ``Exception`` → ``"ungraceful"``
+    - the parser returned without raising → ``"graceful_success"``
+      (silent acceptance — spec_024 §3 forbids this; R5 will fail)
+    - the named parser or case is not in the production catalog →
+      ``"unknown"`` (loop halts conservatively).
+
+    Uses :class:`tempfile.TemporaryDirectory` so the fixture cleanup
+    happens deterministically; no live-repo write is ever performed.
+    """
+
+    import tempfile
+
+    from ccd.adversarial import (
+        GRACEFUL_EXCEPTIONS,
+        UNGRACEFUL_OVERRIDES,
+        default_cases,
+        default_parsers,
+    )
+
+    parser_fn = None
+    for p in default_parsers():
+        if p.name == parser:
+            parser_fn = p.fn
+            break
+    if parser_fn is None:
+        return "unknown"
+
+    case = None
+    for c in default_cases():
+        if c.name == case_name:
+            case = c
+            break
+    if case is None:
+        return "unknown"
+
+    with tempfile.TemporaryDirectory(prefix="ccd_r5_b_") as tmp_str:
+        fixture = Path(tmp_str) / f"{case.name}.bin"
+        fixture.write_bytes(case.content)
+        try:
+            parser_fn(fixture)
+        except UNGRACEFUL_OVERRIDES:
+            return "ungraceful"
+        except GRACEFUL_EXCEPTIONS:
+            return "graceful_error"
+        except Exception:
+            return "ungraceful"
+        else:
+            return "graceful_success"
 
 
 @dataclass
@@ -1043,6 +1401,7 @@ def _utc_today() -> date:
 
 
 __all__ = [
+    "AdversarialRechecker",
     "AutoFixOutcome",
     "ChannelOutcome",
     "FixDispatchOutcome",
