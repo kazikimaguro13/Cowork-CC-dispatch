@@ -1,4 +1,4 @@
-"""ccd profile — profile model + loader (spec_018, v2 Phase 1).
+"""ccd profile — profile model + loader (spec_018, v2 Phase 1; spec_023 ext).
 
 The v2 loop is **profile-driven from day one** (``docs/DESIGN.md §9.3``).
 A profile bundles per-repository configuration — target repo, enabled
@@ -25,18 +25,28 @@ human inspection of the effective profile. Existing subcommands
 (``dispatch`` / ``chain`` / ``report`` / ``dashboard`` / ``retrospect``
 / ``discover`` / ``brief`` / ``reconcile``) are NOT rewired here.
 
-Phase 2 reserved fields (NOT implemented in this spec)
-------------------------------------------------------
-- ``safety``: "branch-only" vs "push" — controls whether the
-  autonomous loop is allowed to push merged work.
+Phase 2 fields
+--------------
+
+- ``safety.autonomous_fix`` (spec_023) — the **gate** that ignites the
+  autonomous-fix loop in ``ccd nightly``. Default ``False`` (safe) so a
+  freshly-configured profile only does discovery + morning report; flip
+  to ``True`` in CCD's own profile to let the loop translate one
+  template-A finding per night and merge the fix locally (`docs/DESIGN.md
+  §9.7` 论点1 tier: CCD itself = ON, future client repos = OFF).
+
+Phase 2 reserved fields (NOT implemented yet)
+---------------------------------------------
+- ``safety.push`` — "branch-only" vs "push" (spec_023 is level 2:
+  local merge only, no push).
 - Cost ceilings: per-night and per-week token / dollar budgets.
 - Un-pushed backlog threshold: stop the loop when N un-pushed commits
   accumulate, to force a human review point.
 
-When Phase 2 lands, add these to the pydantic model with their own
-defaults and update the scheduler to consume them. Until then they
-should NOT be in the TOML — ``extra="forbid"`` will reject them so
-operators don't silently rely on a field CCD doesn't yet honor.
+When more Phase 2 fields land, add them to ``SafetyConfig`` with their
+own defaults. Until then they should NOT be in the TOML —
+``extra="forbid"`` will reject them so operators don't silently rely on
+a field CCD doesn't yet honor.
 """
 
 from __future__ import annotations
@@ -108,13 +118,31 @@ class ScheduleConfig(BaseModel):
         return v
 
 
+class SafetyConfig(BaseModel):
+    """Phase 2 safety knobs (spec_023 §2-1).
+
+    ``autonomous_fix`` is the **gate** that ignites the autonomous-fix
+    loop. When ``True``, ``ccd nightly`` runs
+    ``discover → translate → dispatch → verify → guard → local-merge``
+    for one template-A finding per night. When ``False`` (the safe
+    default), ``ccd nightly`` does Phase-1 discovery + morning report
+    only — no translation, no dispatch, no merge. The default is OFF so
+    a freshly-configured client repo never auto-fixes by surprise; only
+    a profile that explicitly opts in flips it on.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    autonomous_fix: bool = False
+
+
 class Profile(BaseModel):
-    """The Phase 1 profile (spec_018 §2-2).
+    """The profile (spec_018 §2-2; ``safety`` added by spec_023).
 
     Every field has a sensible default; an absent profile file therefore
     yields a fully-populated ``Profile()``. Unknown fields are rejected
-    (``extra="forbid"``) so typos and Phase 2 fields surface as errors
-    instead of silently being ignored.
+    (``extra="forbid"``) so typos surface as errors instead of silently
+    being ignored.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -122,6 +150,7 @@ class Profile(BaseModel):
     repo: str = "."
     discovery: DiscoveryConfig = Field(default_factory=DiscoveryConfig)
     schedule: ScheduleConfig = Field(default_factory=ScheduleConfig)
+    safety: SafetyConfig = Field(default_factory=SafetyConfig)
 
 
 # --------------------------------------------------------------------------- #
@@ -243,7 +272,15 @@ def render_profile(result: ProfileLoadResult) -> str:
     lines.append("")
     lines.append("[schedule]")
     lines.append(f'nightly_at = "{p.schedule.nightly_at}"')
+    lines.append("")
+    lines.append("[safety]")
+    lines.append(f"autonomous_fix = {_toml_bool(p.safety.autonomous_fix)}")
     return "\n".join(lines)
+
+
+def _toml_bool(value: bool) -> str:
+    """Render a Python bool as TOML literal (``true`` / ``false``)."""
+    return "true" if value else "false"
 
 
 def _toml_str_list(items: list[str]) -> str:

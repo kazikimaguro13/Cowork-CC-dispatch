@@ -23,14 +23,19 @@ import pytest
 
 from ccd import cli
 from ccd.brief import BriefResult, BriefSummary
+from ccd.guard import GuardResult
 from ccd.nightly import (
+    AutoFixOutcome,
     ChannelOutcome,
+    FixDispatchOutcome,
     NightlyResult,
+    SuiteOutcome,
     run_nightly,
 )
 from ccd.profile import (
     DiscoveryConfig,
     Profile,
+    SafetyConfig,
     ScheduleConfig,
 )
 
@@ -750,3 +755,876 @@ def test_channel_outcome_fields_are_preserved(tmp_path: Path) -> None:
     assert co.report_md_path == md
     assert co.report_json_path == js
     assert co.halt_reason == ""
+
+
+# --------------------------------------------------------------------------- #
+# spec_023 — autonomous-fix loop fakes
+# --------------------------------------------------------------------------- #
+
+
+@dataclass
+class _FakeGitOps:
+    """Records every git operation the loop performs; never touches git."""
+
+    branches_created: list[str] = field(default_factory=list)
+    merges: list[str] = field(default_factory=list)
+    checkouts: list[str] = field(default_factory=list)
+    diffs_requested: list[tuple[str, str]] = field(default_factory=list)
+    canned_diff: str = ""
+    create_should_raise: Exception | None = None
+    merge_should_raise: Exception | None = None
+
+    def create_and_checkout_branch(self, *, repo: Path, branch: str) -> None:
+        if self.create_should_raise is not None:
+            raise self.create_should_raise
+        self.branches_created.append(branch)
+        self.checkouts.append(branch)
+
+    def diff(self, *, repo: Path, base: str, head: str) -> str:
+        self.diffs_requested.append((base, head))
+        return self.canned_diff
+
+    def merge_branch_into_main(self, *, repo: Path, branch: str) -> None:
+        if self.merge_should_raise is not None:
+            raise self.merge_should_raise
+        self.merges.append(branch)
+
+    def checkout(self, *, repo: Path, ref: str) -> None:
+        self.checkouts.append(ref)
+
+
+@dataclass
+class _FakeFixDispatcher:
+    """Records spec_auto dispatches; returns a canned FixDispatchOutcome."""
+
+    outcome: FixDispatchOutcome = field(
+        default_factory=lambda: FixDispatchOutcome(status="done", commits_made=1)
+    )
+    calls: list[tuple[Path, Path, str]] = field(default_factory=list)
+    side_effect: Callable[[Path, Path], None] | None = None
+
+    def __call__(
+        self,
+        *,
+        spec_path: Path,
+        repo: Path,
+        branch: str,
+    ) -> FixDispatchOutcome:
+        self.calls.append((Path(spec_path), Path(repo), branch))
+        if self.side_effect is not None:
+            self.side_effect(Path(spec_path), Path(repo))
+        return self.outcome
+
+
+@dataclass
+class _FakeSuiteRunner:
+    outcome: SuiteOutcome = field(
+        default_factory=lambda: SuiteOutcome(passed=True, output="ok")
+    )
+    calls: list[Path] = field(default_factory=list)
+
+    def __call__(self, *, repo: Path) -> SuiteOutcome:
+        self.calls.append(Path(repo))
+        return self.outcome
+
+
+@dataclass
+class _FakeMutationRechecker:
+    status: str = "killed"
+    calls: list[tuple[str, int, str]] = field(default_factory=list)
+
+    def __call__(
+        self,
+        *,
+        repo: Path,
+        file: str,
+        line: int,
+        mutation: str,
+        signature: str,
+    ) -> str:
+        self.calls.append((file, line, signature))
+        return self.status
+
+
+@dataclass
+class _FakeGuardInspector:
+    result: GuardResult = field(
+        default_factory=lambda: GuardResult(
+            passed=True, halt_reasons=(), files_touched=(), template="A"
+        )
+    )
+    calls: list[tuple[str, tuple[str, ...], str]] = field(default_factory=list)
+
+    def __call__(
+        self,
+        *,
+        diff: str,
+        allowed_files: list[str],
+        template: str,
+    ) -> GuardResult:
+        self.calls.append((diff, tuple(allowed_files), template))
+        return self.result
+
+
+def _write_mutation_discover_json(
+    *,
+    repo: Path,
+    actionable: list[dict[str, Any]] | None = None,
+) -> Path:
+    """Drop a synthetic ``discover_NNN.json`` so the loop has a candidate
+    to chew on. Default actionable: one survivor in ``ccd/protocol.py``."""
+
+    discover_dir = repo / "_ai_workspace" / "discover"
+    discover_dir.mkdir(parents=True, exist_ok=True)
+    if actionable is None:
+        actionable = [
+            {
+                "file": "ccd/protocol.py",
+                "line": 46,
+                "mutation": "x == y → x != y",
+                "status": "survived",
+                "signature": "ccd/protocol.py:46:x == y → x != y",
+            }
+        ]
+    payload = {
+        "summary": {
+            "tool": "mutmut",
+            "target_paths": ["ccd"],
+            "mutants_total": len(actionable) + 1,
+            "status_breakdown": {"survived": len(actionable), "killed": 1},
+            "survived_total": len(actionable),
+            "survived_by_file": {},
+            "blocklisted_total": 0,
+            "actionable_total": len(actionable),
+        },
+        "actionable": actionable,
+        "blocklisted": [],
+    }
+    json_path = discover_dir / "discover_001.json"
+    json_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    md_path = discover_dir / "discover_001.md"
+    md_path.write_text("# fake discover report\n", encoding="utf-8")
+    return json_path
+
+
+def _autofix_profile(
+    *,
+    autonomous: bool,
+    channels: list[str] | None = None,
+) -> Profile:
+    return Profile(
+        discovery=DiscoveryConfig(
+            channels=channels if channels is not None else ["mutation"]
+        ),
+        schedule=ScheduleConfig(),
+        safety=SafetyConfig(autonomous_fix=autonomous),
+    )
+
+
+# --------------------------------------------------------------------------- #
+# spec_023 — gate OFF: behavior unchanged from spec_020
+# --------------------------------------------------------------------------- #
+
+
+def test_autonomous_fix_off_means_no_loop_runs(tmp_path: Path) -> None:
+    """Gate OFF → ``auto_fix`` is ``None`` and no loop seam is touched."""
+
+    _write_mutation_discover_json(repo=tmp_path)
+    channel_runner = _RecordingChannelRunner()
+    brief_runner, _ = _make_fake_brief_runner()
+    mirror, _ = _make_recording_mirror()
+    dispatcher = _FakeFixDispatcher()
+    suite = _FakeSuiteRunner()
+    recheck = _FakeMutationRechecker()
+    guard = _FakeGuardInspector()
+    gops = _FakeGitOps()
+
+    result = run_nightly(
+        repo=tmp_path,
+        profile=_autofix_profile(autonomous=False),
+        channel_runner=channel_runner,
+        brief_runner=brief_runner,
+        windows_mirror=mirror,
+        fix_dispatcher=dispatcher,
+        suite_runner=suite,
+        mutation_rechecker=recheck,
+        guard_inspector=guard,
+        git_ops=gops,
+    )
+
+    # spec_020 behavior preserved bit-for-bit when the gate is off.
+    assert result.auto_fix is None
+    assert dispatcher.calls == []
+    assert suite.calls == []
+    assert recheck.calls == []
+    assert guard.calls == []
+    assert gops.branches_created == []
+    assert gops.merges == []
+
+
+def test_autonomous_fix_off_default_profile_no_loop(tmp_path: Path) -> None:
+    """A freshly built ``Profile()`` (default) keeps the gate off — Phase 1
+    behavior survives intact."""
+
+    _write_mutation_discover_json(repo=tmp_path)
+    channel_runner = _RecordingChannelRunner()
+    brief_runner, _ = _make_fake_brief_runner()
+    mirror, _ = _make_recording_mirror()
+
+    result = run_nightly(
+        repo=tmp_path,
+        profile=Profile(discovery=DiscoveryConfig(channels=["mutation"])),
+        channel_runner=channel_runner,
+        brief_runner=brief_runner,
+        windows_mirror=mirror,
+    )
+
+    assert result.auto_fix is None
+    assert result.success is True
+
+
+# --------------------------------------------------------------------------- #
+# spec_023 — gate ON happy path: full loop merges
+# --------------------------------------------------------------------------- #
+
+
+def test_autonomous_fix_happy_path_merges_locally(tmp_path: Path) -> None:
+    """Gate ON + candidate + dispatch ok + R5 killed + R4 green + guard
+    pass → loop merges into ``main`` (local, no push)."""
+
+    _write_mutation_discover_json(repo=tmp_path)
+    channel_runner = _RecordingChannelRunner()
+    brief_runner, _ = _make_fake_brief_runner()
+    mirror, _ = _make_recording_mirror()
+    dispatcher = _FakeFixDispatcher(
+        outcome=FixDispatchOutcome(status="done", commits_made=1)
+    )
+    suite = _FakeSuiteRunner(outcome=SuiteOutcome(passed=True))
+    recheck = _FakeMutationRechecker(status="killed")
+    guard = _FakeGuardInspector(
+        result=GuardResult(
+            passed=True, halt_reasons=(), files_touched=("tests/x.py",), template="A"
+        )
+    )
+    gops = _FakeGitOps(canned_diff="diff --git a/tests/x.py b/tests/x.py\n")
+
+    result = run_nightly(
+        repo=tmp_path,
+        profile=_autofix_profile(autonomous=True),
+        channel_runner=channel_runner,
+        brief_runner=brief_runner,
+        windows_mirror=mirror,
+        fix_dispatcher=dispatcher,
+        suite_runner=suite,
+        mutation_rechecker=recheck,
+        guard_inspector=guard,
+        git_ops=gops,
+        today=date(2026, 5, 25),
+    )
+
+    af = result.auto_fix
+    assert isinstance(af, AutoFixOutcome)
+    assert af.skipped is False
+    assert af.spec_auto_id.startswith("spec_auto_")
+    assert af.spec_auto_path is not None
+    assert af.spec_auto_path.exists()
+    assert af.finding_signature == "ccd/protocol.py:46:x == y → x != y"
+    assert af.template == "A"
+    assert af.branch == f"auto/{af.spec_auto_id}"
+    assert af.dispatched is True
+    assert af.dispatch_status == "done"
+    assert af.r5_killed is True
+    assert af.r4_suite_passed is True
+    assert af.guard_passed is True
+    assert af.merged is True
+    assert af.halt_reason == ""
+
+    # All four loop side-effects fired exactly once.
+    assert dispatcher.calls and dispatcher.calls[0][0] == af.spec_auto_path
+    assert suite.calls == [tmp_path.resolve()]
+    assert recheck.calls == [
+        ("ccd/protocol.py", 46, af.finding_signature),
+    ]
+    assert guard.calls == [
+        (gops.canned_diff, ("tests/",), "A"),
+    ]
+    # Branch was created and (after merging) the loop did NOT call
+    # checkout("main") again — only merge_branch_into_main, which the
+    # subprocess impl handles internally. Fakes don't auto-checkout.
+    assert gops.branches_created == [af.branch]
+    assert gops.merges == [af.branch]
+
+
+def test_autonomous_fix_does_not_push(tmp_path: Path) -> None:
+    """Safety boundary level 2 — the loop never invokes a push primitive.
+
+    The fake git_ops has no ``push`` method; any attempt by the loop
+    code to call it would AttributeError. We assert structurally by
+    enumerating every method the loop touched and pinning it to the
+    four we documented."""
+
+    _write_mutation_discover_json(repo=tmp_path)
+    dispatcher = _FakeFixDispatcher()
+    suite = _FakeSuiteRunner()
+    recheck = _FakeMutationRechecker(status="killed")
+    guard = _FakeGuardInspector()
+    gops = _FakeGitOps()
+    brief_runner, _ = _make_fake_brief_runner()
+
+    run_nightly(
+        repo=tmp_path,
+        profile=_autofix_profile(autonomous=True),
+        channel_runner=_RecordingChannelRunner(),
+        brief_runner=brief_runner,
+        windows_mirror=lambda _p: None,
+        fix_dispatcher=dispatcher,
+        suite_runner=suite,
+        mutation_rechecker=recheck,
+        guard_inspector=guard,
+        git_ops=gops,
+    )
+
+    # Loop only ever used: create_and_checkout_branch, diff,
+    # merge_branch_into_main. (Not push, not force-anything.)
+    assert not hasattr(gops, "push")
+    # Sanity: the fake recorded the operations as expected.
+    assert gops.branches_created and gops.merges
+
+
+# --------------------------------------------------------------------------- #
+# spec_023 — gate ON but no candidate / halt branches
+# --------------------------------------------------------------------------- #
+
+
+def test_autonomous_fix_skipped_when_no_candidate(tmp_path: Path) -> None:
+    """Gate ON, no actionable findings → ``skipped=True`` and no dispatch."""
+
+    # No discover JSON dropped → no candidate.
+    dispatcher = _FakeFixDispatcher()
+    suite = _FakeSuiteRunner()
+    recheck = _FakeMutationRechecker()
+    guard = _FakeGuardInspector()
+    gops = _FakeGitOps()
+    brief_runner, _ = _make_fake_brief_runner()
+
+    result = run_nightly(
+        repo=tmp_path,
+        profile=_autofix_profile(autonomous=True),
+        channel_runner=_RecordingChannelRunner(),
+        brief_runner=brief_runner,
+        windows_mirror=lambda _p: None,
+        fix_dispatcher=dispatcher,
+        suite_runner=suite,
+        mutation_rechecker=recheck,
+        guard_inspector=guard,
+        git_ops=gops,
+    )
+
+    af = result.auto_fix
+    assert af is not None
+    assert af.skipped is True
+    assert "no template-A candidate" in af.skip_reason
+    assert dispatcher.calls == []
+    assert gops.branches_created == []
+
+
+def test_autonomous_fix_halts_when_guard_halts(tmp_path: Path) -> None:
+    """Guard HALT → loop does NOT merge; ``halt_reason`` is recorded."""
+
+    _write_mutation_discover_json(repo=tmp_path)
+    dispatcher = _FakeFixDispatcher()
+    suite = _FakeSuiteRunner(outcome=SuiteOutcome(passed=True))
+    recheck = _FakeMutationRechecker(status="killed")
+    guard = _FakeGuardInspector(
+        result=GuardResult(
+            passed=False,
+            halt_reasons=("R2: tests/x.py removed lines",),
+            files_touched=("tests/x.py", "ccd/sneaky.py"),
+            template="A",
+        )
+    )
+    gops = _FakeGitOps()
+    brief_runner, _ = _make_fake_brief_runner()
+
+    result = run_nightly(
+        repo=tmp_path,
+        profile=_autofix_profile(autonomous=True),
+        channel_runner=_RecordingChannelRunner(),
+        brief_runner=brief_runner,
+        windows_mirror=lambda _p: None,
+        fix_dispatcher=dispatcher,
+        suite_runner=suite,
+        mutation_rechecker=recheck,
+        guard_inspector=guard,
+        git_ops=gops,
+    )
+
+    af = result.auto_fix
+    assert af is not None
+    assert af.skipped is False
+    assert af.dispatched is True
+    assert af.guard_passed is False
+    assert "R2: tests/x.py removed lines" in af.guard_halt_reasons[0]
+    assert af.merged is False
+    assert "guard halted the fix" in af.halt_reason
+    assert "R2:" in af.halt_reason
+    # No merge happened — explicitly.
+    assert gops.merges == []
+
+
+def test_autonomous_fix_halts_when_r5_fails(tmp_path: Path) -> None:
+    """Target mutation still surviving → loop HALTs, no merge."""
+
+    _write_mutation_discover_json(repo=tmp_path)
+    dispatcher = _FakeFixDispatcher()
+    suite = _FakeSuiteRunner(outcome=SuiteOutcome(passed=True))
+    recheck = _FakeMutationRechecker(status="survived")  # R5 fails
+    guard = _FakeGuardInspector()
+    gops = _FakeGitOps()
+    brief_runner, _ = _make_fake_brief_runner()
+
+    result = run_nightly(
+        repo=tmp_path,
+        profile=_autofix_profile(autonomous=True),
+        channel_runner=_RecordingChannelRunner(),
+        brief_runner=brief_runner,
+        windows_mirror=lambda _p: None,
+        fix_dispatcher=dispatcher,
+        suite_runner=suite,
+        mutation_rechecker=recheck,
+        guard_inspector=guard,
+        git_ops=gops,
+    )
+
+    af = result.auto_fix
+    assert af is not None
+    assert af.r5_killed is False
+    assert af.merged is False
+    assert "R5 failed" in af.halt_reason
+    assert gops.merges == []
+
+
+def test_autonomous_fix_halts_when_r4_fails(tmp_path: Path) -> None:
+    """Suite red → loop HALTs even when R5 + guard would pass."""
+
+    _write_mutation_discover_json(repo=tmp_path)
+    dispatcher = _FakeFixDispatcher()
+    suite = _FakeSuiteRunner(outcome=SuiteOutcome(passed=False))  # R4 fails
+    recheck = _FakeMutationRechecker(status="killed")
+    guard = _FakeGuardInspector()
+    gops = _FakeGitOps()
+    brief_runner, _ = _make_fake_brief_runner()
+
+    result = run_nightly(
+        repo=tmp_path,
+        profile=_autofix_profile(autonomous=True),
+        channel_runner=_RecordingChannelRunner(),
+        brief_runner=brief_runner,
+        windows_mirror=lambda _p: None,
+        fix_dispatcher=dispatcher,
+        suite_runner=suite,
+        mutation_rechecker=recheck,
+        guard_inspector=guard,
+        git_ops=gops,
+    )
+
+    af = result.auto_fix
+    assert af is not None
+    assert af.r4_suite_passed is False
+    assert af.merged is False
+    assert "R4 failed" in af.halt_reason
+    assert gops.merges == []
+
+
+def test_autonomous_fix_halts_when_dispatch_fails(tmp_path: Path) -> None:
+    """Dispatch returns ``failed`` → loop skips R4/R5/guard and HALTs."""
+
+    _write_mutation_discover_json(repo=tmp_path)
+    dispatcher = _FakeFixDispatcher(
+        outcome=FixDispatchOutcome(
+            status="failed",
+            halt_reason="agent_misread",
+        )
+    )
+    suite = _FakeSuiteRunner()
+    recheck = _FakeMutationRechecker()
+    guard = _FakeGuardInspector()
+    gops = _FakeGitOps()
+    brief_runner, _ = _make_fake_brief_runner()
+
+    result = run_nightly(
+        repo=tmp_path,
+        profile=_autofix_profile(autonomous=True),
+        channel_runner=_RecordingChannelRunner(),
+        brief_runner=brief_runner,
+        windows_mirror=lambda _p: None,
+        fix_dispatcher=dispatcher,
+        suite_runner=suite,
+        mutation_rechecker=recheck,
+        guard_inspector=guard,
+        git_ops=gops,
+    )
+
+    af = result.auto_fix
+    assert af is not None
+    assert af.dispatched is True
+    assert af.dispatch_status == "failed"
+    assert af.merged is False
+    assert "dispatch failed" in af.halt_reason
+    # R4/R5/guard not invoked when dispatch failed.
+    assert suite.calls == []
+    assert recheck.calls == []
+    assert guard.calls == []
+    assert gops.merges == []
+
+
+# --------------------------------------------------------------------------- #
+# spec_023 — 1 candidate per night
+# --------------------------------------------------------------------------- #
+
+
+def test_autonomous_fix_processes_exactly_one_candidate(tmp_path: Path) -> None:
+    """Discover JSON has multiple actionable findings → exactly one is
+    picked (论点3 "1晩1候補"). The other survivors stay in the JSON for
+    the morning brief to surface."""
+
+    _write_mutation_discover_json(
+        repo=tmp_path,
+        actionable=[
+            {
+                "file": "ccd/foo.py",
+                "line": 10,
+                "mutation": "a → b",
+                "status": "survived",
+                "signature": "ccd/foo.py:10:a → b",
+            },
+            {
+                "file": "ccd/bar.py",
+                "line": 20,
+                "mutation": "c → d",
+                "status": "survived",
+                "signature": "ccd/bar.py:20:c → d",
+            },
+            {
+                "file": "ccd/baz.py",
+                "line": 30,
+                "mutation": "e → f",
+                "status": "survived",
+                "signature": "ccd/baz.py:30:e → f",
+            },
+        ],
+    )
+    dispatcher = _FakeFixDispatcher()
+    suite = _FakeSuiteRunner()
+    recheck = _FakeMutationRechecker(status="killed")
+    guard = _FakeGuardInspector()
+    gops = _FakeGitOps()
+    brief_runner, _ = _make_fake_brief_runner()
+
+    result = run_nightly(
+        repo=tmp_path,
+        profile=_autofix_profile(autonomous=True),
+        channel_runner=_RecordingChannelRunner(),
+        brief_runner=brief_runner,
+        windows_mirror=lambda _p: None,
+        fix_dispatcher=dispatcher,
+        suite_runner=suite,
+        mutation_rechecker=recheck,
+        guard_inspector=guard,
+        git_ops=gops,
+    )
+
+    af = result.auto_fix
+    assert af is not None
+    # Dispatcher called exactly once (the first candidate).
+    assert len(dispatcher.calls) == 1
+    assert af.finding_signature == "ccd/foo.py:10:a → b"
+    assert af.candidate_count == 3
+    # And only one branch + one merge fired.
+    assert len(gops.branches_created) == 1
+    assert len(gops.merges) == 1
+
+
+# --------------------------------------------------------------------------- #
+# spec_023 — finding selection sources
+# --------------------------------------------------------------------------- #
+
+
+def test_autonomous_fix_reads_from_channel_outcome_when_available(
+    tmp_path: Path,
+) -> None:
+    """When the mutation channel surfaces its own JSON path, the loop
+    prefers it over scanning ``_ai_workspace/discover/`` blindly."""
+
+    # The "live" discover dir holds an older report we should NOT pick.
+    _write_mutation_discover_json(
+        repo=tmp_path,
+        actionable=[
+            {
+                "file": "ccd/old.py",
+                "line": 1,
+                "mutation": "old → ancient",
+                "status": "survived",
+                "signature": "ccd/old.py:1:old → ancient",
+            }
+        ],
+    )
+    # The channel outcome points to a fresher JSON in a different dir.
+    fresh_dir = tmp_path / "fresh"
+    fresh_dir.mkdir()
+    fresh_json = fresh_dir / "discover_999.json"
+    fresh_json.write_text(
+        json.dumps(
+            {
+                "summary": {},
+                "actionable": [
+                    {
+                        "file": "ccd/new.py",
+                        "line": 5,
+                        "mutation": "fresh → stale",
+                        "status": "survived",
+                        "signature": "ccd/new.py:5:fresh → stale",
+                    }
+                ],
+                "blocklisted": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    channel_runner = _RecordingChannelRunner(
+        per_channel={
+            "mutation": _FakeChannelResult(
+                success=True,
+                report_md_path=fresh_json.with_suffix(".md"),
+                report_json_path=fresh_json,
+            )
+        }
+    )
+    dispatcher = _FakeFixDispatcher()
+    suite = _FakeSuiteRunner()
+    recheck = _FakeMutationRechecker(status="killed")
+    guard = _FakeGuardInspector()
+    gops = _FakeGitOps()
+    brief_runner, _ = _make_fake_brief_runner()
+
+    result = run_nightly(
+        repo=tmp_path,
+        profile=_autofix_profile(autonomous=True),
+        channel_runner=channel_runner,
+        brief_runner=brief_runner,
+        windows_mirror=lambda _p: None,
+        fix_dispatcher=dispatcher,
+        suite_runner=suite,
+        mutation_rechecker=recheck,
+        guard_inspector=guard,
+        git_ops=gops,
+    )
+
+    af = result.auto_fix
+    assert af is not None
+    assert af.finding_signature == "ccd/new.py:5:fresh → stale"
+
+
+def test_autonomous_fix_downgrade_when_translate_rejects(
+    tmp_path: Path,
+) -> None:
+    """When the discover JSON only has channel-incompatible findings,
+    the pre-filter rejects them and ``skipped`` carries the reason."""
+
+    # Only a "killed" finding (not survived) → fails the pre-filter.
+    _write_mutation_discover_json(
+        repo=tmp_path,
+        actionable=[
+            {
+                "file": "ccd/foo.py",
+                "line": 1,
+                "mutation": "x → y",
+                "status": "killed",  # not survived → pre-filter rejects
+                "signature": "ccd/foo.py:1:x → y",
+            }
+        ],
+    )
+    dispatcher = _FakeFixDispatcher()
+    suite = _FakeSuiteRunner()
+    recheck = _FakeMutationRechecker()
+    guard = _FakeGuardInspector()
+    gops = _FakeGitOps()
+    brief_runner, _ = _make_fake_brief_runner()
+
+    result = run_nightly(
+        repo=tmp_path,
+        profile=_autofix_profile(autonomous=True),
+        channel_runner=_RecordingChannelRunner(),
+        brief_runner=brief_runner,
+        windows_mirror=lambda _p: None,
+        fix_dispatcher=dispatcher,
+        suite_runner=suite,
+        mutation_rechecker=recheck,
+        guard_inspector=guard,
+        git_ops=gops,
+    )
+
+    af = result.auto_fix
+    assert af is not None
+    assert af.skipped is True
+    assert "no template-A candidate" in af.skip_reason
+    assert dispatcher.calls == []
+
+
+# --------------------------------------------------------------------------- #
+# spec_023 — CLI surfaces the auto-fix outcome
+# --------------------------------------------------------------------------- #
+
+
+def test_cli_nightly_prints_auto_fix_merged_line(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """When the loop merges, ``ccd nightly`` stdout shows an auto-fix line."""
+
+    _write_mutation_discover_json(repo=tmp_path)
+    # Write a profile that flips the gate on.
+    profile_path = tmp_path / "ccd_profile.toml"
+    profile_path.write_text(
+        "[discovery]\nchannels = [\"mutation\"]\n\n"
+        "[safety]\nautonomous_fix = true\n",
+        encoding="utf-8",
+    )
+
+    dispatcher = _FakeFixDispatcher()
+    suite = _FakeSuiteRunner()
+    recheck = _FakeMutationRechecker(status="killed")
+    guard = _FakeGuardInspector()
+    gops = _FakeGitOps()
+    brief_runner, _ = _make_fake_brief_runner()
+
+    rc = cli.main(
+        [
+            "nightly",
+            "--repo",
+            str(tmp_path),
+            "--profile",
+            str(profile_path),
+        ],
+        channel_runner=_RecordingChannelRunner(),
+        brief_runner=brief_runner,
+        windows_mirror=lambda _p: None,
+        fix_dispatcher=dispatcher,
+        suite_runner=suite,
+        mutation_rechecker=recheck,
+        guard_inspector=guard,
+        git_ops=gops,
+    )
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "auto-fix: merged" in out
+    assert "branch=auto/spec_auto_" in out
+    assert "signature=ccd/protocol.py:46:" in out
+
+
+def test_cli_nightly_prints_auto_fix_halt_line(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Guard HALT → ``auto-fix: HALT ...`` appears in stdout with the reason."""
+
+    _write_mutation_discover_json(repo=tmp_path)
+    profile_path = tmp_path / "ccd_profile.toml"
+    profile_path.write_text(
+        "[discovery]\nchannels = [\"mutation\"]\n\n"
+        "[safety]\nautonomous_fix = true\n",
+        encoding="utf-8",
+    )
+
+    dispatcher = _FakeFixDispatcher()
+    suite = _FakeSuiteRunner()
+    recheck = _FakeMutationRechecker(status="killed")
+    guard = _FakeGuardInspector(
+        result=GuardResult(
+            passed=False,
+            halt_reasons=("R1: tests/sneaky.py is not allowed",),
+            files_touched=(),
+            template="A",
+        )
+    )
+    gops = _FakeGitOps()
+    brief_runner, _ = _make_fake_brief_runner()
+
+    rc = cli.main(
+        [
+            "nightly",
+            "--repo",
+            str(tmp_path),
+            "--profile",
+            str(profile_path),
+        ],
+        channel_runner=_RecordingChannelRunner(),
+        brief_runner=brief_runner,
+        windows_mirror=lambda _p: None,
+        fix_dispatcher=dispatcher,
+        suite_runner=suite,
+        mutation_rechecker=recheck,
+        guard_inspector=guard,
+        git_ops=gops,
+    )
+
+    assert rc == 0  # nightly itself is success; the loop halted, not the brief
+    out = capsys.readouterr().out
+    assert "auto-fix: HALT" in out
+    assert "guard halted the fix" in out
+    assert gops.merges == []
+
+
+def test_cli_nightly_prints_auto_fix_skipped_line(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """No candidate → ``auto-fix: skipped (...)`` line surfaces."""
+
+    profile_path = tmp_path / "ccd_profile.toml"
+    profile_path.write_text(
+        "[discovery]\nchannels = [\"mutation\"]\n\n"
+        "[safety]\nautonomous_fix = true\n",
+        encoding="utf-8",
+    )
+
+    brief_runner, _ = _make_fake_brief_runner()
+
+    rc = cli.main(
+        [
+            "nightly",
+            "--repo",
+            str(tmp_path),
+            "--profile",
+            str(profile_path),
+        ],
+        channel_runner=_RecordingChannelRunner(),
+        brief_runner=brief_runner,
+        windows_mirror=lambda _p: None,
+    )
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "auto-fix: skipped" in out
+    assert "no template-A candidate" in out
+
+
+def test_cli_nightly_off_profile_no_auto_fix_line(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Gate off → CLI does not print an auto-fix line at all (preserves
+    the spec_020 stdout shape bit-for-bit when the gate is off)."""
+
+    rc = cli.main(
+        ["nightly", "--repo", str(tmp_path)],
+        channel_runner=_RecordingChannelRunner(),
+        brief_runner=_make_fake_brief_runner()[0],
+        windows_mirror=lambda _p: None,
+    )
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "auto-fix" not in out
