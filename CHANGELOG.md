@@ -2,6 +2,65 @@
 
 本プロジェクトの注目すべき変更を記録する。フォーマットは [Keep a Changelog](https://keepachangelog.com/) に準ずる。
 
+## [0.13.0] — 2026-05-25
+
+v2 Phase 2 の本丸 — spec_023。spec_021 で**インチキ修正ガード**（`ccd/guard.py`）、spec_022 で**翻訳器**（`ccd/translate.py`）が揃った次の段として、**自律修正ループを閉じる** ── 発見を無人で直す `[発見]→[翻訳]→[修正]→[検証]→[ローカルmerge]→[朝レポート]` を `ccd nightly` に組み込む（`docs/DESIGN.md §9.5/§9.7`）。
+
+リスク傾斜（`docs/DESIGN.md §9.7`）に従い、**まずテンプレ A（ミューテーション → test-only）のみ**を自律化する ── test-only は本番コードを構造的に壊せない、最も安全な自律変更。テンプレ B（本番コードに触る）は spec_024 で、A が信用できてから点火。安全境界レベル2：**ローカル merge まで、push しない**。
+
+ループは **プロファイル `safety.autonomous_fix` で gate される**（spec_018 → spec_023 拡張、論点1 tier）。既定 OFF — 新規プロファイルは Phase 1 挙動（discover + 朝レポート）のみ。CCD 自身のプロファイルだけ ON にしてループを点火。**1晩1候補**（论点3）── 複数 actionable があっても 1 件だけ処理、残りは朝レポートに surface。失敗時は HALT・merge せず・朝レポートに理由（论点4 layer 5、無限リトライしない）。
+
+`AutoFixOutcome` データクラスが「skipped（gate off / 候補なし）」「dispatched + 各検証結果（R4 / R5 / guard）」「merged or halt_reason」を全て揃えて返し、朝レポート（spec_017 brief）が同じ shape を読める形を担保。
+
+### Added
+
+- **`ccd/profile.py` 拡張** — Phase 2 gate `SafetyConfig`。
+  - **`SafetyConfig` pydantic model (extra=forbid)** — `autonomous_fix: bool = False`（既定 OFF）。docstring に「クライアント repo は OFF 既定、CCD 自身は ON に opt-in」「Phase 2 が成熟すれば `push` / cost ceilings / un-pushed backlog threshold を同じ `[safety]` 配下に追加する」を明記。
+  - **`Profile.safety: SafetyConfig`** — 既存 `discovery` / `schedule` と並ぶ第 3 のセクション。デフォルトは `SafetyConfig()`、TOML の `[safety]` セクション（または完全省略）から組み立て。
+  - **`render_profile`** — TOML-shaped 出力に `[safety]\nautonomous_fix = false` を追加。`_toml_bool` 補助関数も追加。
+  - 既存 `test_unknown_field_raises_value_error` が `safety = "branch-only"` を未知フィールド例にしていたのを `mystery_knob = "wat"` に変更（safety は今や既知のサブセクションなので例として不適切に）。意図は同じ ── 未知フィールドは silently 落とさず `ValueError`。
+- **`ccd/nightly.py` 拡張** — Phase 2 自律修正ループを `run_nightly` に組み込み。
+  - **`AutoFixOutcome` dataclass (frozen)** — `skipped` / `skip_reason` / `spec_auto_id` / `spec_auto_path` / `finding_signature` / `candidate_count` / `template` / `branch` / `dispatched` / `dispatch_status` / `r5_killed` / `r4_suite_passed` / `guard_passed` / `guard_halt_reasons` / `merged` / `halt_reason`。朝レポートとテストが同じ shape を読める形に純化。
+  - **`NightlyResult.auto_fix: AutoFixOutcome | None`** — gate ON のとき必ず populate（候補なしなら `skipped=True`）、gate OFF のとき `None`（spec_020 挙動を bit-for-bit 保持）。
+  - **`_run_auto_fix_loop`** — `[候補選択 → 翻訳 → ブランチ作成 → dispatch → R5 → R4 → ガード → ローカル merge or HALT]` を直線的に並べた。各段で例外を吸って `halt_reason` に変換 ── 1 つの broken seam がループを crash させない（spec_020 の channel 例外吸収と同じ精神）。
+  - **`_select_template_a_candidate`** — 候補解決順序: ① mutation channel outcome の `report_json_path` → ② `<repo>/_ai_workspace/discover/discover_*.json` の最大連番。`actionable` リストを舐めて、pre-filter（`file` 非空 / `line > 0` / `mutation` 非空 / `status == "survived"`）を通る最初の 1 件を返す。残りは朝レポートが拾う。
+  - **6 つの注入 seam** — `fix_dispatcher` / `suite_runner` / `mutation_rechecker` / `guard_inspector` / `git_ops` / 補助の `agent_runner` / `mutation_runner`。テストは fake で注入、production は `_build_default_fix_dispatcher`（`dispatch_with_retry` を `max_attempts=1` で wrap、论点4 layer 5）、`_default_suite_runner`（`pytest -q`）、`_build_default_mutation_rechecker`（`MutmutRunner` + spec_019 iso-venv 再利用、`paths=[finding.file]` で単一ファイルに絞る、signature で同定）、`_default_guard_inspector`（`inspect_diff` 1:1）、`SubprocessGitOps`（`git checkout -b` / `git diff main..HEAD` / `git checkout main && git merge --no-ff <branch>`）。
+  - **`GitOps` Protocol** — `create_and_checkout_branch` / `diff` / `merge_branch_into_main` / `checkout` の 4 メソッドのみ。**push 系メソッドを意図的に持たない** ── push したくても seam 自体が存在しないので構造的に push 不能（`test_autonomous_fix_does_not_push` で `not hasattr(gops, "push")` を pin、安全境界レベル2 を物理的に保証）。
+  - **テンプレ A 限定** — `_AUTO_FIX_ALLOWED_FILES = ("tests/",)` を `guard_inspector` に固定で渡す。テンプレ B が混入する経路がない（`finding.channel != "mutation"` は `translate_finding` 側で `skipped=True` に降格、loop はそこで止まる）。`branch = f"auto/{spec_auto_id}"` 命名で git log で機械生成ブランチが一目で判別可能。
+  - **HALT 文言の固定 anchor** — `_HALT_NO_CANDIDATE` / `_HALT_GUARD_HALT` / `_HALT_R5_FAILED` / `_HALT_R4_FAILED` / `_HALT_DISPATCH_FAILED` をモジュール定数化、朝レポートの集計用 anchor として再利用可能（テンプレ A の `_CONSTRAINT_*` と同じパターン）。
+- **`ccd/cli.py` 拡張** — `ccd nightly` が自律修正の outcome を stdout に1行で surface。
+  - `auto-fix: merged <spec_auto_NNN> (branch=auto/spec_auto_NNN, signature=...)` / `auto-fix: HALT ... — <reason>` / `auto-fix: skipped (<reason>)` の 3 形。gate OFF のときはこの行を一切出さない（spec_020 挙動を bit-for-bit 保持、`test_cli_nightly_off_profile_no_auto_fix_line` で pin）。
+  - `main()` シグネチャに `fix_dispatcher` / `suite_runner` / `mutation_rechecker` / `guard_inspector` / `git_ops` の 5 つの seam を追加（既存 `channel_runner` / `brief_runner` / `windows_mirror` と同じ流儀）。CLI からの注入は `cli.main(..., fix_dispatcher=...)` 形で、production CLI 利用では自動的に default seam が使われる。
+- **`tests/test_profile.py`** — 5 件の新規テスト:
+  - `test_safety_default_is_autonomous_fix_off` — `Profile().safety.autonomous_fix is False`
+  - `test_safety_autonomous_fix_can_be_enabled_via_toml` — `[safety]\nautonomous_fix = true` → True
+  - `test_safety_unknown_subfield_raises_value_error` — `[safety]\npush = "..."` → ValueError（`extra="forbid"` を pin）
+  - `test_safety_section_appears_in_render_profile` / `test_safety_section_renders_true_when_enabled` — `ccd profile` 出力に `[safety]` セクション
+- **`tests/test_nightly.py`** — 16 件の新規テスト（既存 18 件 + 新規 16 件 = 34 件）:
+  - **fakes**: `_FakeGitOps` / `_FakeFixDispatcher` / `_FakeSuiteRunner` / `_FakeMutationRechecker` / `_FakeGuardInspector` / `_write_mutation_discover_json` / `_autofix_profile` — テストで実 mutmut・実 claude・実 git を呼ばない（spec §3）。
+  - **gate OFF**: `test_autonomous_fix_off_means_no_loop_runs` / `test_autonomous_fix_off_default_profile_no_loop` — `auto_fix is None`・seam 一切呼ばれない。
+  - **happy path**: `test_autonomous_fix_happy_path_merges_locally` — translate → branch → dispatch → R5=killed → R4=passed → guard=pass → merge、全 seam が正しい引数で 1 回ずつ呼ばれる。
+  - **push しない (level 2)**: `test_autonomous_fix_does_not_push` — `not hasattr(gops, "push")` を assert（seam の surface に push が無いことを構造的に pin）。
+  - **HALT 分岐**: `test_autonomous_fix_halts_when_guard_halts` / `test_autonomous_fix_halts_when_r5_fails` / `test_autonomous_fix_halts_when_r4_fails` / `test_autonomous_fix_halts_when_dispatch_fails` — 4 経路すべてで merge しない・halt_reason に分類入り・後段の seam を呼ばない。
+  - **1晩1候補 (论点3)**: `test_autonomous_fix_processes_exactly_one_candidate` — actionable=3 でも dispatcher 呼び出し 1 回、`candidate_count=3` で残数を朝レポート用に保持。
+  - **候補解決**: `test_autonomous_fix_reads_from_channel_outcome_when_available` — channel outcome の `report_json_path` が discover dir よりも優先。
+  - **降格**: `test_autonomous_fix_downgrade_when_translate_rejects` — `status="killed"` のみの actionable → pre-filter が rejects、`skipped=True`、dispatcher 呼ばれない。
+  - **CLI**: `test_cli_nightly_prints_auto_fix_merged_line` / `test_cli_nightly_prints_auto_fix_halt_line` / `test_cli_nightly_prints_auto_fix_skipped_line` / `test_cli_nightly_off_profile_no_auto_fix_line` — 3 形 + OFF 不出力。
+
+### Changed
+
+- `pyproject.toml` / `ccd/__init__.py` version `0.12.0` → **`0.13.0`**（**新機能 = minor bump**、spec §2-7）。
+- `tests/test_smoke.py::test_version_is_0120` → **`test_version_is_0130`**、assert を `0.13.0` に。
+
+### Constraints (spec §3)
+
+- **触ってよい**: `ccd/nightly.py`、`ccd/profile.py`（`SafetyConfig` / `Profile.safety` / `render_profile`）、`ccd/cli.py`（seam 追加 + `auto-fix:` stdout）、`tests/test_nightly.py` / `tests/test_profile.py` / `tests/test_smoke.py`、`CHANGELOG.md`、`pyproject.toml`、`ccd/__init__.py`。
+- **触っていない**: `ccd/{models,protocol,dispatch,chain,integrate,metrics,dashboard,run_writer,retry,backfill,agent,retrospect,discover,adversarial,ai_review,brief,guard,translate}.py` のコアロジックは **1 行も変更していない**（spec §3 で明示的に禁止）。再利用は import 経由のみ（`run_channel` / `dispatch_with_retry` / `inspect_diff` / `translate_finding` / `parse_spec` / `MutmutRunner` / `run_discovery` を読み取りのみ）。`docs/` も触らない。
+- **テンプレ A 限定** — 本 spec は test-only の自律化のみ。`_AUTO_FIX_ALLOWED_FILES = ("tests/",)` が固定で `guard_inspector` に渡る経路しかなく、テンプレ B（本番コード修正）が混入する経路がない（spec §3 / §4）。
+- 安全境界レベル2：**ローカル merge まで、push しない**。`GitOps` Protocol が push 系メソッドを持たないので構造的に push 不能（テストで pin）。
+- **テストで実 mutmut・実 claude を呼ばない** — 6 つの seam を fake で注入、production default は subprocess wrapper（CCD 自身が `ccd nightly` を本番で走らせるときのみ使われる）。
+- すべて**追加のみ**。ローカル commit のみ、**push しない／ブランチ操作・merge しない**（spec §3）。
+
 ## [0.12.0] — 2026-05-25
 
 v2 Phase 2 の 2 本目 — spec_022。spec_021 で**インチキ修正ガード**（`ccd/guard.py`）が静的検査単独で実証された次の段として、**翻訳器** を追加。発見（`discover_NNN.json` の生存改変 1 件）を、CC に投げられる修正 spec（`spec_auto_NNN.md`）に変換する（`docs/DESIGN.md §9.5` 論点5）。本 spec はテンプレ A（ミューテーション生存改変 → test-only 修正）のみを実装 ── テンプレ B（敵対的入力 → 本番コード修正）は spec_024 の責務。

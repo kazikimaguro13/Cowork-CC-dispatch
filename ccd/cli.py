@@ -25,6 +25,7 @@ import sys
 from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 from ccd import __version__
 from ccd.agent import AgentRunner, ClaudeCodeRunner
@@ -457,6 +458,12 @@ def main(
     channel_runner: ChannelRunner | None = None,
     brief_runner: BriefRunner | None = None,
     windows_mirror: WindowsMirror | None = None,
+    # spec_023 — autonomous-fix seams (forwarded to ``ccd nightly``).
+    fix_dispatcher: Any | None = None,
+    suite_runner: Any | None = None,
+    mutation_rechecker: Any | None = None,
+    guard_inspector: Any | None = None,
+    git_ops: Any | None = None,
 ) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -483,6 +490,13 @@ def main(
             channel_runner=channel_runner,
             brief_runner=brief_runner,
             windows_mirror=windows_mirror,
+            agent_runner=runner,
+            mutation_runner=mutation_runner,
+            fix_dispatcher=fix_dispatcher,
+            suite_runner=suite_runner,
+            mutation_rechecker=mutation_rechecker,
+            guard_inspector=guard_inspector,
+            git_ops=git_ops,
         )
     if args.command == "guard":
         return _cmd_guard(args)
@@ -745,6 +759,13 @@ def _cmd_nightly(
     channel_runner: ChannelRunner | None,
     brief_runner: BriefRunner | None,
     windows_mirror: WindowsMirror | None,
+    agent_runner: AgentRunner | None = None,
+    mutation_runner: MutationRunner | None = None,
+    fix_dispatcher: Any | None = None,
+    suite_runner: Any | None = None,
+    mutation_rechecker: Any | None = None,
+    guard_inspector: Any | None = None,
+    git_ops: Any | None = None,
 ) -> int:
     repo = _resolve_repo(args.repo)
     profile_path = getattr(args, "profile_path", None)
@@ -755,12 +776,34 @@ def _cmd_nightly(
         channel_runner=channel_runner,
         brief_runner=brief_runner,
         windows_mirror=windows_mirror,
+        agent_runner=agent_runner,
+        mutation_runner=mutation_runner,
+        fix_dispatcher=fix_dispatcher,
+        suite_runner=suite_runner,
+        mutation_rechecker=mutation_rechecker,
+        guard_inspector=guard_inspector,
+        git_ops=git_ops,
     )
 
     print("channels executed: " + (", ".join(result.channels_executed) or "(none)"))
     for co in result.channels_run:
         status = "ok" if co.success else f"halted ({co.halt_reason or 'no reason'})"
         print(f"  - {co.channel}: {status}")
+
+    if result.auto_fix is not None:
+        af = result.auto_fix
+        if af.skipped:
+            print(f"auto-fix: skipped ({af.skip_reason or 'no reason'})")
+        elif af.merged:
+            print(
+                f"auto-fix: merged {af.spec_auto_id} "
+                f"(branch={af.branch}, signature={af.finding_signature})"
+            )
+        else:
+            print(
+                f"auto-fix: HALT {af.spec_auto_id} "
+                f"(branch={af.branch}) — {af.halt_reason or 'no reason'}"
+            )
 
     if result.brief_report_wsl is not None:
         print(f"morning report (wsl):     {result.brief_report_wsl}")

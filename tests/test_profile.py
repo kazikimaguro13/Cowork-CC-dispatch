@@ -158,9 +158,9 @@ def test_invalid_toml_raises_value_error(tmp_path: Path) -> None:
 
 
 def test_unknown_field_raises_value_error(tmp_path: Path) -> None:
-    """Unknown top-level fields (e.g. Phase 2 ``safety``) must error,
-    not be silently dropped — operators must not rely on a field CCD
-    doesn't yet honor."""
+    """Unknown top-level fields (e.g. an unreserved Phase-2 knob) must
+    error, not be silently dropped — operators must not rely on a field
+    CCD doesn't yet honor."""
 
     profile_path = tmp_path / "_ai_workspace" / "ccd_profile.toml"
     profile_path.parent.mkdir(parents=True)
@@ -168,7 +168,7 @@ def test_unknown_field_raises_value_error(tmp_path: Path) -> None:
         dedent(
             """
             repo = "."
-            safety = "branch-only"
+            mystery_knob = "wat"
             """
         ).strip()
         + "\n",
@@ -180,7 +180,7 @@ def test_unknown_field_raises_value_error(tmp_path: Path) -> None:
 
     msg = str(excinfo.value)
     assert "invalid profile" in msg
-    assert "safety" in msg
+    assert "mystery_knob" in msg
 
 
 def test_unknown_channel_raises_value_error(tmp_path: Path) -> None:
@@ -422,3 +422,97 @@ def test_cli_profile_invalid_toml_exits_non_zero(
     captured = capsys.readouterr()
     assert "profile error" in captured.err
     assert "invalid TOML" in captured.err
+
+
+# --------------------------------------------------------------------------- #
+# Phase 2 — safety.autonomous_fix gate (spec_023)
+# --------------------------------------------------------------------------- #
+
+
+def test_safety_default_is_autonomous_fix_off() -> None:
+    """An absent profile / freshly-built ``Profile()`` must default to
+    ``safety.autonomous_fix=False`` (spec_023 §2-1 论点1: safe default)."""
+
+    profile = Profile()
+
+    assert profile.safety.autonomous_fix is False
+
+
+def test_safety_autonomous_fix_can_be_enabled_via_toml(tmp_path: Path) -> None:
+    """Operator opts in by writing ``[safety]\\nautonomous_fix = true`` —
+    the loader must surface that as ``profile.safety.autonomous_fix=True``."""
+
+    profile_path = tmp_path / "_ai_workspace" / "ccd_profile.toml"
+    profile_path.parent.mkdir(parents=True)
+    profile_path.write_text(
+        dedent(
+            """
+            [safety]
+            autonomous_fix = true
+            """
+        ).strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    profile = load_profile(tmp_path)
+
+    assert profile.safety.autonomous_fix is True
+
+
+def test_safety_unknown_subfield_raises_value_error(tmp_path: Path) -> None:
+    """``[safety]`` is ``extra="forbid"`` so an unknown subfield
+    (e.g. a reserved Phase-2 knob CCD doesn't yet honor) raises rather
+    than silently being dropped."""
+
+    profile_path = tmp_path / "_ai_workspace" / "ccd_profile.toml"
+    profile_path.parent.mkdir(parents=True)
+    profile_path.write_text(
+        dedent(
+            """
+            [safety]
+            autonomous_fix = true
+            push = "yes-please"
+            """
+        ).strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError) as excinfo:
+        load_profile(tmp_path)
+
+    assert "push" in str(excinfo.value)
+
+
+def test_safety_section_appears_in_render_profile(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """``ccd profile`` surfaces the safety gate in its TOML-shaped render
+    so an operator can copy-paste the block as a starting point."""
+
+    rc = cli.main(["profile", "--repo", str(tmp_path)])
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "[safety]" in out
+    assert "autonomous_fix = false" in out
+
+
+def test_safety_section_renders_true_when_enabled(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    profile_path = tmp_path / "_ai_workspace" / "ccd_profile.toml"
+    profile_path.parent.mkdir(parents=True)
+    profile_path.write_text(
+        "[safety]\nautonomous_fix = true\n",
+        encoding="utf-8",
+    )
+
+    rc = cli.main(["profile", "--repo", str(tmp_path)])
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "autonomous_fix = true" in out
