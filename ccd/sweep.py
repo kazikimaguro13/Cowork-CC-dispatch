@@ -323,6 +323,41 @@ def _process_policy(
         ).resolve()
         proposal_dir = (brief_dir / "proposals").resolve()
 
+    # spec_030 — profile-driven adversarial parser injection. In
+    # genuine registry mode (NOT fallback) a施策 that lists
+    # ``"adversarial"`` in ``discovery.channels`` MUST also configure
+    # ``[discovery.adversarial.parsers]`` — otherwise the sweep skips
+    # the channel rather than silently routing it to CCD's hard-coded
+    # parsers (the Phase 2.5 misfire that motivated this spec).
+    # Fallback mode preserves the spec_015 behavior bit-for-bit: no
+    # parser injection, no skip — adversarial uses ``default_parsers``.
+    adversarial_parsers: Any = None
+    channel_skips: dict[str, str] = {}
+    profile_disc = getattr(entry.profile, "discovery", None)
+    profile_channels = list(getattr(profile_disc, "channels", ()) or ())
+    if not fallback_mode and "adversarial" in profile_channels:
+        adv_cfg = getattr(profile_disc, "adversarial", None)
+        if adv_cfg is None:
+            channel_skips["adversarial"] = (
+                "adversarial channel skipped: profile に "
+                "[discovery.adversarial.parsers] が未設定 "
+                "(CCD のパーサは走らせない — spec_030 §2-3)"
+            )
+        else:
+            from ccd.adversarial import resolve_parser_targets
+
+            try:
+                adversarial_parsers = resolve_parser_targets(adv_cfg.parsers)
+            except ValueError as exc:
+                # Bad import / not callable etc. ── do not silently
+                # fall back to CCD parsers; record as a skip so the
+                # operator sees the misconfiguration in §D.
+                channel_skips["adversarial"] = (
+                    "adversarial channel skipped: cannot resolve "
+                    f"[discovery.adversarial.parsers] — {exc}"
+                )
+                adversarial_parsers = None
+
     # The caller's nightly_kwargs are layered first; the sweep's
     # per-policy overrides win (a test cannot accidentally pin every
     # policy's output to the same path via the kwargs bag).
@@ -333,6 +368,10 @@ def _process_policy(
     call_kwargs["discover_dir"] = discover_dir
     call_kwargs["brief_dir"] = brief_dir
     call_kwargs["proposal_dir"] = proposal_dir
+    if adversarial_parsers is not None:
+        call_kwargs["adversarial_parsers"] = adversarial_parsers
+    if channel_skips:
+        call_kwargs["channel_skips"] = channel_skips
 
     try:
         result = run(**call_kwargs)
@@ -503,6 +542,18 @@ def _summarize_nightly(result: NightlyResult | None) -> str:
     if result.paused:
         return "PAUSE 中 — `_ai_workspace/PAUSE` が在ったので何もしませんでした"
 
+    # spec_030 — count channel-level halts / skips so the index makes
+    # silent failures visible at a glance (the Phase 2.5 misfire's root
+    # cause was that 0-mutants / wrong-parser silently looked like a
+    # successful run in the index). The summary still leads with the
+    # most operator-relevant fact below; the HALT count is appended.
+    halt_count = sum(
+        1
+        for co in (result.channels_run or ())
+        if not bool(co.success) and (co.halt_reason or "")
+    )
+    halt_suffix = f" — HALT {halt_count} 件 (§D 参照)" if halt_count else ""
+
     af = result.auto_fix
     if af is not None:
         mode = getattr(af, "mode", "auto")
@@ -526,9 +577,9 @@ def _summarize_nightly(result: NightlyResult | None) -> str:
     # No auto-fix (fix_mode="off") or auto_fix is None. Surface the
     # mechanical-channel finding count if we have any channels.
     if not result.channels_run:
-        return "発見なし (チャンネル未実行)"
+        return "発見なし (チャンネル未実行)" + halt_suffix
     channel_names = ", ".join(co.channel for co in result.channels_run)
-    return f"発見のみ ({channel_names})"
+    return f"発見のみ ({channel_names}){halt_suffix}"
 
 
 def _format_report_link(

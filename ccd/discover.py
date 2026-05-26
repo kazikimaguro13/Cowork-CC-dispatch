@@ -55,7 +55,7 @@ from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 
 DEFAULT_DISCOVER_DIR_REL = Path("_ai_workspace") / "discover"
 DEFAULT_BLOCKLIST_FILENAME = "blocklist.txt"
@@ -211,6 +211,38 @@ def run_discovery(
             raw_output=outcome.raw_output,
         )
 
+    # spec_030 §2-2 — 0-mutants silent-failure HALT. mutmut returning zero
+    # mutants for a non-empty target list is structurally implausible (any
+    # real Python file contains arithmetic / comparisons / defaults mutmut
+    # can mutate). The Phase 2.5 incident: an iso-venv whose pip install
+    # silently failed left mutmut unable to instrument the target, but
+    # ``outcome.error`` stayed empty and the existing canary fires only on
+    # ``mutants > threshold && killed == 0`` — leaving a "0 mutants"
+    # ``success=True`` report indistinguishable from "no findings". The
+    # honest read is "we don't know whether there were findings": halt
+    # without writing a misleading report. False positives (genuinely
+    # trivial files like ``__init__.py``) are accepted — operators
+    # suppress them by removing the file from ``mutation_paths`` (YAGNI:
+    # no opt-out knob until a real false positive shows up).
+    if not outcome.mutants and target_paths:
+        return DiscoveryResult(
+            success=False,
+            report_md_path=None,
+            report_json_path=None,
+            summary=_empty_summary(outcome.tool, target_paths),
+            actionable_mutants=[],
+            blocklisted_mutants=[],
+            halt_reason=(
+                f"mutation setup likely failed: 0 mutants generated for "
+                f"non-empty targets {list(target_paths)}. "
+                "Possible causes: iso-venv dependency install error, "
+                "mutmut path mismatch, test discovery failure, "
+                "or genuinely trivial Python file "
+                "(suppress via profile.mutation_paths if intended)."
+            ),
+            raw_output=outcome.raw_output,
+        )
+
     blocklist = _load_blocklist(discover_root / DEFAULT_BLOCKLIST_FILENAME)
     survived = [m for m in outcome.mutants if m.status == STATUS_SURVIVED]
     actionable: list[Mutant] = []
@@ -292,6 +324,7 @@ def run_channel(
     mutation_runner: MutationRunner | None = None,
     agent_runner=None,
     discover_dir: Path | None = None,
+    adversarial_parsers: Any = None,
 ):
     """Dispatch one ``ccd discover --channel <channel>`` invocation.
 
@@ -311,6 +344,17 @@ def run_channel(
     other channels; ``agent_runner`` is the AI channel's seam (the same
     ``AgentRunner`` abstraction ``dispatch`` / ``retrospect`` use) and
     is ignored for the mutation / adversarial channels.
+
+    spec_030: ``adversarial_parsers`` is the profile-driven parser
+    injection — a tuple of resolved ``_Parser`` objects from
+    :func:`ccd.adversarial.resolve_parser_targets`. ``None`` means the
+    caller did not supply parsers; the adversarial channel then falls
+    back to :func:`ccd.adversarial.default_parsers` (the CCD-only
+    hard-coded set) so single-invocation ``ccd discover --channel
+    adversarial`` keeps its spec_015 behavior. The sweep entry point
+    deliberately decides BEFORE calling ``run_channel`` whether to pass
+    a profile-driven list or skip the channel — it never falls back
+    here.
     """
 
     if channel == CHANNEL_MUTATION:
@@ -327,7 +371,11 @@ def run_channel(
         # circular load order on first use.
         from ccd.adversarial import run_adversarial
 
-        return run_adversarial(repo=repo, discover_dir=discover_dir)
+        return run_adversarial(
+            repo=repo,
+            discover_dir=discover_dir,
+            parsers=adversarial_parsers,
+        )
     if channel == CHANNEL_AI:
         # Same lazy-import rationale as the adversarial channel.
         from ccd.agent import ClaudeCodeRunner

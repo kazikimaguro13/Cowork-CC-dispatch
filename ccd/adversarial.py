@@ -44,6 +44,7 @@ Hang detection is *not* attempted here — see Open questions in result_015.
 
 from __future__ import annotations
 
+import importlib
 import json
 import re
 import tempfile
@@ -54,6 +55,7 @@ from pathlib import Path
 from pydantic import ValidationError
 
 from ccd.discover import DEFAULT_DISCOVER_DIR_REL
+from ccd.profile import ParserTarget
 from ccd.protocol import parse_result, parse_spec
 from ccd.run_writer import load_records, reconcile_run_file
 
@@ -169,6 +171,14 @@ def default_parsers() -> tuple[_Parser, ...]:
     ``reconcile_run_file`` is included even though it *writes* on success
     — we feed it a tmp file, so its write happens inside the disposable
     fixture tree, never in the live repo.
+
+    spec_030: this remains the **single-invocation CLI fallback**
+    (``ccd discover --channel adversarial``) — no profile context, no
+    target施策, so the natural answer is "scan CCD's own parsers". The
+    sweep path (``ccd nightly-all``) deliberately does NOT use this
+    fallback: per spec_030 §2-3 a sweep-mode施策 without
+    ``[discovery.adversarial.parsers]`` is **skipped** rather than
+    running on the wrong code (the Phase 2.5 misfire).
     """
 
     return (
@@ -177,6 +187,94 @@ def default_parsers() -> tuple[_Parser, ...]:
         _Parser("ccd.run_writer.load_records", load_records),
         _Parser("ccd.run_writer.reconcile_run_file", reconcile_run_file),
     )
+
+
+def resolve_parser_targets(
+    targets: Iterable[ParserTarget],
+) -> tuple[_Parser, ...]:
+    """Resolve a ``[ParserTarget, ...]`` list into runnable ``_Parser``s.
+
+    Each target's ``import`` field is a dotted ``module(.sub)*.attr``
+    path; we split off the trailing attribute, ``importlib.import_module``
+    the parent, and ``getattr`` the attribute. Resolution failures raise
+    ``ValueError`` with the offending import string included so the sweep
+    surfaces the bad profile loudly (spec_030 §1 "正直な計測" — silent
+    failures are the bug we are fixing).
+
+    The wrapper bound to ``_Parser.fn`` adapts the call shape to
+    :data:`ParserTarget.input_kind`:
+
+    - ``"path"`` — the target callable accepts a :class:`Path`. This is
+      the spec_015 contract and what the CCD-default parsers want.
+    - ``"bytes"`` — the channel reads the fixture bytes and passes them
+      directly. Use when the parser accepts raw bytes (e.g. ``def
+      parse(content: bytes)``).
+    - ``"str"`` — the channel decodes the fixture as UTF-8 with
+      ``errors="replace"`` (so invalid-UTF-8 fixtures still reach the
+      parser) and passes a ``str``.
+    """
+
+    resolved: list[_Parser] = []
+    for target in targets:
+        fn = _resolve_dotted_name(target.import_)
+        kind = target.input_kind
+        if kind == "path":
+            wrapped = fn
+        elif kind == "bytes":
+            def wrapped(fixture: Path, _fn: Callable[..., object] = fn) -> object:
+                return _fn(fixture.read_bytes())
+        elif kind == "str":
+            def wrapped(fixture: Path, _fn: Callable[..., object] = fn) -> object:
+                return _fn(fixture.read_text(encoding="utf-8", errors="replace"))
+        else:
+            # Pydantic validation guards this branch; defensive raise so
+            # an unsupported kind cannot silently degrade to "path".
+            raise ValueError(
+                f"unsupported ParserTarget.input_kind={kind!r} for "
+                f"import {target.import_!r}"
+            )
+        resolved.append(_Parser(name=target.import_, fn=wrapped))
+    return tuple(resolved)
+
+
+def _resolve_dotted_name(dotted: str) -> Callable[..., object]:
+    """Resolve ``module.sub.attr`` → the bound callable.
+
+    Splits on the final dot so submodule paths (e.g.
+    ``pkg.sub.module.func``) work without operators having to specify
+    where the module ends. Both an :class:`ImportError` (module missing)
+    and an :class:`AttributeError` (attribute missing) become a
+    :class:`ValueError` that names the failing target — the sweep
+    treats this as a registry-level halt so the operator fixes the
+    profile rather than silently routing the channel elsewhere.
+    """
+
+    if "." not in dotted:
+        raise ValueError(
+            f"adversarial parser target {dotted!r} is not a dotted path "
+            "(expected module(.sub)*.attr)"
+        )
+    module_name, _, attr_name = dotted.rpartition(".")
+    try:
+        mod = importlib.import_module(module_name)
+    except ImportError as exc:
+        raise ValueError(
+            f"adversarial parser target {dotted!r}: cannot import "
+            f"module {module_name!r} — {exc}"
+        ) from exc
+    try:
+        attr = getattr(mod, attr_name)
+    except AttributeError as exc:
+        raise ValueError(
+            f"adversarial parser target {dotted!r}: module "
+            f"{module_name!r} has no attribute {attr_name!r}"
+        ) from exc
+    if not callable(attr):
+        raise ValueError(
+            f"adversarial parser target {dotted!r}: resolved object is "
+            f"not callable (got {type(attr).__name__})"
+        )
+    return attr
 
 
 # --------------------------------------------------------------------------- #
@@ -648,5 +746,6 @@ __all__ = [
     "UNGRACEFUL_OVERRIDES",
     "default_cases",
     "default_parsers",
+    "resolve_parser_targets",
     "run_adversarial",
 ]

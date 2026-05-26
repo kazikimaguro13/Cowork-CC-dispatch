@@ -455,9 +455,17 @@ def test_cli_discover_channel_ai_end_to_end(
 def test_cli_discover_default_channel_remains_mutation(
     repo: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """spec_013 挙動 不変 — ``--channel`` omitted still means mutation."""
+    """spec_013 挙動 不変 — ``--channel`` omitted still means mutation.
 
-    runner = FakeMutationRunner(mutants=[])
+    spec_030 update: feed at least one mutant so the 0-mutants
+    silent-failure HALT does not fire (channel routing test, not the
+    HALT guard)."""
+
+    from ccd.discover import STATUS_KILLED, Mutant
+
+    runner = FakeMutationRunner(
+        mutants=[Mutant(file="ccd/x.py", line=1, mutation="m", status=STATUS_KILLED)]
+    )
     rc = cli.main(["discover", "--repo", str(repo)], mutation_runner=runner)
     assert rc == 0
     assert len(runner.calls) == 1
@@ -482,7 +490,11 @@ def test_cli_discover_channel_adversarial_still_works(
 def test_cli_discover_channel_mutation_explicit_still_works(
     repo: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    runner = FakeMutationRunner(mutants=[])
+    from ccd.discover import STATUS_KILLED, Mutant
+
+    runner = FakeMutationRunner(
+        mutants=[Mutant(file="ccd/x.py", line=1, mutation="m", status=STATUS_KILLED)]
+    )
     rc = cli.main(
         ["discover", "--repo", str(repo), "--channel", CHANNEL_MUTATION],
         mutation_runner=runner,
