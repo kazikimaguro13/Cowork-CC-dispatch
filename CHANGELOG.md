@@ -2,6 +2,103 @@
 
 本プロジェクトの注目すべき変更を記録する。フォーマットは [Keep a Changelog](https://keepachangelog.com/) に準ずる。
 
+## [0.19.0] — 2026-05-27
+
+spec_030 — **Phase 2.5 実走で発覚した 2 つの「沈黙失敗」の構造修正**。v0.18.0 で複数施策の巡回 (`ccd nightly-all`) が点火した直後、CCD 自身 + axis-knowledge-rag の 2 施策で sweep を回したところ、ふたつの欠陥が顕在化した:
+
+1. **adversarial が CCD のパーサに固定**：axis-knowledge-rag プロファイルから adversarial channel を起動したのに、対象パーサが CCD ハードコード（`ccd.protocol.parse_spec` / etc.）に走り、`UnicodeDecodeError` 8 件の発見が axis のレポート silo に書かれた ── 完全な誤検出。
+2. **`mutants_total = 0` の沈黙失敗**：axis-knowledge-rag の `_decay.py` (61 行、mutate 可能な式多数) の mutation channel が **0 mutants** を返した。実態は iso-venv の `pip install` が axis の重い依存（chromadb / google-generativeai / streamlit）の install に失敗していた可能性が高いが、`IsoVenvProvisioningError` は raise されず、spec_019 のカナリア (`mutants_total ≥ threshold && killed == 0`) は **`mutants_total = 0` を素通り**する設計。
+
+両方とも v2 の「**正直な計測**」原則（`docs/DESIGN.md §9.4 / §9.6` ── 「観測できていない失敗を推測で埋めない」「無意味なレポートを出さず停止する」）の穴。任意 repo に向けたときの沈黙失敗を防ぐ補強を 1 spec で扱う (minor bump = 新機能 + 沈黙失敗の可視化):
+
+### Added
+
+- **`ccd/profile.py` に `AdversarialConfig` / `ParserTarget` を追加** (spec_030 §2-1):
+  - 新規 `ParserTarget` (pydantic `BaseModel`, `extra="forbid"`):
+    - `import: str` (TOML 上は `import`、Python 上は `import_` で alias)。完全修飾名相当の正規表現 (`module(.sub)*.attr` ── 英数字 + `.` + `_`、先頭非数字、ドット 1 つ以上) でバリデート。シェルインジェクションやパス区切りタイポを load 時点で reject。
+    - `input_kind: Literal["path", "bytes", "str"] = "path"`。spec_015 の `_Parser.fn(Path) → object` 契約をデフォルト維持。`"bytes"` / `"str"` は fixture の bytes/str を直接渡す形に wrap。
+  - 新規 `AdversarialConfig` (pydantic `BaseModel`, `extra="forbid"`):
+    - `parsers: list[ParserTarget]`。**空リストは reject** (typo であって意図ではない、disable したいなら `channels` から `"adversarial"` を外す)。
+  - `DiscoveryConfig` に新規 `adversarial: AdversarialConfig | None = None` フィールド。`None` は「未設定」（`[discovery.adversarial]` が TOML に無い）。`[]` 空リストは validator で reject。
+  - 既存 `KNOWN_CHANNELS` / `mutation_paths` / `channels` / `schedule` 等は **1 行も touch していない** ── spec §3 「コアロジック不変」遵守。
+  - `render_profile` を adversarial 出力に対応 ── `[[discovery.adversarial.parsers]]` 行を round-trippable に emit。
+  - 新規定数 `_ADVERSARIAL_IMPORT_RE` ── 完全修飾名の正規表現を 1 箇所に集中。
+- **`ccd/discover.py:run_discovery` に 0-mutants HALT 分岐を追加** (spec_030 §2-2):
+  - 既存の `outcome.error` 分岐の **直後**に新規 HALT 分岐:
+    - 条件: `outcome.error is None` **かつ** `not outcome.mutants` **かつ** `target_paths` 非空。
+    - `DiscoveryResult(success=False, ..., halt_reason="mutation setup likely failed: 0 mutants generated for non-empty targets ...")` を返す ── 報告ファイル (md/json) **未作成** (既存 `outcome.error` 経路と同じ扱い)。
+    - halt_reason には 4 つの可能性 (iso-venv 依存 install エラー / mutmut path 不一致 / test discovery 失敗 / genuinely trivial Python file) を文面に列挙、最後に「`profile.mutation_paths` で抑制したい場合の opt-out なし — YAGNI、必要になったら追加」と記述。
+  - 既存 spec_019 カナリア (`_detect_broken_mutation_setup`、`mutants_total ≥ threshold && killed == 0`) は **不変で並列稼働**。両者は別バリアントを埋める ── 0 mutants HALT と spec_019 カナリアを並列に持つことで「mutmut が走らなかった」「mutmut は走ったが mutation を見ていない」の両方を捕まえる。
+  - **偽陽性は許す・偽陰性は許さない**：`__init__.py` 等の trivial ファイルで誤 HALT が出る可能性は受容。opt-out (profile.suppress_zero_mutants 等) は本 spec では入れない (YAGNI、本当に必要になってから)。
+- **`ccd/adversarial.py` に `resolve_parser_targets` を追加** (spec_030 §2-3):
+  - 既存 `run_adversarial(parsers=None)` シグネチャは **不変** ── `parsers=None` のとき `default_parsers()` を使うフォールバック挙動も bit-for-bit 維持 (spec_015 single-CLI invocation 後方互換)。
+  - 新規 `resolve_parser_targets(targets: Iterable[ParserTarget]) -> tuple[_Parser, ...]`:
+    - 各 `ParserTarget.import` を `importlib.import_module` + `getattr` で解決。
+    - `input_kind` に応じて `_Parser.fn` を wrap (`"path"` → そのまま / `"bytes"` → `read_bytes` / `"str"` → `read_text(errors="replace")`)。
+    - 解決失敗 (`ImportError` / `AttributeError` / non-callable) は **`ValueError` で loud に raise** ── silently `default_parsers` にフォールバックしない (沈黙失敗の防止が本 spec の主旨)。
+  - 内部ヘルパー `_resolve_dotted_name(dotted: str) -> Callable` ── 最後のドットで `module_name` と `attr_name` を分割、`importlib.import_module(module_name)` + `getattr(mod, attr_name)`、callable チェック。
+  - 既存 `default_parsers()` の docstring を更新 ── 「**単体実行 CLI fallback**」と明示、sweep 経路では fallback を使わない旨を明記。
+  - `__all__` に `resolve_parser_targets` を追加。
+- **`ccd/discover.py:run_channel` に `adversarial_parsers` 引数を追加** (spec_030 §2-3):
+  - 新規キーワード引数 `adversarial_parsers: Any = None` (`tuple[_Parser, ...] | None` のダックタイプ)。
+  - adversarial channel 経路で `adversarial_parsers is not None` のときに `run_adversarial(parsers=adversarial_parsers, ...)` に forward。
+  - `adversarial_parsers=None` (single-CLI / 既存 `ccd discover --channel adversarial`) のときは `run_adversarial(parsers=None)` で `default_parsers()` にフォールバック ── spec_015 既存テストは **無修正で green**。
+- **`ccd/nightly.py:run_nightly` に `adversarial_parsers` / `channel_skips` 引数を追加** (spec_030 §2-3):
+  - `adversarial_parsers: Any = None`: sweep 経路で profile-driven parsers を渡すための seam。`_run_channels` 経由で `run_channel(channel="adversarial", adversarial_parsers=...)` に forward。
+  - `channel_skips: dict[str, str] | None = None`: sweep が施策のチャンネルを「実行せずに skip」する旨と理由を通知する seam。skip対象は `effective_profile.discovery.channels` から除外して `_run_channels` を呼び、skip 後に **synthetic `ChannelOutcome`** (`success=False`, `halt_reason=<理由>`) を append ── 朝レポート §D が verbatim に surface する。
+  - `_run_channels` シグネチャに `adversarial_parsers: Any = None` を追加、adversarial channel のときだけ `kwargs["adversarial_parsers"] = adversarial_parsers` を入れる構造。
+  - `run_brief_fn(...)` 呼び出しに `channel_outcomes=tuple(channel_outcomes)` を追加。
+  - **`_run_auto_fix_loop` / `_run_propose_loop` の dispatch / R5 / R4 / guard / merge / patch save 本体は 1 行も touch していない** (spec §3 遵守)。
+- **`ccd/sweep.py:_process_policy` に adversarial routing を追加** (spec_030 §2-3):
+  - `fallback_mode=False` (genuine registry sweep) かつ profile.discovery.channels に `"adversarial"` を含む施策について:
+    - `profile.discovery.adversarial is None` → `channel_skips["adversarial"] = "adversarial channel skipped: profile に [discovery.adversarial.parsers] が未設定..."` を立てて `run_nightly` に forward。CCD のハードコードパーサは **走らせない** (Phase 2.5 誤検出の構造的解決)。
+    - `profile.discovery.adversarial is not None` → `resolve_parser_targets(...)` で解決して `adversarial_parsers` に forward。解決失敗 (`ValueError`) も skip 扱い (silently default にしない)。
+  - `fallback_mode=True` (`profiles/` ディレクトリ無し、legacy `ccd_profile.toml`) では skip / 注入のいずれも行わず、spec_015 既存挙動を bit-for-bit 維持 (デフォルトのフォールバックパーサが走る)。
+  - 既存 `discover_dir` / `brief_dir` / `proposal_dir` のパスリダイレクト・失敗隔離 (论点4)・横断インデックス出力は **不変**。
+- **`ccd/sweep.py` の `_summarize_nightly` に HALT カウント追加** (spec_030 §2-4):
+  - `result.channels_run` 内の `success=False && halt_reason` 数をカウント、`f"... — HALT {count} 件 (§D 参照)"` を suffix として append。
+  - 横断インデックスの 1 行サマリで沈黙失敗が見えるようになる (Phase 2.5 misfire を index 段階で捕捉)。
+- **`ccd/brief.py` に `channel_outcomes` 引数を追加 + §A / §D を拡張** (spec_030 §2-4):
+  - `run_brief(..., channel_outcomes: Sequence[ChannelOutcome] | None = None)` ── nightly orchestrator が channel halts / skips を渡す seam。
+  - `_render_section_a` に新引数 `channel_halt_count: int = 0`、`channel_halt_count > 0` のとき `f"**HALT {count} 件** (§D 参照)"` を §A の bullet 列に append (沈黙失敗を front page で surface)。
+  - `_render_section_d` に新引数 `channel_outcomes: Sequence[ChannelOutcome] | None = None`:
+    - `channel_outcomes` の `success=False && halt_reason` を channel 名でインデックス化。
+    - `summary.channels_missing` 内の channel について `channel_outcomes` に対応する halt_reason があれば「**<ラベル>** halt: <reason>」を出力 (mutation 0-mutants HALT / adversarial skip がここ)。なければ既存の「discover_NNN.json が見つからなかった (未実行)」フォールバック。
+    - 未マッチの outcomes (familiar でない channel) も最後に surface ── silently 落とさない (`docs/DESIGN.md §9.4`「正直な計測」)。
+  - 既存 §B / §C / §E / §F は **1 行も touch していない** (spec §3 「render 系コアロジック」を最小変更で達成)。
+- **`_ai_workspace/profiles/ccd.toml` に `[[discovery.adversarial.parsers]]` を明示** (spec_030 §2-5):
+  - CCD 既定の 4 パーサ (`ccd.protocol.parse_spec` / `parse_result` / `ccd.run_writer.load_records` / `reconcile_run_file`) を `input_kind = "path"` で `[discovery.adversarial.parsers]` 配列に明示。
+  - これによりハードコードリストは「**`ccd/adversarial.py:default_parsers` (= 単体実行 fallback)**」の 1 箇所のみに集中、運用設定とコードの責務が分離。
+  - `_ai_workspace/profiles/axis-knowledge-rag.toml` は本 spec の作業範囲外 (中島さんが運用で `[discovery.adversarial.parsers]` を書くかは別判断、書かなければ skip される現状で問題なし、spec §2-5 後段)。
+
+### Added (tests)
+
+- **`tests/test_profile.py` に AdversarialConfig / ParserTarget の検証テスト (+10 件)** ── defaults / TOML round-trip / 空リスト reject / 不正 `input_kind` reject / 不正 `import` 文字列 reject (3 バリエーション) / `mutation_paths` 不変 pin。
+- **`tests/test_discover.py` に 0-mutants HALT の検証テスト (+4 件 + 既存 3 件の更新)** ── `outcome.error` 経路との分離 / killed mutant で HALT 不発 / spec_019 カナリアと並列稼働 (文言混在なし) / 既存 `test_zero_mutants_is_graceful` を `test_zero_mutants_is_halt_for_non_empty_targets` に rename して spec_030 文言を assert。
+- **`tests/test_adversarial.py` に `resolve_parser_targets` の検証テスト (+8 件)** ── ドット名解決 / `input_kind` 3 種の wrap (`bytes` / `str` は `tests/_adversarial_targets_for_test.py` をターゲット利用) / 解決失敗 3 種で `ValueError` / `run_adversarial` の injection vs fallback。
+- **`tests/_adversarial_targets_for_test.py` を新規追加** ── テスト用解決ターゲット。
+- **`tests/test_ai_review.py` の `test_cli_discover_default_channel_remains_mutation` / `_channel_mutation_explicit_still_works` を mutant 投入に更新** (spec_030 HALT 不発)。
+- **`tests/test_sweep.py` に sweep adversarial routing テスト (+4 件)** ── 未設定 → skip / 設定済 → parsers 注入 / 解決失敗 → skip 文言 / fallback_mode は変化なし (spec_015 carry)。
+- **`tests/test_brief.py` に §D / §A surfacing テスト (+5 件 + `_extract_section` ヘルパー)** ── mutation 0-mutants HALT / adversarial skip が §D に halt 文言で出る / §A の HALT カウント / no-halts では §A noise なし / `channel_outcomes` 省略時は既存挙動。
+- **`tests/test_smoke.py` の `test_version_is_0180` → `test_version_is_0190`**、assert を `"0.19.0"` に追従。
+
+### Constraints
+
+- **`ccd/{models,protocol,dispatch,chain,integrate,metrics,dashboard,run_writer,retry,backfill,agent,retrospect,ai_review,translate,guard}.py` のコアロジックは 1 行も touch していない** (spec §3 「触ってはいけない」逐語遵守)。
+- **`ccd/nightly.py` の変更は計 4 箇所のみ** ── (a) `run_nightly` シグネチャに 2 引数追加 (default `None`)、(b) `_run_channels` の adversarial channel 経路に kwarg 追加、(c) `run_brief_fn` 呼び出しに `channel_outcomes=` 追加、(d) skip channel 分岐。**`_run_auto_fix_loop` / `_run_propose_loop` の dispatch / R5 / R4 / guard / merge / patch save 本体は不変**。
+- 自律修正ループ (`nightly.py`)・インチキ修正ガード (`guard.py`)・翻訳 (`translate.py`)・提案モード (spec_028)・複数施策の巡回 (spec_029) の本体ロジックは不変。本 spec は発見チャンネル層への追加と HALT 経路の補強のみ。
+- **`docs/` / `docs/data/*.json` は触っていない** (Phase 3 全体の `docs/DESIGN.md` 更新は別 spec の責務、spec_027 / spec_028 / spec_029 result と同じ精神)。
+- **`ccd discover --channel adversarial` 単体実行は不変** ── プロファイル context 無しは `default_parsers()` フォールバック (spec_015 既存テストは無修正で green)。
+- **既存の単一プロファイル運用も不変** ── `profiles/` 無しの legacy single-profile fallback で adversarial が `default_parsers()` を使う挙動は bit-for-bit 維持。
+- 安全境界レベル 2 は不変。
+- ローカル commit のみ、push しない／ブランチ操作・merge しない。
+
+### Verification
+
+- ``ruff check .`` → ``All checks passed!``
+- ``pytest -q`` → ``595 passed in 19.33s`` (spec_013〜029 既存 564 件 + spec_030 新規 +31 件 ── 全件 green)。
+- ``python3 -m ccd --version`` → ``ccd 0.19.0``。
+
 ## [0.18.0] — 2026-05-26
 
 spec_029 — **v2 Phase 3 の 3 本目の spec**。spec_028 で **提案モード (`fix_mode="propose"`)** が入り、CCD のモードが3つ（`auto` / `propose` / `off`）になった。これでクライアント施策の repo に向けられる中身は揃った ── が、CCD は依然 **1 施策 (1 repo) しか相手にできない**（プロファイルは `_ai_workspace/ccd_profile.toml` 1枚、`ccd nightly` は `--repo` を1つ取るだけ）。施策が増えると「タスクを N 個手で登録」になってしまう。

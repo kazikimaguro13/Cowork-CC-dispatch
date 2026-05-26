@@ -93,10 +93,21 @@ import re
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 KNOWN_CHANNELS: tuple[str, ...] = ("mutation", "adversarial", "ai")
+
+# spec_030 — adversarial parser ``import`` field validation. The string
+# must be a Python-style fully-qualified attribute path: dotted segments
+# of letters / digits / underscores, each segment starting with a letter
+# or underscore. The regex deliberately rejects path separators, shell
+# metachars, hyphens, and leading digits so a typo or shell injection
+# attempt is caught at load time rather than after a long sweep.
+_ADVERSARIAL_IMPORT_RE = re.compile(
+    r"^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+$"
+)
 
 # Templates the autonomous-fix loop knows how to handle. ``"A"`` = mutation
 # survivor → test-only fix (spec_022/spec_023). ``"B"`` = adversarial
@@ -164,8 +175,88 @@ _HHMM_RE = re.compile(r"^(?:[01]\d|2[0-3]):[0-5]\d$")
 # --------------------------------------------------------------------------- #
 
 
+class ParserTarget(BaseModel):
+    """One adversarial parser entry (spec_030 §2-1).
+
+    Operators write this as a TOML ``[[discovery.adversarial.parsers]]``
+    array-of-tables entry — the registry-time analogue of the hard-coded
+    ``default_parsers()`` list ``ccd/adversarial.py`` carried before
+    spec_030. The string ``import`` is resolved at sweep time via a
+    dotted-name lookup (``importlib`` + ``getattr``) so the profile
+    decides which target repo's parsers the channel observes — CCD's own
+    parsers are NOT used when this list is supplied, which prevents the
+    sweep silently exercising the wrong code (the Phase 2.5 misfire).
+
+    ``input_kind`` constrains how the channel feeds the fixture to the
+    parser:
+
+    - ``"path"`` (the spec_015 contract) — pass a ``Path`` pointing at a
+      tmp file containing the fixture bytes. The CCD-default parsers all
+      use this shape.
+    - ``"bytes"`` — pass the raw fixture bytes directly. Use for parsers
+      that accept ``bytes`` without writing to disk.
+    - ``"str"`` — pass the fixture decoded as UTF-8 (``errors="replace"``
+      so invalid-UTF-8 cases still reach the parser as adversarial input).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    import_: str = Field(alias="import")
+    input_kind: Literal["path", "bytes", "str"] = "path"
+
+    @field_validator("import_")
+    @classmethod
+    def _import_well_formed(cls, v: str) -> str:
+        if not isinstance(v, str) or not v.strip():
+            raise ValueError(
+                "ParserTarget.import must be a non-empty dotted import path"
+            )
+        v = v.strip()
+        if not _ADVERSARIAL_IMPORT_RE.fullmatch(v):
+            raise ValueError(
+                f"ParserTarget.import {v!r} is not a valid dotted name — "
+                "must match module(.sub)*.attr (letters/digits/underscore, "
+                "non-numeric first character per segment, at least one dot)"
+            )
+        return v
+
+
+class AdversarialConfig(BaseModel):
+    """Adversarial-channel parser injection (spec_030 §2-1).
+
+    The presence of this block in a profile means "this施策 owns its own
+    adversarial parser list — use that instead of the CCD default". An
+    absent block (``DiscoveryConfig.adversarial is None``) means "no
+    adversarial parsers configured for this施策 — sweep mode skips the
+    channel rather than silently running CCD's own parsers on the
+    施策's behalf" (spec_030 §1-1: the Phase 2.5 misfire).
+
+    An empty list is rejected (``ValueError``) — operators who really
+    want to disable the channel should drop ``"adversarial"`` from
+    ``DiscoveryConfig.channels`` instead. An empty parsers list is a
+    typo, not an intent.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    parsers: list[ParserTarget] = Field(default_factory=list)
+
+    @field_validator("parsers")
+    @classmethod
+    def _parsers_non_empty(cls, v: list[ParserTarget]) -> list[ParserTarget]:
+        if not v:
+            raise ValueError(
+                "discovery.adversarial.parsers must list at least one "
+                "[[discovery.adversarial.parsers]] entry; "
+                "to disable the channel drop 'adversarial' from "
+                "discovery.channels instead"
+            )
+        return v
+
+
 class DiscoveryConfig(BaseModel):
-    """Discovery-channel settings (spec_018 §2-2)."""
+    """Discovery-channel settings (spec_018 §2-2; adversarial added by
+    spec_030)."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -175,6 +266,14 @@ class DiscoveryConfig(BaseModel):
     mutation_paths: list[str] = Field(
         default_factory=lambda: ["ccd"],
     )
+    # spec_030 — opt-in per-policy adversarial parser injection. ``None``
+    # means "the profile did not configure the adversarial channel"; the
+    # sweep path then skips the channel rather than silently routing it
+    # to CCD's hard-coded parsers (the Phase 2.5 misfire). Single-policy
+    # ``ccd discover --channel adversarial`` invocations still fall back
+    # to the hard-coded defaults so existing spec_015 behavior is
+    # bit-for-bit unchanged.
+    adversarial: AdversarialConfig | None = None
 
     @field_validator("channels")
     @classmethod
@@ -495,6 +594,12 @@ def render_profile(result: ProfileLoadResult) -> str:
     lines.append("channels = " + _toml_str_list(p.discovery.channels))
     lines.append("mutation_paths = " + _toml_str_list(p.discovery.mutation_paths))
     lines.append("")
+    if p.discovery.adversarial is not None:
+        for parser in p.discovery.adversarial.parsers:
+            lines.append("[[discovery.adversarial.parsers]]")
+            lines.append(f'import = "{parser.import_}"')
+            lines.append(f'input_kind = "{parser.input_kind}"')
+            lines.append("")
     lines.append("[schedule]")
     lines.append(f'nightly_at = "{p.schedule.nightly_at}"')
     lines.append(f'cadence = "{p.schedule.cadence}"')

@@ -42,6 +42,18 @@ def repo(tmp_path: Path) -> Path:
     return tmp_path
 
 
+def _one_killed_mutant() -> list:
+    """One killed Mutant so the spec_030 0-mutants HALT does not fire.
+
+    Tests that exercise channel routing (not the mutation summary
+    itself) just need *some* mutant in the run; we use ``killed`` so the
+    spec_019 canary stays quiet as well."""
+
+    from ccd.discover import STATUS_KILLED, Mutant
+
+    return [Mutant(file="ccd/x.py", line=1, mutation="m", status=STATUS_KILLED)]
+
+
 # --------------------------------------------------------------------------- #
 # Default catalog — fixed, curated, deterministic
 # --------------------------------------------------------------------------- #
@@ -487,9 +499,13 @@ def test_tmp_fixture_dir_is_cleaned_up_on_exit(repo: Path) -> None:
 def test_cli_discover_default_channel_is_mutation(
     repo: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """spec_013 挙動 不変 — no ``--channel`` flag means mutation channel."""
+    """spec_013 挙動 不変 — no ``--channel`` flag means mutation channel.
 
-    runner = FakeMutationRunner(mutants=[])
+    spec_030 update: feed at least one mutant so the 0-mutants silent-
+    failure HALT does not fire (this test pins channel routing, not
+    the 0-mutants guard)."""
+
+    runner = FakeMutationRunner(mutants=_one_killed_mutant())
     rc = cli.main(["discover", "--repo", str(repo)], mutation_runner=runner)
 
     assert rc == 0
@@ -506,7 +522,7 @@ def test_cli_discover_explicit_channel_mutation(
 ) -> None:
     """Explicit ``--channel mutation`` matches the default behavior."""
 
-    runner = FakeMutationRunner(mutants=[])
+    runner = FakeMutationRunner(mutants=_one_killed_mutant())
     rc = cli.main(
         ["discover", "--repo", str(repo), "--channel", CHANNEL_MUTATION],
         mutation_runner=runner,
@@ -614,3 +630,181 @@ def test_summary_dataclass_is_frozen() -> None:
     )
     with pytest.raises(FrozenInstanceError):
         s.cases_total = 5  # type: ignore[misc]
+
+
+# --------------------------------------------------------------------------- #
+# spec_030 — adversarial parser target resolution (profile injection seam)
+# --------------------------------------------------------------------------- #
+
+
+def test_resolve_parser_targets_resolves_dotted_path() -> None:
+    """spec_030 §2-3 — the resolver looks up dotted attribute paths
+    via ``importlib`` + ``getattr`` and returns runnable ``_Parser``
+    objects whose ``name`` is the import string verbatim (so reports
+    and §D entries reference the configured target, not an alias)."""
+
+    from ccd.adversarial import resolve_parser_targets
+    from ccd.profile import ParserTarget
+
+    targets = [
+        ParserTarget(**{"import": "ccd.protocol.parse_spec", "input_kind": "path"}),
+        ParserTarget(**{"import": "ccd.run_writer.load_records", "input_kind": "path"}),
+    ]
+    parsers = resolve_parser_targets(targets)
+
+    assert len(parsers) == 2
+    assert parsers[0].name == "ccd.protocol.parse_spec"
+    assert parsers[1].name == "ccd.run_writer.load_records"
+    # The wrapper for input_kind="path" is the raw imported callable
+    # (or a thin path-passing wrapper) — either way the resolved
+    # ``_Parser.fn`` is callable.
+    assert callable(parsers[0].fn)
+
+
+def test_resolve_parser_targets_supports_input_kind_bytes(tmp_path: Path) -> None:
+    """spec_030 §2-3 — ``input_kind="bytes"`` reads the fixture file's
+    raw bytes and passes them directly. We verify by routing to a
+    module-level helper that records what it received."""
+
+    from ccd.adversarial import resolve_parser_targets
+    from ccd.profile import ParserTarget
+    from tests import _adversarial_targets_for_test as t
+
+    t.received.clear()
+    targets = [
+        ParserTarget(
+            **{
+                "import": "tests._adversarial_targets_for_test.record_bytes",
+                "input_kind": "bytes",
+            }
+        )
+    ]
+    parsers = resolve_parser_targets(targets)
+    fixture = tmp_path / "fixture.bin"
+    fixture.write_bytes(b"\xff\xfe\x80 garbage")
+
+    parsers[0].fn(fixture)
+
+    assert t.received == [(b"\xff\xfe\x80 garbage", "bytes")]
+
+
+def test_resolve_parser_targets_supports_input_kind_str(tmp_path: Path) -> None:
+    """spec_030 §2-3 — ``input_kind="str"`` decodes the fixture as
+    UTF-8 (``errors="replace"`` so invalid-UTF-8 fixtures still reach
+    the parser as adversarial input)."""
+
+    from ccd.adversarial import resolve_parser_targets
+    from ccd.profile import ParserTarget
+    from tests import _adversarial_targets_for_test as t
+
+    t.received.clear()
+    targets = [
+        ParserTarget(
+            **{
+                "import": "tests._adversarial_targets_for_test.record_str",
+                "input_kind": "str",
+            }
+        )
+    ]
+    parsers = resolve_parser_targets(targets)
+    fixture = tmp_path / "fixture.bin"
+    fixture.write_bytes(b"hello\xff world")
+
+    parsers[0].fn(fixture)
+
+    assert len(t.received) == 1
+    payload, kind = t.received[0]
+    assert kind == "str"
+    assert isinstance(payload, str)
+    assert "hello" in payload and "world" in payload
+
+
+def test_resolve_parser_targets_raises_for_unknown_module() -> None:
+    """spec_030 §2-3 — unresolvable targets raise ``ValueError`` with
+    the bad import string so the operator sees the misconfiguration
+    rather than silently falling back to CCD parsers."""
+
+    from ccd.adversarial import resolve_parser_targets
+    from ccd.profile import ParserTarget
+
+    targets = [
+        ParserTarget(
+            **{"import": "ccd_does_not_exist.parser", "input_kind": "path"}
+        )
+    ]
+    with pytest.raises(ValueError, match="cannot import"):
+        resolve_parser_targets(targets)
+
+
+def test_resolve_parser_targets_raises_for_missing_attribute() -> None:
+    """spec_030 §2-3 — module exists but attribute doesn't → loud
+    error rather than silent degradation."""
+
+    from ccd.adversarial import resolve_parser_targets
+    from ccd.profile import ParserTarget
+
+    targets = [
+        ParserTarget(**{"import": "ccd.protocol.does_not_exist", "input_kind": "path"})
+    ]
+    with pytest.raises(ValueError, match="has no attribute"):
+        resolve_parser_targets(targets)
+
+
+def test_resolve_parser_targets_raises_for_non_callable() -> None:
+    """spec_030 §2-3 — the resolved attribute must be callable.
+    ``ccd.discover.DEFAULT_DISCOVER_DIR_REL`` is a ``Path`` constant —
+    the resolver rejects it loudly."""
+
+    from ccd.adversarial import resolve_parser_targets
+    from ccd.profile import ParserTarget
+
+    targets = [
+        ParserTarget(
+            **{
+                "import": "ccd.discover.DEFAULT_DISCOVER_DIR_REL",
+                "input_kind": "path",
+            }
+        )
+    ]
+    with pytest.raises(ValueError, match="not callable"):
+        resolve_parser_targets(targets)
+
+
+def test_run_adversarial_uses_injected_parsers_not_defaults(repo: Path) -> None:
+    """spec_030 §2-3 — when ``parsers`` is provided, ``run_adversarial``
+    uses it verbatim and does NOT invoke any of the CCD defaults
+    (``ccd.protocol.parse_spec`` / etc.). This is the "no silent
+    fallback in sweep mode" invariant — a profile-driven施策 sees its
+    own parsers and only its own."""
+
+    custom_calls: list[Path] = []
+
+    def custom_parser(fixture: Path) -> object:
+        custom_calls.append(fixture)
+        return "ok"
+
+    custom = (_AdvParser("custom.parser", custom_parser),)
+
+    result = run_adversarial(
+        repo=repo,
+        parsers=custom,
+        cases=default_cases()[:2],
+    )
+
+    assert result.success
+    # Exactly the injected parser ran — none of the CCD defaults.
+    assert result.summary.parsers == ("custom.parser",)
+    assert len(custom_calls) == 2  # 1 parser × 2 cases
+
+
+def test_run_adversarial_falls_back_to_defaults_when_no_parsers(repo: Path) -> None:
+    """spec_030 §2-3 / spec_015 — single-CLI compatibility. When
+    ``parsers=None`` (the ``ccd discover --channel adversarial``
+    path), ``run_adversarial`` uses ``default_parsers()`` so spec_015
+    behavior is bit-for-bit preserved."""
+
+    result = run_adversarial(repo=repo, cases=default_cases()[:1])
+
+    # All 4 CCD-default parsers ran against the 1 case.
+    assert result.summary.parsers == tuple(p.name for p in default_parsers())
+    assert result.summary.evaluations_total == 4

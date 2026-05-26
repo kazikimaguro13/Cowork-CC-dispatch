@@ -468,6 +468,20 @@ def run_nightly(
     discover_dir: Path | None = None,
     brief_dir: Path | None = None,
     proposal_dir: Path | None = None,
+    # spec_030 — profile-driven adversarial parser injection +
+    # synthetic channel-skip surfacing. ``adversarial_parsers`` is a
+    # tuple of resolved adversarial parsers (see
+    # :func:`ccd.adversarial.resolve_parser_targets`); ``None`` means
+    # ``run_channel`` uses the CCD-default fallback (single-CLI path).
+    # ``channel_skips`` maps a channel name to the reason it was NOT
+    # invoked for this policy — the sweep populates it when a profile
+    # opts out (e.g. adversarial channel without
+    # ``[discovery.adversarial.parsers]``); the nightly orchestrator
+    # then records them as :class:`ChannelOutcome` entries so the
+    # morning brief surfaces them in §D rather than the
+    # indistinguishable "未実行" line.
+    adversarial_parsers: Any = None,
+    channel_skips: dict[str, str] | None = None,
 ) -> NightlyResult:
     """Drive one nightly orchestration end-to-end.
 
@@ -525,13 +539,33 @@ def run_nightly(
     run_brief_fn = brief_runner if brief_runner is not None else run_brief
     mirror_fn = windows_mirror if windows_mirror is not None else _default_mirror
 
+    # spec_030 — channels the profile opted out of (e.g. adversarial
+    # without ``[discovery.adversarial.parsers]`` in sweep mode) appear
+    # as synthetic skip outcomes BEFORE the executed-channel list, so
+    # the morning brief's §D surfaces them with a real reason. The skip
+    # list is filtered out of the executed list to avoid running them.
+    skip_map: dict[str, str] = dict(channel_skips or {})
+    executed_channels = [
+        c for c in effective_profile.discovery.channels if c not in skip_map
+    ]
     channel_outcomes = _run_channels(
-        channels=effective_profile.discovery.channels,
+        channels=executed_channels,
         mutation_paths=list(effective_profile.discovery.mutation_paths),
         repo=repo,
         run_channel_fn=run_channel_fn,
         discover_dir=discover_dir,
+        adversarial_parsers=adversarial_parsers,
     )
+    for skipped_channel, reason in skip_map.items():
+        channel_outcomes.append(
+            ChannelOutcome(
+                channel=skipped_channel,
+                success=False,
+                halt_reason=reason,
+                report_md_path=None,
+                report_json_path=None,
+            )
+        )
 
     auto_fix: AutoFixOutcome | None = None
     fix_mode = effective_profile.safety.fix_mode
@@ -590,6 +624,7 @@ def run_nightly(
         auto_fix=auto_fix,
         brief_dir=brief_dir,
         discover_dir=discover_dir,
+        channel_outcomes=tuple(channel_outcomes),
     )
     brief_md = brief_result.report_path if brief_result.success else None
 
@@ -670,6 +705,7 @@ def _run_channels(
     repo: Path,
     run_channel_fn: ChannelRunner,
     discover_dir: Path | None = None,
+    adversarial_parsers: Any = None,
 ) -> list[ChannelOutcome]:
     """Invoke each enabled channel and collect the four shared fields.
 
@@ -677,6 +713,10 @@ def _run_channels(
     forward it to each channel so the discover JSON lands in CCD's
     per-policy workspace instead of the target repo's. None preserves
     the spec_020 flat layout under ``<repo>/_ai_workspace/discover/``.
+
+    spec_030: ``adversarial_parsers`` (when provided) is forwarded to
+    the adversarial channel so the sweep can inject profile-driven
+    parsers instead of the CCD-default hard-coded set.
     """
 
     out: list[ChannelOutcome] = []
@@ -685,6 +725,8 @@ def _run_channels(
         kwargs: dict[str, Any] = {"repo": repo, "paths": paths}
         if discover_dir is not None:
             kwargs["discover_dir"] = discover_dir
+        if channel == "adversarial" and adversarial_parsers is not None:
+            kwargs["adversarial_parsers"] = adversarial_parsers
         try:
             result = run_channel_fn(channel, **kwargs)
         except Exception as exc:

@@ -809,3 +809,141 @@ def test_sweep_does_not_write_to_target_repo_for_propose_off(
         assert not path.is_relative_to(target.resolve()), (
             f"{key}={path} must NOT sit under target repo {target}"
         )
+
+
+# --------------------------------------------------------------------------- #
+# spec_030 — adversarial channel routing in sweep mode
+# --------------------------------------------------------------------------- #
+
+
+def test_sweep_skips_adversarial_when_unconfigured(tmp_path: Path) -> None:
+    """spec_030 §2-3 — a policy that lists ``"adversarial"`` in
+    ``discovery.channels`` but does NOT supply
+    ``[discovery.adversarial.parsers]`` is **skipped**, not silently
+    routed to CCD's hard-coded parsers. The skip is surfaced to the
+    nightly orchestrator via ``channel_skips`` so the morning brief's
+    §D shows an honest line."""
+
+    profiles_dir = tmp_path / "_ai_workspace" / "profiles"
+    _write_policy(
+        profiles_dir,
+        "axis",
+        repo=str(tmp_path / "axis_repo"),
+        extra=(
+            '[discovery]\n'
+            'channels = ["mutation", "adversarial"]\n'
+            'mutation_paths = ["src"]\n'
+        ),
+    )
+    (tmp_path / "axis_repo").mkdir()
+
+    fake = _RecordingNightlyRunner()
+    run_nightly_all(repo=tmp_path, nightly_runner=fake, today=date(2026, 5, 27))
+
+    assert len(fake.calls) == 1
+    call = fake.calls[0]
+    # No adversarial parsers were injected because the profile has no
+    # [discovery.adversarial.parsers].
+    assert "adversarial_parsers" not in call or call["adversarial_parsers"] is None
+    # The skip reason was passed instead.
+    skips = call.get("channel_skips") or {}
+    assert "adversarial" in skips
+    assert "[discovery.adversarial.parsers]" in skips["adversarial"]
+
+
+def test_sweep_routes_adversarial_parsers_from_profile(tmp_path: Path) -> None:
+    """spec_030 §2-3 — when ``[discovery.adversarial.parsers]`` is set,
+    the sweep resolves the targets and forwards them via
+    ``adversarial_parsers``. ``channel_skips`` is not populated."""
+
+    profiles_dir = tmp_path / "_ai_workspace" / "profiles"
+    _write_policy(
+        profiles_dir,
+        "ccd",
+        repo=str(tmp_path),
+        extra=(
+            '[discovery]\n'
+            'channels = ["mutation", "adversarial"]\n'
+            'mutation_paths = ["ccd"]\n'
+            '\n'
+            '[[discovery.adversarial.parsers]]\n'
+            'import = "ccd.protocol.parse_spec"\n'
+            'input_kind = "path"\n'
+            '\n'
+            '[[discovery.adversarial.parsers]]\n'
+            'import = "ccd.protocol.parse_result"\n'
+            'input_kind = "path"\n'
+        ),
+    )
+
+    fake = _RecordingNightlyRunner()
+    run_nightly_all(repo=tmp_path, nightly_runner=fake, today=date(2026, 5, 27))
+
+    assert len(fake.calls) == 1
+    call = fake.calls[0]
+    parsers = call.get("adversarial_parsers")
+    assert parsers is not None
+    assert tuple(p.name for p in parsers) == (
+        "ccd.protocol.parse_spec",
+        "ccd.protocol.parse_result",
+    )
+    assert not call.get("channel_skips")
+
+
+def test_sweep_surfaces_bad_adversarial_import_as_skip(tmp_path: Path) -> None:
+    """spec_030 §2-3 — a target whose dotted path cannot resolve (e.g.
+    module missing in the runtime env) must NOT silently fall back to
+    CCD parsers. Resolution errors are turned into a skip reason for
+    §D so the operator fixes the profile."""
+
+    profiles_dir = tmp_path / "_ai_workspace" / "profiles"
+    _write_policy(
+        profiles_dir,
+        "axis",
+        repo=str(tmp_path / "axis_repo"),
+        extra=(
+            '[discovery]\n'
+            'channels = ["adversarial"]\n'
+            '\n'
+            '[[discovery.adversarial.parsers]]\n'
+            'import = "axis_does_not_exist.parser"\n'
+            'input_kind = "path"\n'
+        ),
+    )
+    (tmp_path / "axis_repo").mkdir()
+
+    fake = _RecordingNightlyRunner()
+    run_nightly_all(repo=tmp_path, nightly_runner=fake, today=date(2026, 5, 27))
+
+    call = fake.calls[0]
+    assert call.get("adversarial_parsers") is None
+    skips = call.get("channel_skips") or {}
+    assert "adversarial" in skips
+    assert "cannot resolve" in skips["adversarial"]
+
+
+def test_sweep_does_not_skip_adversarial_in_fallback_mode(tmp_path: Path) -> None:
+    """spec_030 §2-3 — single-profile fallback (no ``profiles/`` dir)
+    must preserve spec_015 behavior bit-for-bit: adversarial keeps
+    using ``default_parsers()``. The sweep does NOT inject skip
+    reasons in fallback mode."""
+
+    # Legacy single profile with adversarial in channels but no
+    # [discovery.adversarial] block — spec_015 behavior must hold.
+    legacy = tmp_path / "_ai_workspace" / "ccd_profile.toml"
+    legacy.parent.mkdir(parents=True)
+    legacy.write_text(
+        '[discovery]\n'
+        'channels = ["mutation", "adversarial"]\n'
+        'mutation_paths = ["ccd"]\n',
+        encoding="utf-8",
+    )
+
+    fake = _RecordingNightlyRunner()
+    run_nightly_all(repo=tmp_path, nightly_runner=fake, today=date(2026, 5, 27))
+
+    call = fake.calls[0]
+    # No skip and no injected parsers — falls through to run_channel
+    # which then defaults to default_parsers().
+    assert not call.get("channel_skips")
+    assert call.get("adversarial_parsers") is None

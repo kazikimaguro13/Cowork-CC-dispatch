@@ -76,7 +76,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from ccd.nightly import AutoFixOutcome
+    from ccd.nightly import AutoFixOutcome, ChannelOutcome
 
 # Phase 2 §B diff cap — the brief shouldn't grow unbounded if a fix's
 # diff is unexpectedly large. The guard's R3 already caps template-B
@@ -167,6 +167,7 @@ def run_brief(
     discover_dir: Path | None = None,
     today: date | None = None,
     auto_fix: AutoFixOutcome | None = None,
+    channel_outcomes: Sequence[ChannelOutcome] | None = None,
 ) -> BriefResult:
     """Render one morning report from already-completed discovery JSON.
 
@@ -218,6 +219,7 @@ def run_brief(
             channels=channels,
             auto_fix=auto_fix,
             repo=repo,
+            channel_outcomes=channel_outcomes,
         ),
         encoding="utf-8",
     )
@@ -370,6 +372,7 @@ def _render_md(
     channels: list[ChannelReport],
     auto_fix: AutoFixOutcome | None = None,
     repo: Path | None = None,
+    channel_outcomes: Sequence[ChannelOutcome] | None = None,
 ) -> str:
     by_channel = {c.channel: c for c in channels}
     phase2_merge_active = (
@@ -423,13 +426,31 @@ def _render_md(
             "(`docs/DESIGN.md §9.6 / §9.7`)。"
         )
 
+    # spec_030 — count channel-level halts / skips surfaced via the
+    # nightly orchestrator's :class:`ChannelOutcome` list (mutation
+    # 0-mutants HALT and adversarial未設定 skip both flow here). The
+    # count anchors §A and §D so the operator sees the silent-failure
+    # gates at a glance instead of having to scan the body.
+    channel_halt_count = sum(
+        1
+        for co in (channel_outcomes or ())
+        if not bool(getattr(co, "success", True))
+        and (getattr(co, "halt_reason", "") or "")
+    )
+
     parts: list[str] = [
         header,
         "",
         preamble,
         "",
     ]
-    parts.extend(_render_section_a(summary, auto_fix=auto_fix))
+    parts.extend(
+        _render_section_a(
+            summary,
+            auto_fix=auto_fix,
+            channel_halt_count=channel_halt_count,
+        )
+    )
     if phase2_merge_active:
         assert auto_fix is not None  # narrowed by phase2_merge_active above
         parts.extend(_render_section_b_phase2(auto_fix=auto_fix, repo=repo))
@@ -439,7 +460,14 @@ def _render_md(
     else:
         parts.extend(_render_section_b(by_channel))
     parts.extend(_render_section_c(by_channel))
-    parts.extend(_render_section_d(by_channel, summary, auto_fix=auto_fix))
+    parts.extend(
+        _render_section_d(
+            by_channel,
+            summary,
+            auto_fix=auto_fix,
+            channel_outcomes=channel_outcomes,
+        )
+    )
     parts.extend(_render_section_e(summary, by_channel))
     parts.extend(_render_section_f(summary, auto_fix=auto_fix))
 
@@ -450,6 +478,7 @@ def _render_section_a(
     summary: BriefSummary,
     *,
     auto_fix: AutoFixOutcome | None = None,
+    channel_halt_count: int = 0,
 ) -> list[str]:
     bits: list[str] = []
 
@@ -505,6 +534,11 @@ def _render_section_a(
                 _CHANNEL_LABEL.get(c, c) for c in summary.channels_missing
             )
             bits.append(f"**一部チャンネル未実行**: {missing_label}")
+    # spec_030 — surface the silent-failure HALT count alongside the
+    # finding counts so the operator notices a 0-mutants HALT or an
+    # adversarial-skip even when scrolling past §A in a hurry.
+    if channel_halt_count > 0:
+        bits.append(f"**HALT {channel_halt_count} 件** (§D 参照)")
     headline = "; ".join(bits)
     return [
         "## A. 一行判定",
@@ -919,16 +953,47 @@ def _render_section_d(
     summary: BriefSummary,
     *,
     auto_fix: AutoFixOutcome | None = None,
+    channel_outcomes: Sequence[ChannelOutcome] | None = None,
 ) -> list[str]:
-    """halt / skip section — appears only when there is something to say."""
+    """halt / skip section — appears only when there is something to say.
+
+    spec_030: also surfaces halt / skip reasons recorded by the nightly
+    orchestrator's :class:`ChannelOutcome` list. Mutation 0-mutants HALT
+    (silent failure: 0 mutants for non-empty targets) and adversarial
+    skip ("[discovery.adversarial.parsers] 未設定") both flow here —
+    without the explicit ``channel_outcomes`` plumbing they would
+    appear in §D as the indistinguishable "未実行" line because
+    halted channels never write a JSON file.
+    """
 
     items: list[str] = []
+    # spec_030 — channels that ran (or were deliberately skipped) but
+    # did NOT write a JSON payload still surface their halt_reason via
+    # ``channel_outcomes``. Index by channel name so missing-channel
+    # rendering below can defer to the explicit reason when available.
+    outcomes_by_channel: dict[str, str] = {}
+    for co in (channel_outcomes or ()):
+        if bool(getattr(co, "success", True)):
+            continue
+        reason = (getattr(co, "halt_reason", "") or "").strip()
+        if not reason:
+            continue
+        outcomes_by_channel[getattr(co, "channel", "")] = reason
+
     for channel in summary.channels_missing:
         label = _CHANNEL_LABEL.get(channel, channel)
-        items.append(
-            f"- **{label}** (`channel: {channel}`) — "
-            "discover_NNN.json が見つからなかった (未実行)"
-        )
+        reason = outcomes_by_channel.pop(channel, "")
+        if reason:
+            # The HALT / skip wording is whatever the orchestrator
+            # supplied verbatim — discover.py emits the 0-mutants
+            # HALT phrasing, sweep.py emits the adversarial-skipped
+            # phrasing (spec_030 §2-2 / §2-4).
+            items.append(f"- **{label}** halt: {reason}")
+        else:
+            items.append(
+                f"- **{label}** (`channel: {channel}`) — "
+                "discover_NNN.json が見つからなかった (未実行)"
+            )
     for channel in summary.channels_picked:
         report = by_channel.get(channel)
         if report is None:
@@ -937,6 +1002,12 @@ def _render_section_d(
         if isinstance(halt, str) and halt:
             label = _CHANNEL_LABEL.get(channel, channel)
             items.append(f"- **{label}** halt: {halt}")
+    # Any remaining halt reasons (e.g. an unfamiliar channel name) get
+    # surfaced without a friendly label — better to expose them than
+    # drop them silently (spec_030 §1 "正直な計測").
+    for channel, reason in outcomes_by_channel.items():
+        label = _CHANNEL_LABEL.get(channel, channel)
+        items.append(f"- **{label}** halt: {reason}")
 
     # spec_025/028 — surface autonomous-fix / propose halts and
     # structural skips so the operator sees them in §D alongside

@@ -1133,3 +1133,301 @@ def test_render_profile_round_trip_preserves_schedule(tmp_path: Path) -> None:
     reloaded = load_profile(tmp_path, path=round_trip_path)
 
     assert reloaded == original.profile
+
+
+# --------------------------------------------------------------------------- #
+# spec_030 — AdversarialConfig / ParserTarget
+# --------------------------------------------------------------------------- #
+
+
+def test_profile_without_adversarial_block_returns_none(tmp_path: Path) -> None:
+    """spec_030 §2-1 — ``DiscoveryConfig.adversarial`` defaults to ``None``
+    when no ``[discovery.adversarial]`` table is present. ``None`` means
+    "this施策 did not configure the channel"; the sweep treats this as
+    a skip rather than silently using CCD's hard-coded parsers."""
+
+    profile_path = tmp_path / "_ai_workspace" / "ccd_profile.toml"
+    profile_path.parent.mkdir(parents=True)
+    profile_path.write_text(
+        dedent(
+            """
+            repo = "."
+
+            [discovery]
+            channels = ["mutation"]
+            mutation_paths = ["ccd"]
+            """
+        ).strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    profile = load_profile(tmp_path)
+
+    assert profile.discovery.adversarial is None
+    # Existing fields unchanged by spec_030.
+    assert profile.discovery.channels == ["mutation"]
+    assert profile.discovery.mutation_paths == ["ccd"]
+
+
+def test_profile_loads_adversarial_parsers_array_of_tables(tmp_path: Path) -> None:
+    """spec_030 §2-1 — ``[[discovery.adversarial.parsers]]`` lists one
+    entry per target callable. Each entry has ``import`` (dotted path)
+    + ``input_kind`` (path/bytes/str). Operators set this per施策 in
+    ``_ai_workspace/profiles/<name>.toml``."""
+
+    profile_path = tmp_path / "_ai_workspace" / "ccd_profile.toml"
+    profile_path.parent.mkdir(parents=True)
+    profile_path.write_text(
+        dedent(
+            """
+            repo = "."
+
+            [discovery]
+            channels = ["mutation", "adversarial"]
+
+            [[discovery.adversarial.parsers]]
+            import = "backend.src.loader.load_document"
+            input_kind = "path"
+
+            [[discovery.adversarial.parsers]]
+            import = "backend.src.config.load_config"
+            input_kind = "bytes"
+            """
+        ).strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    profile = load_profile(tmp_path)
+
+    assert profile.discovery.adversarial is not None
+    parsers = profile.discovery.adversarial.parsers
+    assert len(parsers) == 2
+    assert parsers[0].import_ == "backend.src.loader.load_document"
+    assert parsers[0].input_kind == "path"
+    assert parsers[1].import_ == "backend.src.config.load_config"
+    assert parsers[1].input_kind == "bytes"
+
+
+def test_profile_rejects_empty_adversarial_parsers_list(tmp_path: Path) -> None:
+    """spec_030 §2-1 — an empty parsers list is rejected (a typo, not
+    intent). To disable the channel, drop ``"adversarial"`` from
+    ``discovery.channels`` instead."""
+
+    profile_path = tmp_path / "_ai_workspace" / "ccd_profile.toml"
+    profile_path.parent.mkdir(parents=True)
+    profile_path.write_text(
+        dedent(
+            """
+            [discovery]
+            channels = ["mutation"]
+
+            [discovery.adversarial]
+            parsers = []
+            """
+        ).strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="at least one"):
+        load_profile(tmp_path)
+
+
+def test_profile_rejects_invalid_input_kind(tmp_path: Path) -> None:
+    """spec_030 §2-1 — only ``"path"`` / ``"bytes"`` / ``"str"`` are
+    accepted; anything else raises ``ValueError`` at load time so the
+    operator catches typos before a long sweep."""
+
+    profile_path = tmp_path / "_ai_workspace" / "ccd_profile.toml"
+    profile_path.parent.mkdir(parents=True)
+    profile_path.write_text(
+        dedent(
+            """
+            [discovery]
+            channels = ["adversarial"]
+
+            [[discovery.adversarial.parsers]]
+            import = "x.y"
+            input_kind = "buffer"
+            """
+        ).strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="input_kind"):
+        load_profile(tmp_path)
+
+
+def test_profile_rejects_invalid_import_string(tmp_path: Path) -> None:
+    """spec_030 §2-1 — the ``import`` field must look like a Python
+    dotted attribute path (letters / digits / underscore, dot-separated,
+    non-numeric leading char). Shell injection / path-separator typos
+    are caught at load time."""
+
+    profile_path = tmp_path / "_ai_workspace" / "ccd_profile.toml"
+    profile_path.parent.mkdir(parents=True)
+    profile_path.write_text(
+        dedent(
+            """
+            [discovery]
+            channels = ["adversarial"]
+
+            [[discovery.adversarial.parsers]]
+            import = "backend/src/loader.load_document"
+            input_kind = "path"
+            """
+        ).strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="not a valid dotted name"):
+        load_profile(tmp_path)
+
+
+def test_profile_rejects_single_segment_import(tmp_path: Path) -> None:
+    """spec_030 §2-1 — single bare names (no dot) are rejected: at
+    minimum we need ``module.attr``."""
+
+    profile_path = tmp_path / "_ai_workspace" / "ccd_profile.toml"
+    profile_path.parent.mkdir(parents=True)
+    profile_path.write_text(
+        dedent(
+            """
+            [discovery]
+            channels = ["adversarial"]
+
+            [[discovery.adversarial.parsers]]
+            import = "loaddocument"
+            input_kind = "path"
+            """
+        ).strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="not a valid dotted name"):
+        load_profile(tmp_path)
+
+
+def test_profile_rejects_leading_digit_import(tmp_path: Path) -> None:
+    """spec_030 §2-1 — Python identifiers cannot start with a digit;
+    profile validator follows the same rule."""
+
+    profile_path = tmp_path / "_ai_workspace" / "ccd_profile.toml"
+    profile_path.parent.mkdir(parents=True)
+    profile_path.write_text(
+        dedent(
+            """
+            [discovery]
+            channels = ["adversarial"]
+
+            [[discovery.adversarial.parsers]]
+            import = "1backend.load"
+            input_kind = "path"
+            """
+        ).strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="not a valid dotted name"):
+        load_profile(tmp_path)
+
+
+def test_profile_adversarial_default_input_kind_is_path(tmp_path: Path) -> None:
+    """spec_030 §2-1 — ``input_kind`` defaults to ``"path"`` (the
+    spec_015 contract)."""
+
+    profile_path = tmp_path / "_ai_workspace" / "ccd_profile.toml"
+    profile_path.parent.mkdir(parents=True)
+    profile_path.write_text(
+        dedent(
+            """
+            [discovery]
+            channels = ["adversarial"]
+
+            [[discovery.adversarial.parsers]]
+            import = "ccd.protocol.parse_spec"
+            """
+        ).strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    profile = load_profile(tmp_path)
+
+    assert profile.discovery.adversarial is not None
+    assert profile.discovery.adversarial.parsers[0].input_kind == "path"
+
+
+def test_profile_render_includes_adversarial_parsers(tmp_path: Path) -> None:
+    """spec_030 §2-5 — ``render_profile`` emits the adversarial parsers
+    in a round-trippable form so ``ccd profile`` shows the operator how
+    their TOML resolved."""
+
+    profile_path = tmp_path / "_ai_workspace" / "ccd_profile.toml"
+    profile_path.parent.mkdir(parents=True)
+    profile_path.write_text(
+        dedent(
+            """
+            [discovery]
+            channels = ["mutation", "adversarial"]
+
+            [[discovery.adversarial.parsers]]
+            import = "ccd.protocol.parse_spec"
+            input_kind = "path"
+            """
+        ).strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    result = load_profile_with_source(tmp_path)
+    rendered = render_profile(result)
+
+    assert "[[discovery.adversarial.parsers]]" in rendered
+    assert 'import = "ccd.protocol.parse_spec"' in rendered
+    assert 'input_kind = "path"' in rendered
+
+
+def test_profile_validation_keeps_mutation_paths_unchanged(tmp_path: Path) -> None:
+    """spec_030 — adding adversarial does not affect existing
+    mutation_paths / channels / cadence validation."""
+
+    profile_path = tmp_path / "_ai_workspace" / "ccd_profile.toml"
+    profile_path.parent.mkdir(parents=True)
+    profile_path.write_text(
+        dedent(
+            """
+            [discovery]
+            channels = ["mutation", "adversarial"]
+            mutation_paths = ["ccd/protocol.py", "ccd/run_writer.py"]
+
+            [[discovery.adversarial.parsers]]
+            import = "ccd.protocol.parse_spec"
+            input_kind = "path"
+
+            [schedule]
+            cadence = "weekly"
+            weekly_day = "Tuesday"
+            """
+        ).strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    profile = load_profile(tmp_path)
+
+    assert profile.discovery.channels == ["mutation", "adversarial"]
+    assert profile.discovery.mutation_paths == [
+        "ccd/protocol.py",
+        "ccd/run_writer.py",
+    ]
+    assert profile.schedule.cadence == "weekly"
+    assert profile.schedule.weekly_day == "Tuesday"
+    assert profile.discovery.adversarial is not None
+    assert len(profile.discovery.adversarial.parsers) == 1

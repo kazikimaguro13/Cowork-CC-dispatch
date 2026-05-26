@@ -260,18 +260,23 @@ def test_discover_dir_is_created_when_missing(repo: Path) -> None:
 # --------------------------------------------------------------------------- #
 
 
-def test_zero_mutants_is_graceful(repo: Path) -> None:
+def test_zero_mutants_is_halt_for_non_empty_targets(repo: Path) -> None:
+    """spec_030 §2-2 — 0 mutants for non-empty targets is a silent-failure
+    HALT, not a graceful run. mutmut returning zero mutants on a real Python
+    file is structurally implausible (the Phase 2.5 incident: iso-venv
+    silently failed to install dependencies, so mutmut could not
+    instrument anything). The HALT branch refuses to emit a misleading
+    report rather than letting "setup failed" look like "no findings"."""
+
     runner = FakeMutationRunner(mutants=[])
 
     result = run_discovery(runner, repo=repo)
 
-    assert result.success
+    assert not result.success
+    assert result.report_md_path is None
+    assert result.report_json_path is None
+    assert "0 mutants generated for non-empty targets" in result.halt_reason
     assert result.summary.mutants_total == 0
-    assert result.summary.survived_total == 0
-    assert result.actionable_mutants == []
-    assert result.report_md_path is not None
-    md = result.report_md_path.read_text(encoding="utf-8")
-    assert "mutant 総数: **0**" in md
 
 
 def test_zero_survivors_is_graceful(repo: Path) -> None:
@@ -366,7 +371,10 @@ def test_cli_discover_halts_nonzero_on_runner_error(
 
 
 def test_cli_discover_accepts_paths_flag(repo: Path) -> None:
-    runner = FakeMutationRunner(mutants=[])
+    # spec_030 §2-2 — a HALT-free run now requires at least one mutant
+    # so the silent-failure guard does not fire (this test exercises
+    # paths-flag forwarding, not 0-mutants behavior).
+    runner = FakeMutationRunner(mutants=_sample_mutants())
 
     rc = cli.main(
         ["discover", "--repo", str(repo), "--paths", "ccd/dispatch.py", "ccd/agent.py"],
@@ -1084,14 +1092,25 @@ def test_canary_does_not_fire_below_threshold(repo: Path) -> None:
 
 def test_canary_does_not_fire_for_zero_mutants(repo: Path) -> None:
     """spec_019 — a clean run (no mutations produced at all) is graceful,
-    not a setup failure. The canary only flags ``ran but couldn't see``."""
+    not a setup failure. The canary only flags ``ran but couldn't see``.
+
+    spec_030 update: the spec_019 *canary* still doesn't fire (it needs
+    ``mutants_total ≥ CANARY_MIN_MUTANTS_FOR_HALT`` to apply); the
+    spec_030 0-mutants HALT is a separate, parallel guard. We assert
+    the canary-specific phrasing is absent — the halt reason now comes
+    from the spec_030 branch — and that the two halt classes are
+    distinct."""
 
     runner = FakeMutationRunner(mutants=[])
 
     result = run_discovery(runner, repo=repo)
 
-    assert result.success is True
-    assert result.halt_reason == ""
+    # spec_030: 0 mutants for non-empty targets is now a HALT.
+    assert result.success is False
+    # The canary-specific phrasing ("canary mutant survived") is NOT
+    # what we get — that's a different halt path.
+    assert "canary mutant survived" not in result.halt_reason
+    assert "0 mutants generated for non-empty targets" in result.halt_reason
 
 
 def test_detect_broken_mutation_setup_pure_function() -> None:
@@ -1383,3 +1402,86 @@ def test_mutmut_runner_returns_error_when_iso_venv_provisioning_fails(
     assert "iso-venv provisioning failed" in outcome.error
     assert "simulated venv breakage" in outcome.error
     assert outcome.mutants == []
+
+
+# --------------------------------------------------------------------------- #
+# spec_030 — 0-mutants silent-failure HALT (parallel to spec_019 canary)
+# --------------------------------------------------------------------------- #
+
+
+def test_zero_mutants_halt_distinct_from_outcome_error(repo: Path) -> None:
+    """spec_030 §2-2 — the new HALT branch is structurally distinct
+    from the existing ``outcome.error`` branch. ``outcome.error`` is
+    "the tool itself failed to run"; ``mutants_total=0 && error=None``
+    is "the tool said success but instrumented nothing" (the silent
+    failure the spec exists to fix)."""
+
+    runner = FakeMutationRunner(mutants=[])  # error="" by default
+
+    result = run_discovery(runner, repo=repo, paths=["ccd/protocol.py"])
+
+    assert not result.success
+    # The spec_030 halt phrasing — distinct from the "mutation tool
+    # failed:" phrasing of the outcome.error branch.
+    assert "mutation tool failed" not in result.halt_reason
+    assert "0 mutants generated for non-empty targets" in result.halt_reason
+    assert "['ccd/protocol.py']" in result.halt_reason
+    # No report files written — the operator must not see a misleading
+    # "0 findings" report when the tool actually failed to instrument.
+    assert result.report_md_path is None
+    assert result.report_json_path is None
+
+
+def test_zero_mutants_halt_does_not_fire_on_outcome_error(repo: Path) -> None:
+    """spec_030 — when ``outcome.error`` is set, the existing branch
+    handles it; the new 0-mutants branch must NOT also fire (would be
+    a double-halt with confusing phrasing)."""
+
+    runner = FakeMutationRunner(mutants=[], error="mutmut binary not found")
+
+    result = run_discovery(runner, repo=repo)
+
+    assert not result.success
+    assert "mutation tool failed" in result.halt_reason
+    # The spec_030 phrasing must NOT appear when outcome.error already
+    # explains the failure.
+    assert "0 mutants generated for non-empty targets" not in result.halt_reason
+
+
+def test_zero_mutants_halt_does_not_fire_for_killed_mutants(repo: Path) -> None:
+    """spec_030 — the HALT condition is ``not outcome.mutants``; any
+    non-empty mutant list (killed, survived, whatever status) bypasses
+    the silent-failure branch."""
+
+    from ccd.discover import STATUS_KILLED, Mutant
+
+    runner = FakeMutationRunner(
+        mutants=[
+            Mutant(file="ccd/x.py", line=1, mutation="m", status=STATUS_KILLED),
+        ]
+    )
+
+    result = run_discovery(runner, repo=repo)
+
+    assert result.success
+    assert "0 mutants generated for non-empty targets" not in result.halt_reason
+
+
+def test_existing_canary_still_fires_independently(repo: Path) -> None:
+    """spec_030 — the spec_019 canary (mutants ≥ threshold && killed
+    == 0) is a separate branch that must remain operational. The
+    spec_030 HALT covers a different silent-failure shape (zero
+    mutants altogether). Both branches stay parallel — neither
+    swallows the other."""
+
+    mutants = _make_canary_mutants(
+        total=CANARY_MIN_MUTANTS_FOR_HALT, killed=0
+    )
+    runner = FakeMutationRunner(mutants=mutants)
+
+    result = run_discovery(runner, repo=repo)
+
+    assert not result.success
+    # spec_019 wording — NOT spec_030 wording.
+    assert "canary mutant survived" in result.halt_reason
+    assert "0 mutants generated for non-empty targets" not in result.halt_reason

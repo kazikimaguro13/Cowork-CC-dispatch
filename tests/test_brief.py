@@ -999,3 +999,173 @@ def test_phase2_auto_brief_unchanged_by_spec_028(tmp_path: Path) -> None:
     assert "## B. 昨夜の修正案" not in md
     assert "push origin main" in md
     assert "git apply" not in md
+
+
+def _extract_section(md: str, header: str) -> list[str]:
+    """Return the lines of one ``## <header>`` section (until the next
+    ``## `` header). Helper for spec_030 §D-only assertions — keeps
+    them from accidentally matching lines in §A / §F."""
+
+    lines = md.splitlines()
+    out: list[str] = []
+    in_section = False
+    for line in lines:
+        if line.startswith(header):
+            in_section = True
+            continue
+        if in_section and line.startswith("## "):
+            break
+        if in_section:
+            out.append(line)
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# spec_030 — §D surfaces channel-level HALT / skip via channel_outcomes
+# --------------------------------------------------------------------------- #
+
+
+def test_section_d_surfaces_mutation_zero_mutants_halt(tmp_path: Path) -> None:
+    """spec_030 §2-4 — when the mutation channel emits a 0-mutants HALT
+    (silent-failure detection: 0 mutants for non-empty targets), §D
+    must surface the halt reason verbatim instead of the
+    indistinguishable "未実行" fallback line."""
+
+    from ccd.nightly import ChannelOutcome
+
+    outcomes = (
+        ChannelOutcome(
+            channel="mutation",
+            success=False,
+            halt_reason=(
+                "mutation setup likely failed: 0 mutants generated for "
+                "non-empty targets ['backend/src/_decay.py']. "
+                "Possible causes: iso-venv dependency install error, ..."
+            ),
+            report_md_path=None,
+            report_json_path=None,
+        ),
+    )
+    result = run_brief(
+        repo=tmp_path,
+        today=date(2026, 5, 27),
+        channel_outcomes=outcomes,
+    )
+
+    assert result.report_path is not None
+    md = result.report_path.read_text(encoding="utf-8")
+    assert "## D. halt・スキップ項目" in md
+    assert "0 mutants generated for non-empty targets" in md
+    # Within §D specifically: mutation surfaces as a halt line, not as
+    # the indistinguishable "未実行" fallback. §A still mentions
+    # "一部チャンネル未実行" (some channels not run) — that's a
+    # different layer; we only assert §D here.
+    section_d = _extract_section(md, "## D.")
+    mutation_lines = [line for line in section_d if "ミューテーション" in line]
+    assert any("halt" in line for line in mutation_lines)
+    assert not any("未実行" in line for line in mutation_lines)
+
+
+def test_section_d_surfaces_adversarial_skipped(tmp_path: Path) -> None:
+    """spec_030 §2-4 — when the sweep skips the adversarial channel
+    (profile has ``"adversarial"`` in channels but no
+    ``[discovery.adversarial.parsers]``), §D shows the skip reason
+    verbatim — the operator sees that the channel was deliberately
+    not run, not silently absent."""
+
+    from ccd.nightly import ChannelOutcome
+
+    outcomes = (
+        ChannelOutcome(
+            channel="adversarial",
+            success=False,
+            halt_reason=(
+                "adversarial channel skipped: profile に "
+                "[discovery.adversarial.parsers] が未設定 "
+                "(CCD のパーサは走らせない — spec_030 §2-3)"
+            ),
+            report_md_path=None,
+            report_json_path=None,
+        ),
+    )
+    result = run_brief(
+        repo=tmp_path,
+        today=date(2026, 5, 27),
+        channel_outcomes=outcomes,
+    )
+
+    assert result.report_path is not None
+    md = result.report_path.read_text(encoding="utf-8")
+    assert "## D. halt・スキップ項目" in md
+    assert "adversarial channel skipped" in md
+    assert "[discovery.adversarial.parsers]" in md
+    # Within §D: adversarial surfaces with the explicit halt reason,
+    # not the generic "未実行" fallback.
+    section_d = _extract_section(md, "## D.")
+    adversarial_lines = [line for line in section_d if "敵対的入力" in line]
+    assert any("halt" in line for line in adversarial_lines)
+    assert not any("未実行" in line for line in adversarial_lines)
+
+
+def test_section_a_includes_halt_count_when_channels_halted(tmp_path: Path) -> None:
+    """spec_030 §2-4 — §A appends a ``HALT N 件`` count when channels
+    are halted/skipped, so the operator notices silent failures at a
+    glance instead of having to scroll to §D."""
+
+    from ccd.nightly import ChannelOutcome
+
+    outcomes = (
+        ChannelOutcome(
+            channel="mutation",
+            success=False,
+            halt_reason="mutation setup likely failed: 0 mutants ...",
+            report_md_path=None,
+            report_json_path=None,
+        ),
+        ChannelOutcome(
+            channel="adversarial",
+            success=False,
+            halt_reason="adversarial channel skipped: ...",
+            report_md_path=None,
+            report_json_path=None,
+        ),
+    )
+    result = run_brief(
+        repo=tmp_path,
+        today=date(2026, 5, 27),
+        channel_outcomes=outcomes,
+    )
+
+    md = result.report_path.read_text(encoding="utf-8")
+    # §A header followed by a HALT count line.
+    assert "## A. 一行判定" in md
+    assert "HALT 2 件" in md
+
+
+def test_section_a_omits_halt_count_when_no_halts(tmp_path: Path) -> None:
+    """spec_030 — when no channel halted/skipped, §A does NOT get the
+    HALT line (avoid noise on clean nights)."""
+
+    result = run_brief(
+        repo=tmp_path,
+        today=date(2026, 5, 27),
+        channel_outcomes=(),
+    )
+
+    md = result.report_path.read_text(encoding="utf-8")
+    assert "HALT" not in md
+
+
+def test_existing_section_d_path_unchanged_when_no_channel_outcomes(
+    tmp_path: Path,
+) -> None:
+    """spec_030 — backward compatibility. When ``channel_outcomes`` is
+    omitted (single-CLI / legacy nightly path), §D behaves bit-for-bit
+    as before: missing channels surface as "未実行" lines."""
+
+    result = run_brief(repo=tmp_path, today=date(2026, 5, 27))
+
+    md = result.report_path.read_text(encoding="utf-8")
+    assert "## D. halt・スキップ項目" in md
+    # All three channels missing — each shows the "未実行" fallback.
+    assert md.count("未実行") >= 3
