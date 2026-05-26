@@ -4,6 +4,8 @@
 
 1 つのエージェント（spec を書く側）がもう 1 つのエージェント（実装する側 = [Claude Code](https://docs.claude.com/claude-code)）に開発タスクを dispatch する。`ccd` はその実行を分類し、スモークテストを通し、`main` に取り込み、結果からメトリクスを集計する。複数 spec の連鎖実行、失敗時の自己修復リトライ、オーケストレータがクラッシュしても記録を失わない耐障害性まで持つ。
 
+**v2 では、これに加えて「夜間（週次）に無人で自分自身を保守するループ」（Loop β）を実装した** ── 発見 3 チャンネル（ミューテーション・敵対的入力・AI 推論）でテストの隙間を炙り出し、インチキ修正ガード（修正係の自己申告ではなく実 diff を機械検査）と R5/R4 検証ゲートを通った修正だけをローカル `main` に merge する。`auto` / `propose` / `off` の 3 モードを信頼度で使い分け、プロファイル 1 行で施策ごとに「どこまで自走させるか」を刻む。設計詳細と実走で炙り出された 3 つの欠陥は [`docs/DESIGN.md §9`](docs/DESIGN.md) を参照。
+
 ```
 spec_NNN.md ──dispatch──▶ Claude Code ──実装──▶ result_NNN.md
      │                                              │
@@ -30,6 +32,9 @@ spec_NNN.md ──dispatch──▶ Claude Code ──実装──▶ result_NNN
 - **自己修復リトライ** — dispatch が失敗（特にテスト失敗）したら、失敗内容を次の試行のプロンプトに食わせてエージェント自身に直させる。`--max-attempts` で試行回数を制御。
 - **耐障害性** — run JSON はステップごとにアトミック（一時ファイル + `os.replace`）に書き込まれる。`subprocess.TimeoutExpired` や git エラーで落ちても、それまでの記録は失われず、中断は `INTERRUPTED` として残る。`ccd reconcile` で孤児レコードを後から畳み込める。
 - **正直な計測** — 7 つのメトリクス（成功率・自律完走率・安全停止率・所要時間・失敗タクソノミー・一発合格率・リトライ回復率）と、生存バイアスを明示する静的 HTML ダッシュボード。
+- **Loop β（夜間自律保守ループ・v2）** — 週次トリガーで `[発見] → [翻訳] → [修正 dispatch] → [検証] → [ガード] → [ローカル merge] → [朝レポート]` を無人で回す。発見 3 チャンネル（ミューテーション・敵対的入力・AI 推論）で「事実なら自律・主張なら人間」と信頼度で経路を分け、複数施策をプロファイルで巡回。
+- **インチキ修正ガード（v2）** — 自律修正が「テストを消して失敗を消す」「assert を緩める」などで偽の合格を作る危険に対し、修正係の自己申告を一切信用せず**実 git diff を機械検査**する強制層。5 ルール（許可ファイル / `tests/` 追加のみ / 本番 diff 有界 / 既存スイート緑維持 / 標的テストの正しい失敗→成功）+ 3 原則（強制であって指示でない / 自己改変不能 / 偽陽性は許す・偽陰性は許さない）。
+- **安全境界レベル 2 — push は人間に残す（v2）** — Loop β は「ブランチで修正 → 検証 → ローカル `main` に merge」まで無人。**`git push` はしない**。`GitOps` Protocol に push 系メソッドを構造的に持たせず、コードが push したくても呼ぶ先がない。朝、人間が diff を見て手動 push する。
 
 ## 必要環境
 
@@ -51,14 +56,14 @@ pip install -e ".[dev]"
 動作確認:
 
 ```bash
-ccd --version          # ccd 0.3.0
+ccd --version          # ccd 0.18.0
 ruff check .
-pytest -q              # 192 passed
+pytest -q              # 564 passed
 ```
 
 ## 使い方
 
-CLI は 5 つのサブコマンドからなる。それぞれが内部の関数を呼ぶ薄い層。
+CLI は 12 のサブコマンドからなる。それぞれが内部の関数を呼ぶ薄い層。v1 系（5 個：`dispatch` / `chain` / `report` / `dashboard` / `reconcile`）は dispatch オーケストレーションと計測。v2 系（7 個：`discover` / `brief` / `profile` / `guard` / `retrospect` / `nightly` / `nightly-all`）は夜間自律保守ループ（Loop β）の各層。
 
 ### `ccd dispatch <spec>`
 
@@ -147,13 +152,35 @@ ccd reconcile _ai_workspace/logs/last_run.json
 - ファイル 1 つ、またはディレクトリ配下の `*.json` 全部を対象にできる。
 - 実際の終了時刻は不明なので捏造しない（`finished_at` は埋めない）。
 
+### v2 — Loop β（夜間自律保守ループ）
+
+v2 で追加された 7 つのサブコマンド。設計詳細は [`docs/DESIGN.md §9`](docs/DESIGN.md)、各段階の決定記録は spec_013〜029 を参照。
+
+| サブコマンド | 役割 |
+|---|---|
+| `ccd discover` | 発見 3 チャンネル（ミューテーション・敵対的入力・AI 推論）。隔離クローン内で実行し、実 repo を汚染しない（spec_014） |
+| `ccd brief` | 朝レポート生成。Phase 1 版（発見のみ）/ Phase 2 版（自律修正の diff・検証証拠・`git push` ワンライナー）/ 提案版（修正案 diff・`git apply` ワンライナー）の 3 版を場面で切り替え |
+| `ccd profile` | プロファイル表示。`fix_mode`（`auto`/`propose`/`off`）・週次ケイデンス・対象 repo・発見チャンネル等を 1 枚で確認 |
+| `ccd guard` | インチキ修正ガード単体実行。任意の diff に対し 5 ルールを機械検査（手動チェック・単独実証用） |
+| `ccd retrospect` | 過去 run の振り返り集計 |
+| `ccd nightly` | 単一 repo に対し Loop β を 1 回回す（discover → 翻訳 → 修正 dispatch → R5/R4 検証 → ガード → ローカル merge → brief） |
+| `ccd nightly-all` | プロファイルレジストリ（`_ai_workspace/profiles/*.toml`）を読み、全施策を直列で巡回。1 施策の失敗が他施策を止めない。週次タスクが呼ぶ入口 |
+
+**3 つのモード**（`safety.fix_mode` で施策ごとに選ぶ）:
+
+- `auto` — 発見 → 修正 → 検証 → ガード → **ローカル merge**（適用する）。CCD 自身の自己保守用。
+- `propose` — 発見 → 修正案生成 → 検証 → ガード → **レポートに diff**（適用しない、隔離クローン内で完結し対象 repo に 1 バイトも書き込まない）。クライアント施策用。
+- `off` — 発見 → 報告のみ（修正案なし）。最小構成。
+
+> **運用ステータス**: v2 全 3 フェーズの**実装は完了**（spec_013〜029、version 0.18.0、564 tests、subcommand 12）。複数週の無人運用による実績作りはこれからの段階（Phase 2.5）。「実装完了」と「運用できる」の差は埋まっていない、というのが現在地。
+
 ## レイアウト
 
 ```
 ccd/                       # import パッケージ（配布名は cowork-cc-dispatch）
   __init__.py              # __version__
   __main__.py              # `python -m ccd` エントリ
-  cli.py                   # CLI 実装（dispatch / chain / report / dashboard / reconcile）
+  cli.py                   # CLI 実装（12 サブコマンド：v1 5 個 + v2 7 個）
   models.py                # Spec / DispatchRecord / Result / RunFile / 各種 enum
   protocol.py              # spec_NNN.md / result_NNN.md の read/write
   agent.py                 # AgentRunner（ClaudeCodeRunner + FakeAgentRunner）
@@ -165,7 +192,18 @@ ccd/                       # import パッケージ（配布名は cowork-cc-dis
   metrics.py               # 7 指標の集計と Markdown レポート
   backfill.py              # 旧 result_NNN.md から匿名化 run JSON を生成
   dashboard.py             # 静的 HTML ダッシュボード生成
-tests/                     # pytest（192 tests）
+  retrospect.py            # 過去 run の振り返り集計（v2）
+  # ── Loop β（v2、夜間自律保守ループ） ──
+  discover.py              # 発見 3 チャンネル（mutation / adversarial / ai）+ 隔離クローン
+  adversarial.py           # 敵対的入力テスト
+  ai_review.py             # AI 推論による発見（報告専用チャンネル）
+  brief.py                 # 朝レポート（Phase 1/2/提案版を場面で切り替え）
+  profile.py               # プロファイル（fix_mode / 発見設定 / 週次ケイデンス）
+  guard.py                 # インチキ修正ガード — diff 5 ルール機械検査
+  translate.py             # 発見 → spec_auto 翻訳（AI 不使用・テンプレ穴埋め）
+  nightly.py               # 単一 repo に対し Loop β を 1 回回す
+  sweep.py                 # プロファイルレジストリを巡回し各 repo に nightly
+tests/                     # pytest（564 tests）
 docs/
   DESIGN.md                # 設計の正典
   architecture.md          # モジュール構成と流れ
