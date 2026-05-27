@@ -33,6 +33,7 @@ from ccd.discover import (
     MutmutRunner,
     _collect_killed_mutants_from_cache,
     _detect_broken_mutation_setup,
+    _extract_pyproject_project_name,
     _isolated_clone,
     _parse_mutmut_results,
     _parse_mutmut_show,
@@ -1485,3 +1486,339 @@ def test_existing_canary_still_fires_independently(repo: Path) -> None:
     # spec_019 wording — NOT spec_030 wording.
     assert "canary mutant survived" in result.halt_reason
     assert "0 mutants generated for non-empty targets" not in result.halt_reason
+
+
+# --------------------------------------------------------------------------- #
+# spec_031 — iso-venv post-install validation (silent install failure guard)
+# --------------------------------------------------------------------------- #
+
+
+def _make_fake_provision_subprocess(
+    *,
+    iso_bin: Path,
+    create_mutmut: bool = True,
+    create_pytest: bool = True,
+    create_python: bool = True,
+    probe_returncode: int = 0,
+    probe_stderr: bytes = b"",
+):
+    """Build a ``subprocess.run`` stub for the spec_031 validation tests.
+
+    The stub replaces ``ccd.discover.subprocess.run`` and fakes the three
+    subprocess calls made by ``_provision_iso_venv`` + the post-install
+    validator:
+
+    1. ``python -m venv ...`` → touches ``iso_bin/python`` and ``iso_bin/`` so
+       ``venv_python.exists()`` passes.
+    2. ``pip install ...`` → returns success (no-op), then optionally creates
+       the ``mutmut`` / ``pytest`` binaries depending on flags.
+    3. iso-python importlib probe (the ``-c`` invocation) → returns the
+       ``probe_returncode`` / ``probe_stderr`` the test asks for.
+    """
+
+    from subprocess import CompletedProcess
+
+    def fake_run(*args, **kwargs):  # type: ignore[no-untyped-def]
+        argv = args[0] if args else kwargs.get("args", [])
+        argv_list = list(argv) if isinstance(argv, (list, tuple)) else []
+        # venv creation: python -m venv <dir>
+        if (
+            len(argv_list) >= 3
+            and argv_list[1] == "-m"
+            and argv_list[2] == "venv"
+        ):
+            iso_bin.mkdir(parents=True, exist_ok=True)
+            if create_python:
+                (iso_bin / "python").write_text("# fake", encoding="utf-8")
+                (iso_bin / "python").chmod(0o755)
+            return CompletedProcess(args=argv_list, returncode=0, stdout="", stderr="")
+        # pip install
+        if "pip" in argv_list and "install" in argv_list:
+            if create_mutmut:
+                (iso_bin / "mutmut").write_text("# fake", encoding="utf-8")
+                (iso_bin / "mutmut").chmod(0o755)
+            if create_pytest:
+                (iso_bin / "pytest").write_text("# fake", encoding="utf-8")
+                (iso_bin / "pytest").chmod(0o755)
+            return CompletedProcess(args=argv_list, returncode=0, stdout="", stderr="")
+        # importlib.metadata probe: python -c "..."
+        if len(argv_list) >= 3 and argv_list[1] == "-c":
+            return CompletedProcess(
+                args=argv_list,
+                returncode=probe_returncode,
+                stdout=b"",
+                stderr=probe_stderr,
+            )
+        # Anything else — let it succeed harmlessly.
+        return CompletedProcess(args=argv_list, returncode=0, stdout="", stderr="")
+
+    return fake_run
+
+
+def _write_minimal_pyproject(workspace: Path, *, name: str | None = "ccd-fixture") -> None:
+    workspace.mkdir(parents=True, exist_ok=True)
+    if name is None:
+        # Pyproject without a [project] name — dist_name extraction returns None.
+        (workspace / "pyproject.toml").write_text(
+            "[build-system]\n"
+            'requires = ["setuptools>=68"]\n'
+            'build-backend = "setuptools.build_meta"\n',
+            encoding="utf-8",
+        )
+        return
+    (workspace / "pyproject.toml").write_text(
+        "[build-system]\n"
+        'requires = ["setuptools>=68"]\n'
+        'build-backend = "setuptools.build_meta"\n'
+        "\n"
+        "[project]\n"
+        f'name = "{name}"\n'
+        'version = "0.0.1"\n',
+        encoding="utf-8",
+    )
+
+
+def test_extract_pyproject_project_name_reads_dist_name(tmp_path: Path) -> None:
+    """spec_031 §2-2 — happy path: [project] name is returned verbatim
+    so the post-install validator can probe importlib.metadata for it."""
+
+    _write_minimal_pyproject(tmp_path, name="ccd-knowledge-rag")
+    assert _extract_pyproject_project_name(tmp_path) == "ccd-knowledge-rag"
+
+
+def test_extract_pyproject_project_name_missing_pyproject_returns_none(
+    tmp_path: Path,
+) -> None:
+    """spec_031 §2-2 — no pyproject.toml → None (古典 setuptools 等を
+    排除しないための silent fallback)。"""
+
+    assert _extract_pyproject_project_name(tmp_path) is None
+
+
+def test_extract_pyproject_project_name_missing_project_table_returns_none(
+    tmp_path: Path,
+) -> None:
+    """spec_031 §2-2 — pyproject.toml without [project] name → None
+    (validator skips the import probe, only binary checks run)。"""
+
+    _write_minimal_pyproject(tmp_path, name=None)
+    assert _extract_pyproject_project_name(tmp_path) is None
+
+
+def test_extract_pyproject_project_name_malformed_returns_none(
+    tmp_path: Path,
+) -> None:
+    """spec_031 §2-2 — malformed TOML → None (silent fallback, validator
+    skips the import probe rather than blowing up provisioning over a
+    syntax error in the target repo)。"""
+
+    (tmp_path / "pyproject.toml").write_text(
+        "[project\nname = oops  ###\n", encoding="utf-8"
+    )
+    assert _extract_pyproject_project_name(tmp_path) is None
+
+
+def test_provision_iso_venv_post_install_happy_path(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """spec_031 §2-1 — when the iso-venv has all three required pieces
+    (mutmut + pytest + importable target package), provisioning returns
+    the bin directory exactly as before (no behavioural change for the
+    healthy case)."""
+
+    workspace = tmp_path / "clone"
+    _write_minimal_pyproject(workspace, name="ccd-fixture")
+    iso_bin = workspace / ".ccd-iso-venv" / "bin"
+
+    fake_run = _make_fake_provision_subprocess(
+        iso_bin=iso_bin,
+        create_mutmut=True,
+        create_pytest=True,
+        probe_returncode=0,
+    )
+    monkeypatch.setattr("ccd.discover.subprocess.run", fake_run)
+
+    result = _provision_iso_venv(workspace)
+    assert result == iso_bin
+
+
+def test_provision_iso_venv_halts_on_missing_mutmut_binary(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """spec_031 §2-1 — pip install exits 0 but mutmut binary absent →
+    IsoVenvProvisioningError with a specific halt_reason name."""
+
+    workspace = tmp_path / "clone"
+    _write_minimal_pyproject(workspace, name="ccd-fixture")
+    iso_bin = workspace / ".ccd-iso-venv" / "bin"
+
+    fake_run = _make_fake_provision_subprocess(
+        iso_bin=iso_bin,
+        create_mutmut=False,
+        create_pytest=True,
+        probe_returncode=0,
+    )
+    monkeypatch.setattr("ccd.discover.subprocess.run", fake_run)
+
+    with pytest.raises(IsoVenvProvisioningError) as exc_info:
+        _provision_iso_venv(workspace)
+    message = str(exc_info.value)
+    assert "post-install validation failed" in message
+    assert "mutmut binary not found" in message
+    # And only one error — pytest + package were both fine.
+    assert "pytest binary not found" not in message
+    assert "not importable" not in message
+
+
+def test_provision_iso_venv_halts_on_missing_pytest_binary(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """spec_031 §2-1 — pip install exits 0 but pytest binary absent →
+    IsoVenvProvisioningError with a specific halt_reason name."""
+
+    workspace = tmp_path / "clone"
+    _write_minimal_pyproject(workspace, name="ccd-fixture")
+    iso_bin = workspace / ".ccd-iso-venv" / "bin"
+
+    fake_run = _make_fake_provision_subprocess(
+        iso_bin=iso_bin,
+        create_mutmut=True,
+        create_pytest=False,
+        probe_returncode=0,
+    )
+    monkeypatch.setattr("ccd.discover.subprocess.run", fake_run)
+
+    with pytest.raises(IsoVenvProvisioningError) as exc_info:
+        _provision_iso_venv(workspace)
+    message = str(exc_info.value)
+    assert "pytest binary not found" in message
+    assert "mutmut binary not found" not in message
+
+
+def test_provision_iso_venv_halts_on_unimportable_package(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """spec_031 §2-1 — pip install exits 0, binaries present, but the
+    target dist isn't visible to ``importlib.metadata`` inside the
+    iso-venv → IsoVenvProvisioningError with the dist name and a
+    stderr snippet so the operator can see exactly what failed."""
+
+    workspace = tmp_path / "clone"
+    _write_minimal_pyproject(workspace, name="ccd-knowledge-rag")
+    iso_bin = workspace / ".ccd-iso-venv" / "bin"
+
+    fake_run = _make_fake_provision_subprocess(
+        iso_bin=iso_bin,
+        create_mutmut=True,
+        create_pytest=True,
+        probe_returncode=1,
+        probe_stderr=b"PackageNotFoundError: No package metadata was found for ccd-knowledge-rag",
+    )
+    monkeypatch.setattr("ccd.discover.subprocess.run", fake_run)
+
+    with pytest.raises(IsoVenvProvisioningError) as exc_info:
+        _provision_iso_venv(workspace)
+    message = str(exc_info.value)
+    assert "package 'ccd-knowledge-rag' not importable" in message
+    assert "PackageNotFoundError" in message
+
+
+def test_provision_iso_venv_aggregates_multiple_failures(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """spec_031 §2-1 — all three checks run unconditionally; a triple
+    failure surfaces all three reasons in a single exception (not the
+    first one only). Mirrors spec_021 ガード 5 「全部チェックする」原則。"""
+
+    workspace = tmp_path / "clone"
+    _write_minimal_pyproject(workspace, name="ccd-fixture")
+    iso_bin = workspace / ".ccd-iso-venv" / "bin"
+
+    fake_run = _make_fake_provision_subprocess(
+        iso_bin=iso_bin,
+        create_mutmut=False,
+        create_pytest=False,
+        probe_returncode=1,
+        probe_stderr=b"PackageNotFoundError: No package metadata was found for ccd-fixture",
+    )
+    monkeypatch.setattr("ccd.discover.subprocess.run", fake_run)
+
+    with pytest.raises(IsoVenvProvisioningError) as exc_info:
+        _provision_iso_venv(workspace)
+    message = str(exc_info.value)
+    assert "mutmut binary not found" in message
+    assert "pytest binary not found" in message
+    assert "package 'ccd-fixture' not importable" in message
+    # All three reasons live under the same header line.
+    assert message.count("post-install validation failed") == 1
+
+
+def test_provision_iso_venv_skips_package_check_when_pyproject_has_no_name(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """spec_031 §2-1 — repos without ``[project] name`` (古典 setuptools
+    等) must not be rejected by the post-install validator; only the
+    binary checks run. We assert this by configuring the probe to fail
+    if it were ever invoked, and observing that provisioning succeeds."""
+
+    workspace = tmp_path / "clone"
+    _write_minimal_pyproject(workspace, name=None)
+    iso_bin = workspace / ".ccd-iso-venv" / "bin"
+
+    probe_was_called = {"hit": False}
+    from subprocess import CompletedProcess
+
+    def fake_run(*args, **kwargs):  # type: ignore[no-untyped-def]
+        argv = args[0] if args else kwargs.get("args", [])
+        argv_list = list(argv) if isinstance(argv, (list, tuple)) else []
+        if (
+            len(argv_list) >= 3
+            and argv_list[1] == "-m"
+            and argv_list[2] == "venv"
+        ):
+            iso_bin.mkdir(parents=True, exist_ok=True)
+            (iso_bin / "python").write_text("# fake", encoding="utf-8")
+            (iso_bin / "python").chmod(0o755)
+            return CompletedProcess(args=argv_list, returncode=0, stdout="", stderr="")
+        if "pip" in argv_list and "install" in argv_list:
+            (iso_bin / "mutmut").write_text("# fake", encoding="utf-8")
+            (iso_bin / "mutmut").chmod(0o755)
+            (iso_bin / "pytest").write_text("# fake", encoding="utf-8")
+            (iso_bin / "pytest").chmod(0o755)
+            return CompletedProcess(args=argv_list, returncode=0, stdout="", stderr="")
+        if len(argv_list) >= 3 and argv_list[1] == "-c":
+            probe_was_called["hit"] = True
+            return CompletedProcess(args=argv_list, returncode=1, stdout=b"", stderr=b"BOOM")
+        return CompletedProcess(args=argv_list, returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("ccd.discover.subprocess.run", fake_run)
+
+    result = _provision_iso_venv(workspace)
+    assert result == iso_bin
+    assert probe_was_called["hit"] is False, (
+        "importlib.metadata probe should be skipped when pyproject has no [project] name"
+    )
+
+
+def test_provision_iso_venv_skips_package_check_when_no_pyproject(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """spec_031 §2-1 — repos without pyproject.toml at all behave the
+    same as repos with pyproject but no [project] name: validator only
+    runs the two binary checks (古典 setuptools 等への過剰実装回避)。"""
+
+    workspace = tmp_path / "clone"
+    workspace.mkdir()
+    iso_bin = workspace / ".ccd-iso-venv" / "bin"
+
+    fake_run = _make_fake_provision_subprocess(
+        iso_bin=iso_bin,
+        create_mutmut=True,
+        create_pytest=True,
+        probe_returncode=1,  # would fail if it were ever called
+    )
+    monkeypatch.setattr("ccd.discover.subprocess.run", fake_run)
+
+    # Should succeed — probe never runs because dist_name is None.
+    result = _provision_iso_venv(workspace)
+    assert result == iso_bin

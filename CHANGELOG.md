@@ -2,6 +2,70 @@
 
 本プロジェクトの注目すべき変更を記録する。フォーマットは [Keep a Changelog](https://keepachangelog.com/) に準ずる。
 
+## [0.19.1] — 2026-05-27
+
+spec_031 — **iso-venv install の沈黙失敗を防ぐ post-install 検証**。v0.19.0 で spec_030 が「`mutants_total = 0` の沈黙失敗を HALT として可視化」したが、その後の sweep #3 / #4 で axis-knowledge-rag に対する mutation チャンネルが安定して HALT する実走結果を観察した：
+
+| sweep | mutation_paths | 結果 |
+|---|---|---|
+| #3 (spec_030 後) | `backend/src/_decay.py` | mutants_total=0 → **HALT に昇格・可視化** |
+| #4 (切り分け実験) | `backend/src/normalizer.py`（underscore なし、81 行）| mutants_total=0 → **同様に HALT** |
+
+`normalizer.py`（underscore prefix なし、十分 mutate 可能な NFKC/カナ統一/lowercase 関数群を含む）に切り替えても 0 mutants だった事実から、**原因は mutmut の underscore 慣習スキップではなく、iso-venv 内に対象 repo の package が正しく install されていない**ことが確定。`_provision_iso_venv` の install ステップ（`pip install -e . mutmut pytest`）は exit 0 で返るが、実際には iso-venv 内に必要なパッケージが揃っておらず、mutmut が「test も対象 package も import できないので 0 mutants を返す」状態を生んでいた。pip の exit code に頼った既存の `subprocess.CalledProcessError` catch では捕まらない silent fail。spec_031 は install ステップ完了後に必須要素が iso-venv に存在するか検証する防護層を追加する (patch bump = install validation の堅牢化):
+
+### Added
+
+- **`ccd/discover.py:_provision_iso_venv` に 3 段階 post-install 検証を追加** (spec_031 §2-1):
+  - 既存の `subprocess.run(install_args, check=True, ...)` 完了直後に `_validate_iso_venv_post_install` を呼び出し、3 つのチェックを **すべて** 実行 (spec_021 ガード 5 と同じ「全部チェックする」流儀 ── 最初の失敗で打ち切らない):
+    1. **`mutmut` バイナリ存在チェック** ── `iso_venv_bin / "mutmut"` が `is_file()` を満たすか。
+    2. **`pytest` バイナリ存在チェック** ── `iso_venv_bin / "pytest"` が `is_file()` を満たすか。
+    3. **対象 repo の dist 名の importability チェック** ── `_extract_pyproject_project_name(workspace)` で `pyproject.toml` の `[project] name` を取得、iso-venv 内の `python -c "from importlib.metadata import version, PackageNotFoundError; ..."` 経由で `importlib.metadata.version(dist_name)` を呼び、`PackageNotFoundError` を捕まえる。
+  - 失敗したチェックを集めて 1 回の `IsoVenvProvisioningError` で raise: message は `"post-install validation failed:\n  - ..."` 形式で全失敗を bullet 列挙。
+  - halt_reason に具体名 (不在バイナリの絶対パス / 不在 dist 名 / importlib.metadata の stderr) が出る ── 朝レポート §D で操作者が「具体的に何が install できなかったか」を 1 行で読める。
+  - `dist_name` が `None` (pyproject.toml が無い / `[project]` テーブルが無い / `[project] name` が無い / TOML malformed) の場合は **package チェックをスキップ** ── バイナリチェックだけ走る。古典 setuptools 等の repo を排除しない (過剰実装の回避)。
+  - `subprocess.run` の例外ハンドリング: `FileNotFoundError` (iso-python 自体が無い) / `subprocess.TimeoutExpired` (probe がハング) も errors リストに追記。
+  - probe の stderr が長い場合は `_POST_INSTALL_STDERR_MAX = 2048` バイトで truncate (朝レポート §D が読みづらくなるのを防ぐ、`...[truncated]` suffix を付与)。
+  - importlib.metadata probe には独自 `try / except PackageNotFoundError: raise SystemExit(f"PackageNotFoundError: {exc}")` の Python ワンライナーを `-c` 経由で実行 ── これにより package の `__init__` が走らず、target package の optional dependency 未充足 (chromadb / streamlit / 等) で false-fail しない。**dist の visibility だけ** をチェックする最小契約。
+- **`ccd/discover.py:_extract_pyproject_project_name` ヘルパを追加** (spec_031 §2-2):
+  - `<workspace>/pyproject.toml` の `[project] name` を `tomllib.loads` で取得して返す。
+  - missing pyproject / `OSError` / `TOMLDecodeError` / `[project]` テーブル無し / `name` 不在 / 空文字列 → **silent fallback to `None`** (古典 setuptools 等の repo を排除しないため)。
+  - `tomllib` は Python 3.11+ 標準ライブラリ ── CCD は 3.11+ 必須 (pyproject.toml の `requires-python`) なので追加依存なし。
+
+### Added (tests)
+
+- **`tests/test_discover.py` に spec_031 セクション追加** (11 件、すべて注入ベース):
+  - `_extract_pyproject_project_name` 4 件:
+    - 正常系: `[project] name = "ccd-knowledge-rag"` → `"ccd-knowledge-rag"` を返す。
+    - pyproject 不在 → `None`。
+    - `[project]` テーブル無し → `None`。
+    - TOML malformed → `None` (silent fallback)。
+  - `_provision_iso_venv` post-install 検証 7 件:
+    - **正常系**: mutmut + pytest + package すべて揃っていれば `iso_venv_bin` を return ── これまでの healthy case の挙動は不変。
+    - **異常系 (a)**: mutmut バイナリ欠如 → message に `"mutmut binary not found"` を含む `IsoVenvProvisioningError`。pytest と package は green、message に他文言が混入しないことも assert (検証ロジックの精度 pin)。
+    - **異常系 (b)**: pytest バイナリ欠如 → message に `"pytest binary not found"` を含む `IsoVenvProvisioningError`。
+    - **異常系 (c)**: package import 失敗 → message に `"package 'ccd-knowledge-rag' not importable"` + stderr の `"PackageNotFoundError"` snippet が含まれる。
+    - **複数失敗の集約**: mutmut + pytest 両方欠如 + package 不在の 3 重失敗で、3 件すべてが 1 つの例外 message に列挙される。message header `"post-install validation failed"` の出現は 1 回だけ ── 「最初の失敗で打ち切らない / 全部集めて 1 回 raise」原則の構造的 pin。
+    - **pyproject `[project] name` 不在のスキップ**: バイナリだけ揃っていれば package チェックをスキップ、probe が呼ばれた形跡なし (`probe_was_called["hit"] is False`) を直接 assert。
+    - **pyproject 不在のスキップ**: 同上 ── pyproject.toml そのものが無い repo でも、バイナリだけ揃っていれば provisioning は通過。
+  - すべて `subprocess.run` を monkeypatch して fake iso-venv を tmp_path 配下に build する方式 ── 実 `python -m venv` / 実 pip / 実 importlib lookup は走らせない (spec_026 §3 / spec_028 §2-4 / spec_029 §2-5 が確立した「dispatch 内に実走検証を入れない」原則を継承)。
+- **既存 `test_provision_iso_venv_creates_clone_local_python` (integration-style 実 venv 起動テスト) は不変** ── pip が使える環境では正常系として通る (本 spec の挙動変更は healthy case を素通りさせる設計のため)、不可な環境では既存通り `pytest.skip` する。
+
+### Constraints
+
+- **触ったファイル**: `ccd/discover.py` (`_provision_iso_venv` 拡張 + `_validate_iso_venv_post_install` + `_extract_pyproject_project_name` + `tomllib` import + 定数 `_POST_INSTALL_STDERR_MAX`) / `tests/test_discover.py` (8 件の新規テスト + import 追加) / `tests/test_smoke.py` (version assert) / `CHANGELOG.md` / `pyproject.toml` / `ccd/__init__.py`。
+- **触っていないファイル** (spec §3 「触ってはいけない」遵守):
+  - `ccd/{models,protocol,dispatch,chain,integrate,metrics,dashboard,run_writer,retry,backfill,agent,retrospect,adversarial,ai_review,brief,profile,guard,translate,nightly,sweep}.py` のコアロジック ── **1 行も touch していない**。
+  - `ccd/cli.py` / `docs/` / `docs/data/*.json` ── 触っていない。
+  - **spec_030 で入れた HALT 経路** (`run_discovery` の 0-mutants HALT / `brief` の §D / `sweep` の skip 経路) は **1 行も touch していない** ── spec_031 はその上流 (`_provision_iso_venv`) を厳しくするだけ。
+- **既存挙動不変**: 正常な iso-venv (CCD 自身の sweep) は新検証を通過し、これまでと同じ `iso_venv_bin` を返す。挙動の違いは「install 沈黙失敗時に `IsoVenvProvisioningError` が raise されるか黙って 0 mutants を返すか」だけ。
+- 安全境界レベル 2 不変 ── ローカル commit のみ、push しない / ブランチ操作・merge しない。
+
+### Verification
+
+- `ruff check .` → All checks passed!
+- `pytest -q` → 606 passed (新規 11 件 + 既存 595 件)。
+- `python3 -m ccd --version` → `ccd 0.19.1`。
+
 ## [0.19.0] — 2026-05-27
 
 spec_030 — **Phase 2.5 実走で発覚した 2 つの「沈黙失敗」の構造修正**。v0.18.0 で複数施策の巡回 (`ccd nightly-all`) が点火した直後、CCD 自身 + axis-knowledge-rag の 2 施策で sweep を回したところ、ふたつの欠陥が顕在化した:
