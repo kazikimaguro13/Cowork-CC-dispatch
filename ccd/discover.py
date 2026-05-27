@@ -326,6 +326,7 @@ def run_channel(
     agent_runner=None,
     discover_dir: Path | None = None,
     adversarial_parsers: Any = None,
+    mutation_config: Any = None,
 ):
     """Dispatch one ``ccd discover --channel <channel>`` invocation.
 
@@ -359,7 +360,25 @@ def run_channel(
     """
 
     if channel == CHANNEL_MUTATION:
-        runner = mutation_runner if mutation_runner is not None else MutmutRunner()
+        if mutation_runner is not None:
+            runner = mutation_runner
+        else:
+            # spec_032 — forward profile-driven mutmut parameters
+            # (cwd / tests_dir / extra_args) when supplied. The test
+            # double `FakeMutationRunner` and existing single-CLI
+            # callers continue to work because ``mutation_config`` is
+            # optional and the runner constructor's new kwargs all
+            # default to None/empty.
+            runner_kwargs: dict[str, Any] = {}
+            if mutation_config is not None:
+                runner_kwargs["cwd"] = getattr(mutation_config, "cwd", None)
+                runner_kwargs["tests_dir"] = getattr(
+                    mutation_config, "tests_dir", None
+                )
+                runner_kwargs["extra_args"] = list(
+                    getattr(mutation_config, "extra_args", []) or []
+                )
+            runner = MutmutRunner(**runner_kwargs)
         return run_discovery(
             runner,
             repo=repo,
@@ -1052,6 +1071,36 @@ def _validate_iso_venv_post_install(
 # --------------------------------------------------------------------------- #
 
 
+def _build_mutmut_run_argv(
+    *,
+    binary: str,
+    paths_arg: str,
+    tests_dir: str | None,
+    extra_args: list[str],
+) -> list[str]:
+    """spec_032 §2-2 — assemble the ``mutmut run`` command line.
+
+    Order matters for the test suite that pins the exact argv shape:
+
+    1. ``<binary> run``
+    2. ``--paths-to-mutate <comma-separated paths>``
+    3. ``--tests-dir <tests_dir>`` when set
+    4. profile-supplied ``extra_args`` verbatim, last
+
+    Extracted to a pure helper so the assembly logic is unit-testable
+    without spinning up an iso-venv. CCD does NOT whitelist
+    ``extra_args`` — the existing防護網 (mutmut non-zero exit, the
+    spec_030 0-mutants HALT) absorbs bad inputs (spec §3
+    「既存防護網に委譲」).
+    """
+
+    cmd: list[str] = [binary, "run", "--paths-to-mutate", paths_arg]
+    if tests_dir:
+        cmd += ["--tests-dir", tests_dir]
+    cmd += list(extra_args)
+    return cmd
+
+
 class MutmutRunner:
     """Production `MutationRunner` that shells out to ``mutmut``.
 
@@ -1074,6 +1123,13 @@ class MutmutRunner:
     mutmut-spawned pytest subprocess) resolve to the *mutated* clone rather
     than the live source — bypassing the parent venv's PEP 660 editable
     finder that caused the 0-killed regression.
+
+    spec_032 — accepts ``cwd`` / ``tests_dir`` / ``extra_args`` so a
+    profile can target nested-structure repos (``backend/src/...``).
+    When ``cwd`` is set, mutmut is invoked from ``<clone>/<cwd>`` and
+    ``.mutmut-cache`` is read from that same subdirectory; the iso-venv
+    itself still lives at the clone root, which avoids any need to
+    change how ``_provision_iso_venv`` installs the editable target.
     """
 
     DEFAULT_BINARY = "mutmut"
@@ -1083,9 +1139,15 @@ class MutmutRunner:
         *,
         binary: str | None = None,
         timeout: float | None = None,
+        cwd: str | None = None,
+        tests_dir: str | None = None,
+        extra_args: list[str] | None = None,
     ) -> None:
         self._binary = binary or self.DEFAULT_BINARY
         self._timeout = timeout
+        self._cwd = cwd
+        self._tests_dir = tests_dir
+        self._extra_args = list(extra_args or [])
 
     def run(
         self,
@@ -1109,11 +1171,23 @@ class MutmutRunner:
 
             binary = self._resolve_binary(iso_venv_bin)
             env = _workspace_env(workspace, iso_venv_bin=iso_venv_bin)
+            # spec_032 — mutmut's working directory inside the clone.
+            # ``None`` keeps the spec_014 behavior (clone root); a
+            # non-None ``cwd`` is resolved relative to the clone, so
+            # ``<clone>/backend`` is what mutmut sees as its CWD and
+            # ``.mutmut-cache`` is read from that subdirectory.
+            run_cwd = workspace / self._cwd if self._cwd else workspace
 
+            argv = _build_mutmut_run_argv(
+                binary=binary,
+                paths_arg=paths_arg,
+                tests_dir=self._tests_dir,
+                extra_args=self._extra_args,
+            )
             try:
                 run_proc = subprocess.run(
-                    [binary, "run", "--paths-to-mutate", paths_arg],
-                    cwd=str(workspace),
+                    argv,
+                    cwd=str(run_cwd),
                     env=env,
                     capture_output=True,
                     text=True,
@@ -1150,7 +1224,7 @@ class MutmutRunner:
             try:
                 results_proc = subprocess.run(
                     [binary, "results"],
-                    cwd=str(workspace),
+                    cwd=str(run_cwd),
                     env=env,
                     capture_output=True,
                     text=True,
@@ -1172,7 +1246,7 @@ class MutmutRunner:
                 for file_path, ids in by_file.items():
                     for mid in ids:
                         file_from_show, line, desc = self._show(
-                            binary, workspace, env, mid
+                            binary, run_cwd, env, mid
                         )
                         mutants.append(
                             Mutant(
@@ -1189,7 +1263,9 @@ class MutmutRunner:
             # the canary check would fire on every successful run. Read the
             # killed mutants straight from ``.mutmut-cache`` (mutmut's own
             # SQLite store) to get the authoritative count.
-            mutants.extend(_collect_killed_mutants_from_cache(workspace))
+            # spec_032 — when ``cwd`` is set the cache lives in
+            # ``<clone>/<cwd>/.mutmut-cache``, not at the clone root.
+            mutants.extend(_collect_killed_mutants_from_cache(run_cwd))
 
             return MutationRunOutcome(
                 mutants=mutants,
@@ -1216,14 +1292,14 @@ class MutmutRunner:
     def _show(
         self,
         binary: str,
-        workspace: Path,
+        run_cwd: Path,
         env: dict[str, str],
         mid: str,
     ) -> tuple[str | None, int, str]:
         try:
             proc = subprocess.run(
                 [binary, "show", mid],
-                cwd=str(workspace),
+                cwd=str(run_cwd),
                 env=env,
                 capture_output=True,
                 text=True,

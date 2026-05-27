@@ -140,7 +140,7 @@ from ccd.discover import (
     run_discovery,
 )
 from ccd.guard import GuardResult, inspect_diff
-from ccd.profile import Profile, load_profile
+from ccd.profile import Profile, effective_mutation_config, load_profile
 from ccd.protocol import parse_spec
 from ccd.translate import Finding, translate_finding
 
@@ -548,9 +548,15 @@ def run_nightly(
     executed_channels = [
         c for c in effective_profile.discovery.channels if c not in skip_map
     ]
+    # spec_032 — derive the effective mutation config (either the new
+    # ``[discovery.mutation]`` block or a wrapper around the legacy
+    # ``discovery.mutation_paths``) so the runner gets cwd / tests_dir /
+    # extra_args when the profile supplies them.
+    mut_cfg = effective_mutation_config(effective_profile.discovery)
     channel_outcomes = _run_channels(
         channels=executed_channels,
-        mutation_paths=list(effective_profile.discovery.mutation_paths),
+        mutation_paths=list(mut_cfg.mutation_paths),
+        mutation_config=mut_cfg,
         repo=repo,
         run_channel_fn=run_channel_fn,
         discover_dir=discover_dir,
@@ -706,6 +712,7 @@ def _run_channels(
     run_channel_fn: ChannelRunner,
     discover_dir: Path | None = None,
     adversarial_parsers: Any = None,
+    mutation_config: Any = None,
 ) -> list[ChannelOutcome]:
     """Invoke each enabled channel and collect the four shared fields.
 
@@ -717,6 +724,10 @@ def _run_channels(
     spec_030: ``adversarial_parsers`` (when provided) is forwarded to
     the adversarial channel so the sweep can inject profile-driven
     parsers instead of the CCD-default hard-coded set.
+
+    spec_032: ``mutation_config`` carries the cwd / tests_dir /
+    extra_args that the profile injects into the mutmut invocation.
+    Forwarded only to the mutation channel; other channels ignore it.
     """
 
     out: list[ChannelOutcome] = []
@@ -727,6 +738,8 @@ def _run_channels(
             kwargs["discover_dir"] = discover_dir
         if channel == "adversarial" and adversarial_parsers is not None:
             kwargs["adversarial_parsers"] = adversarial_parsers
+        if channel == "mutation" and mutation_config is not None:
+            kwargs["mutation_config"] = mutation_config
         try:
             result = run_channel_fn(channel, **kwargs)
         except Exception as exc:
