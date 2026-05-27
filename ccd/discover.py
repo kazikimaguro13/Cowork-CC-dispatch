@@ -51,6 +51,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import tomllib
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -915,7 +916,135 @@ def _provision_iso_venv(
             f"{(exc.stderr or exc.stdout or '').strip()}"
         ) from exc
 
-    return venv_dir / "bin"
+    # spec_031 §2-1 — post-install validation. ``pip install`` can exit 0 yet
+    # leave the iso-venv missing the binaries / package the mutation channel
+    # depends on (sweep #3 / #4 caught this with axis-knowledge-rag: mutmut
+    # ran "successfully" against a venv where the target package wasn't
+    # actually importable, producing ``mutants_total=0`` — the silent failure
+    # spec_030 surfaces as a HALT, but only after the misleading exit-0
+    # install. spec_031 makes the install itself the failure boundary.
+    iso_venv_bin = venv_dir / "bin"
+    _validate_iso_venv_post_install(
+        iso_venv_bin=iso_venv_bin,
+        workspace=workspace,
+        timeout=timeout,
+    )
+    return iso_venv_bin
+
+
+# Max stderr bytes appended to a single post-install validation error line.
+# Real pip / importlib stderr can be many KB; halt_reason eventually lands in
+# the morning brief §D where multi-KB blobs hurt readability. 2 KB keeps the
+# diagnostic informative (full ImportError chain, missing-module name) without
+# overwhelming the report.
+_POST_INSTALL_STDERR_MAX = 2048
+
+
+def _extract_pyproject_project_name(workspace: Path) -> str | None:
+    """Return the dist name from ``<workspace>/pyproject.toml``'s
+    ``[project] name``, or None if pyproject.toml is missing, malformed, or
+    lacks ``[project] name``.
+
+    Used by spec_031 post-install validation to verify the target package is
+    importable in the iso-venv; non-fatal if absent (古典 setuptools 等の
+    repo を排除しない、過剰実装を避ける)。
+    """
+
+    pyproject_path = workspace / "pyproject.toml"
+    if not pyproject_path.is_file():
+        return None
+    try:
+        data = tomllib.loads(pyproject_path.read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError):
+        return None
+    project = data.get("project") or {}
+    name = project.get("name")
+    if isinstance(name, str) and name.strip():
+        return name.strip()
+    return None
+
+
+def _validate_iso_venv_post_install(
+    *,
+    iso_venv_bin: Path,
+    workspace: Path,
+    timeout: float | None,
+) -> None:
+    """spec_031 §2-1 — collect all post-install failures into one exception.
+
+    Three checks, all run unconditionally so the operator sees every missing
+    piece in one go (spec_021 ガード 5 と同じ「全部チェックする」流儀):
+
+    1. ``mutmut`` binary present in ``iso_venv_bin``
+    2. ``pytest`` binary present in ``iso_venv_bin``
+    3. the workspace's ``[project] name`` is importable inside the iso-venv
+       (only when pyproject.toml advertises one — 古典 setuptools 等の repo
+       はスキップして過剰実装を避ける)
+    """
+
+    errors: list[str] = []
+
+    mutmut_bin = iso_venv_bin / "mutmut"
+    if not mutmut_bin.is_file():
+        errors.append(
+            f"mutmut binary not found at {mutmut_bin} "
+            "(pip install of mutmut likely failed silently)"
+        )
+
+    pytest_bin = iso_venv_bin / "pytest"
+    if not pytest_bin.is_file():
+        errors.append(
+            f"pytest binary not found at {pytest_bin} "
+            "(pip install of pytest likely failed silently)"
+        )
+
+    dist_name = _extract_pyproject_project_name(workspace)
+    if dist_name:
+        iso_python = iso_venv_bin / "python"
+        # importlib.metadata.version raises PackageNotFoundError when the
+        # dist isn't visible to the iso-venv — much cheaper than ``import``
+        # since it doesn't execute the package's __init__ (which could fail
+        # for unrelated reasons like a missing optional dependency).
+        probe = (
+            "from importlib.metadata import version, PackageNotFoundError\n"
+            f"try:\n"
+            f"    version({dist_name!r})\n"
+            "except PackageNotFoundError as exc:\n"
+            "    raise SystemExit(f'PackageNotFoundError: {exc}')\n"
+        )
+        try:
+            check_proc = subprocess.run(
+                [str(iso_python), "-c", probe],
+                capture_output=True,
+                timeout=timeout if timeout is not None else 30,
+            )
+        except FileNotFoundError as exc:
+            errors.append(
+                f"iso-venv python missing at {iso_python} ({exc}); "
+                f"cannot verify package {dist_name!r} is importable"
+            )
+        except subprocess.TimeoutExpired:
+            errors.append(
+                f"importlib.metadata probe for {dist_name!r} timed out "
+                f"in iso-venv"
+            )
+        else:
+            if check_proc.returncode != 0:
+                stderr_text = check_proc.stderr.decode(errors="replace").strip()
+                if len(stderr_text) > _POST_INSTALL_STDERR_MAX:
+                    stderr_text = (
+                        stderr_text[:_POST_INSTALL_STDERR_MAX] + "...[truncated]"
+                    )
+                errors.append(
+                    f"package {dist_name!r} not importable in iso-venv "
+                    f"(pip install -e . likely failed silently); "
+                    f"stderr: {stderr_text}"
+                )
+
+    if errors:
+        raise IsoVenvProvisioningError(
+            "post-install validation failed:\n  - " + "\n  - ".join(errors)
+        )
 
 
 # --------------------------------------------------------------------------- #
