@@ -2,6 +2,102 @@
 
 本プロジェクトの注目すべき変更を記録する。フォーマットは [Keep a Changelog](https://keepachangelog.com/) に準ずる。
 
+## [0.20.0] — 2026-05-27
+
+spec_032 — **mutmut とネスト構造の互換性（欠陥 6）の構造修正**。spec_030 で「`mutants_total = 0` の沈黙失敗」を HALT として可視化、spec_031 で iso-venv install の沈黙失敗を `IsoVenvProvisioningError` として捕まえた後も、axis-knowledge-rag に対する mutation チャンネルは sweep #3〜#5 で安定して 0 mutants HALT を返し続けた。sweep #5 で spec_031 の post-install validation を通過した（mutmut バイナリ・pytest バイナリ・対象 package が iso-venv に揃っている）にもかかわらず mutmut が 0 mutants を返す事実から、**原因は install ではなく mutmut とネスト構造（`backend/src/...`）の互換性問題**であることが確定。spec_032 は **profile から mutmut の実行パラメータ（cwd / paths_to_mutate / tests_dir / extra_args）を注入できるようにする** ことで、mutmut 2.x の以下 3 仮説のいずれにも対応可能な汎用解を提供する (minor bump = 新機能 + schema 拡張):
+
+1. mutmut が `backend/src/...` のような階層を source root として認識できない
+2. mutmut が `backend/tests` のような階層を test ディレクトリとして自動検出できない
+3. mutmut の default cwd（repo root）からの相対パス解決が `backend/src/...` で破綻
+
+これで v2 設計思想で実走で炙り出された **全 6 件の欠陥が構造修正済み**（5 件構造修正 + 1 件防護網捕獲 → **6 件全部構造修正**）に昇格する。
+
+### Added
+
+- **`ccd/profile.py` に `MutationConfig` モデルを追加** (spec_032 §2-1):
+  - 新規 `MutationConfig` (pydantic `BaseModel`, `extra="forbid"`):
+    - `mutation_paths: list[str]` (空リスト reject、各要素 non-empty)。
+    - `cwd: str | None = None` ── iso-clone 配下のサブディレクトリ。`None` でレガシー spec_018 の挙動（mutmut が clone root で起動）を維持。
+    - `tests_dir: str | None = None` ── `mutmut run --tests-dir <tests_dir>` に渡す値。`None` で mutmut の auto-discover に任せる。`cwd` 配下相対。
+    - `extra_args: list[str] = []` ── `mutmut run` コマンドラインの末尾に逐語追加。CCD は内容を whitelist しない（spec §3「既存防護網に委譲」── 不正な flag は mutmut の non-zero exit / spec_030 の 0-mutants HALT で結果的に捕まる）。
+  - `DiscoveryConfig` に新規 `mutation: MutationConfig | None = None` フィールドを追加。`None` でレガシー `discovery.mutation_paths` 経路（spec_018）を bit-for-bit 維持。
+  - `model_validator(mode="before")` で「`discovery.mutation_paths` と `[discovery.mutation]` の同時指定」を reject（ambiguity 防止、loud is better than silent）。
+  - 新規 helper `effective_mutation_config(discovery)` ── レガシー / 新形式どちらも `MutationConfig` で受け取れる統一ビュー。call site の分岐を排除。
+  - `render_profile` を新形式の出力に対応 ── `[discovery.mutation]` テーブルを round-trippable に emit、レガシー形式（top-level `mutation_paths`）と排他的に切り替え。
+- **`ccd/profile.py:_validate_mutation_config_paths` を追加** (spec_032 §2-1):
+  - profile 読み込み時に、`[discovery.mutation]` ブロックが指定するパス群が target repo に実在するかを検証。失敗は全部集めて 1 回の `ProfileError`（新規例外、`ValueError` の subclass）で raise。
+  - 検証する 3 項目: (a) `cwd` ディレクトリが存在 / (b) `mutation_paths` の各 entry が `repo_root[/cwd]` 配下で存在 / (c) `tests_dir` が `repo_root[/cwd]` 配下で存在。
+  - エラーメッセージには **不在パスの絶対パス** を全部含める（spec_031 の `IsoVenvProvisioningError` と同じ思想 ── 操作者が「何が見つからなかったか」を 1 行で読める）。
+  - レガシー `discovery.mutation_paths`（top-level、spec_018 形式）は **path existence 検証の対象外** ── 後方互換のため（既存の spec_018 deployment で target repo が profile の expect する場所に未チェックアウトでも load できる）。
+  - `load_profile_with_source` と `load_profile_registry` の両経路から呼び出し ── 単一 profile / registry sweep の両方で fail-fast を保証。
+- **`ProfileError` 例外を追加** (spec_032 §2-1):
+  - `ValueError` の subclass ── 既存の `try/except ValueError` 経路は壊さない。
+  - spec_032 の path-existence 検証専用の例外型として導入、将来の profile post-load 検証拡張にも使える。
+- **`ccd/discover.py:MutmutRunner` に `cwd` / `tests_dir` / `extra_args` パラメータを追加** (spec_032 §2-2):
+  - `__init__` シグネチャに 3 つの新 optional kwarg を追加 ── すべて `None` / `[]` がデフォルトで、spec_014/spec_019 の既存挙動を bit-for-bit 維持。
+  - `run()` 内で:
+    - mutmut の subprocess cwd を `cwd` 指定時は `<clone>/<cwd>` に切り替え（mutmut のネスト構造 workaround：`cd <subdir> && mutmut run --paths-to-mutate <subdir-relative>`）。
+    - argv に `--tests-dir <tests_dir>` を `tests_dir` 指定時に挿入。
+    - argv の末尾に `extra_args` を逐語追加。
+    - `mutmut results` / `mutmut show` も同じ `run_cwd` で起動 ── 一貫した cwd で `.mutmut-cache` を読みに行く。
+    - `_collect_killed_mutants_from_cache(run_cwd)` ── cache は mutmut が起動した cwd 配下に書かれるので、cwd 切替時は cache 読み込み元も切り替える。
+  - 新規 helper `_build_mutmut_run_argv(*, binary, paths_arg, tests_dir, extra_args)` ── pure function、テスト容易性 + 「argv assembly のロジックを 1 箇所に集中」のため。テスト #2 がこの helper を直接 unit test し、`MutmutRunner.run()` の monkeypatch 経由 integration test もパスする。
+- **`ccd/discover.py:run_channel` に `mutation_config` kwarg を追加** (spec_032 §2-2):
+  - `MutmutRunner` のデフォルトインスタンス化時に、`mutation_config.cwd` / `.tests_dir` / `.extra_args` を constructor に forward。
+  - `mutation_config is None` のとき（CLI 単独起動 / nightly fallback）は MutmutRunner() でレガシー挙動を維持。
+- **`ccd/nightly.py:_run_channels` に `mutation_config` kwarg を追加** (spec_032 §2-2):
+  - `run_nightly` で `effective_mutation_config(profile.discovery)` を導出、`_run_channels` 経由で mutation channel に forward。
+  - 既存の `mutation_paths` 引数は引き続き渡す（call sites の最小 diff のため）。
+
+### Changed
+
+- **`_ai_workspace/profiles/axis-knowledge-rag.toml`** ── spec_032 形式に書き換え:
+  - 旧: `[discovery] mutation_paths = ["backend/src/normalizer.py"]`
+  - 新: `[discovery.mutation] cwd = "backend"` + `mutation_paths = ["src/normalizer.py"]` + `tests_dir = "tests"` + `extra_args = []`
+  - mutmut は iso_clone/backend を cwd として `mutmut run --paths-to-mutate src/normalizer.py --tests-dir tests` を実行する。
+- **`_ai_workspace/profiles/ccd.toml`** ── **無変更** (spec §2-4「既存挙動を変えない」証拠 ── レガシー形式が引き続き動作することを構造的に pin)。
+
+### Added (tests)
+
+- **`tests/test_mutation_invocation.py` を新規追加** (16 件、すべて注入ベース):
+  - **unit test #1 — profile schema parse** (4 件):
+    - 正常系: `[discovery.mutation]` ブロックが `cwd` / `mutation_paths` / `tests_dir` / `extra_args` フィールド付き `MutationConfig` に round-trip。
+    - default 値: optional キー（cwd / tests_dir / extra_args）省略時は `None` / `None` / `[]`。
+    - レガシー wrapping: `discovery.mutation is None` の profile（spec_018 形式）が `effective_mutation_config` で `MutationConfig` に wrap される。
+    - 排他性: top-level `mutation_paths` + `[discovery.mutation]` を同時に書くと load 時に `ValueError` (message に "mutually exclusive")。
+  - **unit test #2 — mutmut argv + cwd assembly** (7 件):
+    - `_build_mutmut_run_argv` 単体: minimal / `--tests-dir` 追加 / `extra_args` 末尾追加 の 3 件。
+    - `MutmutRunner.run()` 経由（subprocess.run monkeypatch + iso-venv stub）: 既定 cwd は clone root / `cwd="backend"` で `<clone>/backend` に切替 / `tests_dir="tests"` で `--tests-dir tests` 挿入 / `extra_args=["--use-coverage"]` で末尾追加 の 4 件。
+  - **unit test #3 — profile validation fail-fast** (5 件):
+    - 存在しない `cwd` → `ProfileError` (message に "discovery.mutation.cwd directory not found" + フルパス)。
+    - 存在しない `mutation_paths` entry → `ProfileError` (message に "mutation_paths entry not found" + フルパス)。
+    - 存在しない `tests_dir` → `ProfileError` (message に "discovery.mutation.tests_dir not found" + フルパス)。
+    - 複数失敗の集約 → 1 つの `ProfileError` message に cwd / mutation_paths / tests_dir の 3 件すべてが含まれる（spec_031 の 「全部チェックする」流儀を継承）。
+    - レガシー形式は存在検証の対象外 → `mutation_paths = ["definitely/nonexistent.py"]` でも load 成功（後方互換）。
+- 既存 mutation 系テスト（`tests/test_discover.py` 等）は **無修正で green** ── MutmutRunner の新 kwarg はすべて optional、デフォルト値で spec_014/spec_019 の挙動を bit-for-bit 維持。
+
+### Constraints
+
+- **触ったファイル**: `ccd/profile.py` (MutationConfig + ProfileError + effective_mutation_config + _validate_mutation_config_paths + render_profile 拡張 + DiscoveryConfig mutation field + model_validator) / `ccd/discover.py` (MutmutRunner kwargs + _build_mutmut_run_argv + run_cwd 切替) / `ccd/nightly.py` (effective_mutation_config import + _run_channels mutation_config forward) / `_ai_workspace/profiles/axis-knowledge-rag.toml` / `tests/test_mutation_invocation.py` (新規 16 件) / `tests/test_smoke.py` (version assert) / `CHANGELOG.md` / `pyproject.toml` / `ccd/__init__.py` / `README.md` / `docs/DESIGN.md` (§9.8 欠陥 6 構造修正の節)。
+- **触っていないファイル** (spec §3 「触ってはいけない」遵守):
+  - `ccd/{models,protocol,dispatch,chain,integrate,metrics,dashboard,run_writer,retry,backfill,agent,retrospect,adversarial,ai_review,brief,guard,translate,sweep}.py` ── **1 行も touch していない**。
+  - `ccd/cli.py` ── 1 行も touch していない（本 spec は CLI サブコマンドを追加しない）。
+  - `_ai_workspace/profiles/ccd.toml` ── **1 バイトも touch していない**（既存挙動の証）。
+  - `docs/architecture.md` / `docs/data/*.json` ── 触っていない。
+  - 既存 mutation 系テスト（`tests/test_discover.py` 等）── 1 行も touch していない。
+- **既存挙動不変**:
+  - CCD 自身の profile（レガシー `mutation_paths`）は spec_018 と bit-for-bit 同じ挙動。
+  - MutmutRunner() （引数なし）も spec_014/spec_019 と同じ挙動 ── cwd は clone root、--tests-dir なし、extra_args なし。
+  - レガシー path validation は走らない ── 後方互換完全。
+- 安全境界レベル 2 不変 ── ローカル commit のみ、push しない / ブランチ操作・merge しない。
+
+### Verification
+
+- `ruff check .` → All checks passed!
+- `pytest -q` → 622 passed (新規 16 件 + 既存 606 件、回帰なし)。
+- `python3 -m ccd --version` → `ccd 0.20.0`。
+- 構造修正のスコープ: profile から mutmut の実行パラメータを注入できる構造が完成。axis silo での実走確認（mutmut が依然 0 mutants を返すか、それとも mutation を生成するか）は人間（中島）が手動で実施する（spec §6 ── CC のスコープ外、実走で原因切り分け）。
+
 ## [0.19.1] — 2026-05-27
 
 spec_031 — **iso-venv install の沈黙失敗を防ぐ post-install 検証**。v0.19.0 で spec_030 が「`mutants_total = 0` の沈黙失敗を HALT として可視化」したが、その後の sweep #3 / #4 で axis-knowledge-rag に対する mutation チャンネルが安定して HALT する実走結果を観察した：

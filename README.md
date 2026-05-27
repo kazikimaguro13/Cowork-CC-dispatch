@@ -56,9 +56,9 @@ pip install -e ".[dev]"
 動作確認:
 
 ```bash
-ccd --version          # ccd 0.19.1
+ccd --version          # ccd 0.20.0
 ruff check .
-pytest -q              # 606 passed
+pytest -q              # 622 passed
 ```
 
 ## 使い方
@@ -172,7 +172,7 @@ v2 で追加された 7 つのサブコマンド。設計詳細は [`docs/DESIGN
 - `propose` — 発見 → 修正案生成 → 検証 → ガード → **レポートに diff**（適用しない、隔離クローン内で完結し対象 repo に 1 バイトも書き込まない）。クライアント施策用。
 - `off` — 発見 → 報告のみ（修正案なし）。最小構成。
 
-> **運用ステータス**: v2 全 3 フェーズ + Phase 2.5（複数施策の sweep 運用）の**実装は完了**（spec_013〜031、version 0.19.1、606 tests、subcommand 12）。Phase 2.5 の実走で発覚した「沈黙失敗」2 種（adversarial ハードコード／mutation 0 件）は spec_030/031 で構造修正済み ── v2「正直な計測」原則の補強。複数週の無人運用による実績作りはこれからの段階。「実装完了」と「運用できる」の差は埋まっていない、というのが現在地。
+> **運用ステータス**: v2 全 3 フェーズ + Phase 2.5（複数施策の sweep 運用）の**実装は完了**（spec_013〜032、version 0.20.0、622 tests、subcommand 12）。Phase 2.5 の実走で炙り出された **v2 設計思想由来の欠陥 6 件すべて構造修正済み**（spec_030/031/032）── v2「正直な計測」原則の補強。複数週の無人運用による実績作りはこれからの段階。「実装完了」と「運用できる」の差は埋まっていない、というのが現在地。
 
 ## レイアウト
 
@@ -203,7 +203,7 @@ ccd/                       # import パッケージ（配布名は cowork-cc-dis
   translate.py             # 発見 → spec_auto 翻訳（AI 不使用・テンプレ穴埋め）
   nightly.py               # 単一 repo に対し Loop β を 1 回回す
   sweep.py                 # プロファイルレジストリを巡回し各 repo に nightly
-tests/                     # pytest（606 tests）
+tests/                     # pytest（622 tests）
 docs/
   DESIGN.md                # 設計の正典
   architecture.md          # モジュール構成と流れ

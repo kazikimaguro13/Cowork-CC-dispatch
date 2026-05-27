@@ -95,7 +95,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 KNOWN_CHANNELS: tuple[str, ...] = ("mutation", "adversarial", "ai")
 
@@ -254,9 +261,102 @@ class AdversarialConfig(BaseModel):
         return v
 
 
+class MutationConfig(BaseModel):
+    """Mutation-channel execution parameters (spec_032 §2-1).
+
+    The mutmut CLI runs against a *cwd* inside the isolated clone, with
+    mutation paths and a tests directory resolved *relative to that cwd*.
+    For flat CCD-style repos a single ``mutation_paths`` setting at
+    ``[discovery]`` is enough — the legacy spec_018 form. For nested
+    repos like ``axis-knowledge-rag`` (``backend/src/...``, ``backend/
+    tests/...``), mutmut 2.x does not consistently discover paths from
+    the repo root and 0-mutants HALTs are the resulting symptom. The fix
+    is to let the profile name the subdirectory mutmut should treat as
+    its cwd:
+
+    .. code-block:: toml
+
+        [discovery.mutation]
+        cwd = "backend"
+        mutation_paths = ["src/normalizer.py"]
+        tests_dir = "tests"
+        extra_args = []
+
+    Translates to (inside the iso-clone)::
+
+        cd <clone>/backend && \\
+            mutmut run --paths-to-mutate src/normalizer.py --tests-dir tests
+
+    Fields:
+
+    - ``mutation_paths`` (list[str], non-empty) — files / directories
+      mutmut should mutate, expressed *relative to* ``cwd`` (or to the
+      clone root when ``cwd`` is None).
+    - ``cwd`` (str | None) — subdirectory of the iso-clone mutmut runs
+      in. ``None`` keeps the legacy spec_018 behavior (mutmut runs at
+      the clone root).
+    - ``tests_dir`` (str | None) — value forwarded as ``--tests-dir``.
+      ``None`` lets mutmut auto-discover. Resolved relative to ``cwd``.
+    - ``extra_args`` (list[str]) — appended verbatim to the mutmut
+      ``run`` command line. CCD does NOT whitelist the contents: a bad
+      flag will surface as a mutmut non-zero exit (or the spec_030
+      0-mutants HALT) — that is the existing防護網 (spec_032 §3
+      "既存防護網に委譲").
+
+    Existence checks for ``cwd`` / ``mutation_paths`` entries /
+    ``tests_dir`` are NOT performed inside this model — they happen in
+    :func:`_validate_mutation_config_paths` after the profile has been
+    fully parsed and the target repo path is known.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    mutation_paths: list[str] = Field(default_factory=list)
+    cwd: str | None = None
+    tests_dir: str | None = None
+    extra_args: list[str] = Field(default_factory=list)
+
+    @field_validator("mutation_paths")
+    @classmethod
+    def _paths_non_empty(cls, v: list[str]) -> list[str]:
+        if not v:
+            raise ValueError(
+                "discovery.mutation.mutation_paths must list at least one "
+                "path; drop the [discovery.mutation] table to disable the "
+                "channel-specific override"
+            )
+        if any(not p or not p.strip() for p in v):
+            raise ValueError(
+                "discovery.mutation.mutation_paths entries must be "
+                "non-empty strings"
+            )
+        return v
+
+    @field_validator("cwd", "tests_dir")
+    @classmethod
+    def _path_str_well_formed(cls, v: str | None) -> str | None:
+        if v is None:
+            return v
+        if not isinstance(v, str) or not v.strip():
+            raise ValueError(
+                "discovery.mutation cwd/tests_dir must be non-empty strings "
+                "when set"
+            )
+        return v
+
+    @field_validator("extra_args")
+    @classmethod
+    def _extra_args_strings(cls, v: list[str]) -> list[str]:
+        if any(not isinstance(x, str) for x in v):
+            raise ValueError(
+                "discovery.mutation.extra_args entries must be strings"
+            )
+        return v
+
+
 class DiscoveryConfig(BaseModel):
     """Discovery-channel settings (spec_018 §2-2; adversarial added by
-    spec_030)."""
+    spec_030; per-channel ``mutation`` block added by spec_032)."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -274,6 +374,13 @@ class DiscoveryConfig(BaseModel):
     # to the hard-coded defaults so existing spec_015 behavior is
     # bit-for-bit unchanged.
     adversarial: AdversarialConfig | None = None
+    # spec_032 — opt-in per-policy mutmut invocation parameters. ``None``
+    # keeps spec_018 legacy behavior: ``mutation_paths`` at the top of
+    # ``[discovery]`` is the sole knob, mutmut runs at the clone root,
+    # ``--tests-dir`` is omitted, no extra flags. Setting this enables
+    # the spec_032 nested-structure workaround (cwd / tests_dir /
+    # extra_args).
+    mutation: MutationConfig | None = None
 
     @field_validator("channels")
     @classmethod
@@ -292,6 +399,29 @@ class DiscoveryConfig(BaseModel):
         if any(not p or not p.strip() for p in v):
             raise ValueError("mutation_paths entries must be non-empty strings")
         return v
+
+    @model_validator(mode="before")
+    @classmethod
+    def _no_dual_mutation_config(cls, data):
+        """spec_032 — reject ambiguous TOML where BOTH top-level
+        ``mutation_paths`` AND ``[discovery.mutation]`` are set.
+
+        Either form is fine on its own (legacy spec_018 vs spec_032
+        nested), but writing both is almost certainly a typo or stale
+        migration and "first-wins" semantics would silently choose one
+        over the other. Loud is better than silent.
+        """
+
+        if isinstance(data, dict):
+            if "mutation" in data and "mutation_paths" in data:
+                raise ValueError(
+                    "discovery.mutation_paths and [discovery.mutation] "
+                    "are mutually exclusive — pick one. "
+                    "[discovery.mutation] is the spec_032 form that "
+                    "supports cwd / tests_dir / extra_args; the bare "
+                    "mutation_paths key is the legacy spec_018 form."
+                )
+        return data
 
 
 class ScheduleConfig(BaseModel):
@@ -478,6 +608,47 @@ class Profile(BaseModel):
 
 
 # --------------------------------------------------------------------------- #
+# Errors
+# --------------------------------------------------------------------------- #
+
+
+class ProfileError(ValueError):
+    """Raised when a profile fails post-load validation (spec_032 §2-1).
+
+    Subclasses :class:`ValueError` so existing callers that catch
+    ``ValueError`` continue to work — pydantic schema violations have
+    always been surfaced as ``ValueError`` from this module.
+    """
+
+
+# --------------------------------------------------------------------------- #
+# Effective mutation config (spec_032 §2-1)
+# --------------------------------------------------------------------------- #
+
+
+def effective_mutation_config(discovery: DiscoveryConfig) -> MutationConfig:
+    """Return a uniform :class:`MutationConfig` view of the profile.
+
+    Two equivalent profile shapes (spec_032 §2-1):
+
+    - **Legacy (spec_018)** — ``[discovery] mutation_paths = [...]`` at
+      the top of the discovery table; ``discovery.mutation`` is None.
+      Wrapped into a default :class:`MutationConfig` so call sites have
+      one shape to read.
+    - **spec_032** — ``[discovery.mutation]`` table with explicit
+      ``mutation_paths`` + optional ``cwd`` / ``tests_dir`` /
+      ``extra_args``.
+
+    Call sites should NOT branch on ``discovery.mutation is None`` —
+    use this helper.
+    """
+
+    if discovery.mutation is not None:
+        return discovery.mutation
+    return MutationConfig(mutation_paths=list(discovery.mutation_paths))
+
+
+# --------------------------------------------------------------------------- #
 # Loader
 # --------------------------------------------------------------------------- #
 
@@ -558,11 +729,96 @@ def load_profile_with_source(
     except ValidationError as exc:
         raise ValueError(f"{expected}: invalid profile — {exc}") from exc
 
+    # spec_032 §2-1 — post-parse path-existence validation for the new
+    # [discovery.mutation] block. Legacy ``mutation_paths`` at the top
+    # of ``[discovery]`` is NOT validated for existence (backward
+    # compat with spec_018 deployments where the profile's repo may
+    # not yet be checked out locally).
+    _validate_mutation_config_paths(
+        profile=profile,
+        ccd_repo=repo,
+        profile_path=expected,
+    )
+
     return ProfileLoadResult(
         profile=profile,
         source=expected,
         expected_path=expected,
     )
+
+
+def _resolve_target_repo(profile: Profile, ccd_repo: Path) -> Path:
+    """Resolve ``profile.repo`` to an absolute target-repo path.
+
+    Mirrors :func:`ccd.sweep._resolve_target_repo` (kept module-private
+    there to avoid an import cycle from sweep.py — see spec_029
+    architecture notes). Absolute paths pass through; relative paths
+    resolve against the CCD repo where the profile file lives.
+    """
+
+    raw = profile.repo or "."
+    p = Path(raw)
+    if p.is_absolute():
+        return p.resolve()
+    return (Path(ccd_repo) / p).resolve()
+
+
+def _validate_mutation_config_paths(
+    *,
+    profile: Profile,
+    ccd_repo: Path,
+    profile_path: Path,
+) -> None:
+    """spec_032 §2-1 — validate that paths declared in
+    ``[discovery.mutation]`` actually exist on disk.
+
+    Skipped entirely when the profile uses the legacy
+    ``discovery.mutation_paths`` form (``profile.discovery.mutation is
+    None``) — backward compat with spec_018 deployments.
+
+    All failures are collected and surfaced in a single
+    :class:`ProfileError` so the operator sees every missing piece in
+    one go (same "全部チェックする" flavour as the spec_031 post-install
+    validator).
+    """
+
+    cfg = profile.discovery.mutation
+    if cfg is None:
+        return
+
+    target_repo = _resolve_target_repo(profile, ccd_repo)
+    errors: list[str] = []
+
+    if cfg.cwd:
+        cwd_path = target_repo / cfg.cwd
+        if not cwd_path.is_dir():
+            errors.append(
+                f"discovery.mutation.cwd directory not found: {cwd_path}"
+            )
+
+    base = target_repo / cfg.cwd if cfg.cwd else target_repo
+
+    for entry in cfg.mutation_paths:
+        candidate = base / entry
+        if not candidate.exists():
+            errors.append(
+                f"discovery.mutation.mutation_paths entry not found: "
+                f"{candidate}"
+            )
+
+    if cfg.tests_dir:
+        tests_path = base / cfg.tests_dir
+        if not tests_path.is_dir():
+            errors.append(
+                f"discovery.mutation.tests_dir not found: {tests_path}"
+            )
+
+    if errors:
+        raise ProfileError(
+            f"{profile_path}: invalid profile — "
+            "discovery.mutation paths failed existence check:\n  - "
+            + "\n  - ".join(errors)
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -592,8 +848,27 @@ def render_profile(result: ProfileLoadResult) -> str:
     lines.append("")
     lines.append("[discovery]")
     lines.append("channels = " + _toml_str_list(p.discovery.channels))
-    lines.append("mutation_paths = " + _toml_str_list(p.discovery.mutation_paths))
+    # spec_032 — emit either the legacy ``mutation_paths`` key OR the
+    # new ``[discovery.mutation]`` table, never both (they are mutually
+    # exclusive at load time).
+    if p.discovery.mutation is None:
+        lines.append(
+            "mutation_paths = " + _toml_str_list(p.discovery.mutation_paths)
+        )
     lines.append("")
+    if p.discovery.mutation is not None:
+        lines.append("[discovery.mutation]")
+        lines.append(
+            "mutation_paths = " + _toml_str_list(p.discovery.mutation.mutation_paths)
+        )
+        if p.discovery.mutation.cwd is not None:
+            lines.append(f'cwd = "{p.discovery.mutation.cwd}"')
+        if p.discovery.mutation.tests_dir is not None:
+            lines.append(f'tests_dir = "{p.discovery.mutation.tests_dir}"')
+        lines.append(
+            "extra_args = " + _toml_str_list(p.discovery.mutation.extra_args)
+        )
+        lines.append("")
     if p.discovery.adversarial is not None:
         for parser in p.discovery.adversarial.parsers:
             lines.append("[[discovery.adversarial.parsers]]")
@@ -723,6 +998,13 @@ def load_profile_registry(
             raise ValueError(
                 f"{toml_path}: invalid profile — {exc}"
             ) from exc
+        # spec_032 — apply post-parse mutation-paths existence check
+        # uniformly through the registry path too (sweep loads here).
+        _validate_mutation_config_paths(
+            profile=profile,
+            ccd_repo=repo,
+            profile_path=toml_path,
+        )
         entries.append(
             PolicyEntry(name=name, profile=profile, source=toml_path)
         )
