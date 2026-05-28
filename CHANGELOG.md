@@ -2,6 +2,32 @@
 
 本プロジェクトの注目すべき変更を記録する。フォーマットは [Keep a Changelog](https://keepachangelog.com/) に準ずる。
 
+## [0.20.1] — 2026-05-28
+
+### Fixed
+
+- spec_033: Windows タスクスケジューラ経由起動が `LastTaskResult=2` で失敗する
+  7 件目の欠陥を構造修正。原因は register_nightly.ps1 の `$NightlyCmd` に
+  here-string で複数行 bash を埋めていたが、wsl.exe → bash -c の経路で
+  改行が解釈されず `& ; echo` の構文衝突を起こしていたこと（手動
+  `ccd nightly-all` では露見せず、タスクスケジューラ経路だけで露見する性質）。
+  `scripts/launchers/nightly_all_wrapper.sh` を新規追加し、launcher pattern として
+  DESIGN.md §9.6 に明文化。`register_nightly.ps1` テンプレート (_ai_workspace 配下、
+  git 管理外) は中島さんが手動で `$NightlyCmd` を `"bash $ProjectDir/scripts/launchers/nightly_all_wrapper.sh"`
+  に書き換えて再登録すること。
+
+### Added
+
+- `scripts/launchers/nightly_all_wrapper.sh` (新規) ── タスクスケジューラから
+  呼ばれる wrapper script。複数行 bash 処理を集約。launcher pattern の代表例。
+- `tests/test_launchers.py` (新規) ── wrapper script の bash 構文チェック
+  (`bash -n`) と shebang 妥当性確認。
+
+### Changed
+
+- `docs/DESIGN.md §9.6` ── launcher pattern を明文化（spec_033 サブセクション）。
+- `pyproject.toml` / `ccd/__init__.py` / `tests/test_smoke.py` ── `0.20.0` → `0.20.1`。
+
 ## [0.20.0] — 2026-05-27
 
 spec_032 — **mutmut とネスト構造の互換性（欠陥 6）の構造修正**。spec_030 で「`mutants_total = 0` の沈黙失敗」を HALT として可視化、spec_031 で iso-venv install の沈黙失敗を `IsoVenvProvisioningError` として捕まえた後も、axis-knowledge-rag に対する mutation チャンネルは sweep #3〜#5 で安定して 0 mutants HALT を返し続けた。sweep #5 で spec_031 の post-install validation を通過した（mutmut バイナリ・pytest バイナリ・対象 package が iso-venv に揃っている）にもかかわらず mutmut が 0 mutants を返す事実から、**原因は install ではなく mutmut とネスト構造（`backend/src/...`）の互換性問題**であることが確定。spec_032 は **profile から mutmut の実行パラメータ（cwd / paths_to_mutate / tests_dir / extra_args）を注入できるようにする** ことで、mutmut 2.x の以下 3 仮説のいずれにも対応可能な汎用解を提供する (minor bump = 新機能 + schema 拡張):
