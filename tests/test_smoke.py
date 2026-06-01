@@ -13,8 +13,8 @@ def test_version_string_is_semver_like() -> None:
     assert re.fullmatch(r"\d+\.\d+\.\d+", ccd.__version__)
 
 
-def test_version_is_0203() -> None:
-    assert ccd.__version__ == "0.20.3"
+def test_version_is_0204() -> None:
+    assert ccd.__version__ == "0.20.4"
 
 
 def test_parser_version_flag_exits_zero(capsys) -> None:
