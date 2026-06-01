@@ -14,11 +14,19 @@
 # 使うなら fork / 環境変数化など個別運用。
 
 set -u
-PROJECT=/home/nakashima/projects/Cowork-CC-dispatch
+# spec_034 — PROJECT を相対解決して relocation 耐性を持たせる。
+# 第 1 引数があれば明示渡し優先（register_nightly.ps1 のテンプレが ProjectDir を
+# 渡せる）、なければ wrapper の場所（scripts/launchers/）から repo root を導出。
+# これにより、repo を別パスに clone しても wrapper が動く（test_launchers.py の
+# 相対パス前提と整合する）。
+PROJECT="${1:-$(dirname "$(readlink -f "$0")")/../..}"
+PROJECT="$(readlink -f "$PROJECT")"
 LOG=$PROJECT/_ai_workspace/logs/nightly_task.log
 mkdir -p "$(dirname "$LOG")"
 echo "[$(date -Is)] nightly-all trigger fired (wrapper)" >> "$LOG"
+echo "[$(date -Is)] PROJECT: $PROJECT" >> "$LOG"
 cd "$PROJECT" || { echo "[$(date -Is)] cd failed" >> "$LOG"; exit 1; }
+echo "[$(date -Is)] using ccd: $(. .venv/bin/activate 2>/dev/null; command -v ccd 2>&1 || echo 'NOT FOUND')" >> "$LOG"
 nohup setsid bash -c ". .venv/bin/activate 2>/dev/null; ccd nightly-all --repo $PROJECT >> $LOG 2>&1" </dev/null >/dev/null 2>&1 &
 PID=$!
 disown 2>/dev/null || true
