@@ -1,0 +1,102 @@
+# register_nightly.ps1.template — spec_035
+#
+# CcdNightlyMaintenance を Windows タスクスケジューラに登録するためのテンプレ
+# （明示渡し版、spec_034 / spec_035）。`_ai_workspace/register_nightly.ps1` は
+# git 管理外（`.gitignore: _ai_workspace/`）のため、運用切替時の参照点として
+# 本テンプレを `examples/` 配下に置く。
+#
+# 使い方:
+#   1. このファイルを `_ai_workspace/register_nightly.ps1` など git 管理外の
+#      場所に cp（実体は .gitignore 対象、テンプレのみ repo 管理）
+#   2. `$ProjectDir` / `$WslDistro` / `$NightlyAt` / `$Cadence` / `$WeeklyDay` を
+#      自分の環境に合わせて編集
+#   3. PowerShell（適切な権限）で実行
+#
+# 設計詳細: `docs/DESIGN.md §9.6` (Launcher pattern, spec_033 / spec_034 / spec_035)。
+#
+# 注意:
+#  - 本テンプレは **明示渡し版**。`$NightlyCmd` で wrapper に第 1 引数として
+#    `$ProjectDir` を渡し、wrapper 側 `${1:-...}` がこれを優先採用する。引数なしで
+#    呼ぶと wrapper はログに WARNING を残す（spec_035 §2-ii、運用切替忘れの事後発覚）。
+#  - 既存の `auto_dispatch_controller.sh` 用 `register_task.ps1` (axis-knowledge-rag)
+#    とは別タスク名・別スケジュール・別コマンド。両者は共存可能。
+#  - `ccd nightly-all` は N 施策ぶん `ccd nightly` を直列で回すため数時間走り得る。
+#    タスクスケジューラ側で同期実行すると WakeToRun の意味が無くなるので
+#    `nohup setsid` でデタッチし、トリガー本体は即時返るようにする（wrapper 内）。
+#  - タスク名 `CcdNightlyMaintenance` は据え置き。
+
+# === 環境ごとに編集 ===
+
+$TaskName    = "CcdNightlyMaintenance"
+$ProjectDir  = "/home/<you>/projects/Cowork-CC-dispatch"   # ← 自分の repo root（WSL パス）
+$WslDistro   = "Ubuntu-24.04"
+$NightlyAt   = "02:00"     # profile の schedule.nightly_at と一致させる
+$Cadence     = "weekly"    # "weekly" or "nightly" — profile の schedule.cadence と一致させる
+$WeeklyDay   = "Sunday"    # cadence="weekly" の時のみ使用 — profile の schedule.weekly_day と一致させる
+                           # (フル英名 Monday〜Sunday、PowerShell の -DaysOfWeek にそのまま渡す)
+
+# === 明示渡し版の起動コマンド（spec_034 / spec_035） ===
+# wrapper に第 1 引数で ProjectDir を渡す。wrapper 側 `${1:-...}` がこれを優先採用し、
+# ハードコードに fallback しない。引数なしで呼ぶと wrapper がログに WARNING を残す。
+$NightlyCmd = "bash $ProjectDir/scripts/launchers/nightly_all_wrapper.sh `"$ProjectDir`""
+
+# === ここから下は通常変更不要 ===
+
+# 既存タスク削除 (冪等)
+schtasks /Delete /TN "$TaskName" /F 2>$null | Out-Null
+
+$action = New-ScheduledTaskAction `
+    -Execute "C:\Windows\System32\wsl.exe" `
+    -Argument "-d $WslDistro -- bash -c `"$NightlyCmd`""
+
+# Cadence で `-Weekly -DaysOfWeek` / `-Daily` を分岐 (spec_027)。
+# 不正な cadence は黙って Daily にフォールバックしない ── 必ず止める。
+switch ($Cadence) {
+    "weekly" {
+        $trigger = New-ScheduledTaskTrigger -Weekly -DaysOfWeek $WeeklyDay -At $NightlyAt
+        $TriggerDesc = "weekly on $WeeklyDay at $NightlyAt"
+    }
+    "nightly" {
+        $trigger = New-ScheduledTaskTrigger -Daily -At $NightlyAt
+        $TriggerDesc = "daily at $NightlyAt"
+    }
+    default {
+        Write-Error "Unknown cadence '$Cadence' — must be 'weekly' or 'nightly' (matches profile.schedule.cadence)."
+        return
+    }
+}
+
+# 論点7 で確定の設定:
+#  - StartWhenAvailable: 起動時に過去のトリガーが流れていれば即実行
+#  - WakeToRun: スリープからの起床を許可
+#  - MultipleInstances IgnoreNew: 直前回がまだ走っていたら新規はスキップ
+#  - AllowStartIfOnBatteries / DontStopIfGoingOnBatteries: ラップトップ運用
+#  - ExecutionTimeLimit 6h: ミューテーション + AI 推論 + brief の上限ガード
+#    (デタッチ済みなので実プロセスは別系統だが、タスク自体の hang 防止)
+$settings = New-ScheduledTaskSettingsSet `
+    -AllowStartIfOnBatteries `
+    -DontStopIfGoingOnBatteries `
+    -StartWhenAvailable `
+    -WakeToRun `
+    -ExecutionTimeLimit (New-TimeSpan -Hours 6) `
+    -MultipleInstances IgnoreNew
+
+$principal = New-ScheduledTaskPrincipal `
+    -UserId "$env:USERDOMAIN\$env:USERNAME" `
+    -LogonType Interactive `
+    -RunLevel Limited
+
+Register-ScheduledTask -TaskName "$TaskName" `
+    -Action $action `
+    -Trigger $trigger `
+    -Settings $settings `
+    -Principal $principal `
+    -Force
+
+Write-Host "Task '$TaskName' registered. Trigger: $TriggerDesc (WSL: $WslDistro)."
+Write-Host "Logs will accumulate at $ProjectDir/_ai_workspace/logs/nightly_task.log"
+Write-Host ""
+Write-Host "To trigger a one-off test run now:"
+Write-Host "  Start-ScheduledTask -TaskName `"$TaskName`""
+Write-Host "To inspect last run / next run:"
+Write-Host "  Get-ScheduledTaskInfo -TaskName `"$TaskName`" | Format-List LastRunTime, LastTaskResult, NextRunTime"

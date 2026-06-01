@@ -2,6 +2,31 @@
 
 本プロジェクトの注目すべき変更を記録する。フォーマットは [Keep a Changelog](https://keepachangelog.com/) に準ずる。
 
+## [0.20.3] — 2026-06-01
+
+### Added
+
+- `examples/register_nightly.ps1.template` ── 週次タスク登録の明示渡し版テンプレ
+  を repo 管理に。`register_nightly.ps1` は `_ai_workspace/` 配下で git 管理外の
+  ため、運用切替時の参照点として配置（spec_035 §2-i）。
+- `tests/test_launchers.py` ── 4 件追加：
+  - PROJECT ハードコード復活を検出する guardrail（silent regression 防護網）
+  - venv activate exit code がログ記録されることの確認
+  - examples テンプレの存在確認
+  - 引数なし呼び出しで WARNING がログに出ること（明示渡しでは出ないこと）
+
+### Changed
+
+- `scripts/launchers/nightly_all_wrapper.sh` ── venv activate の exit code を別行で
+  明示ログ（`using ccd:` だけでは venv/system の ccd を判別できない問題を解消、
+  spec_035 §3-b）。引数なし呼び出し時にログへ WARNING を記録（運用切替忘れの
+  事後発覚、spec_035 §2-ii）。
+- `docs/DESIGN.md §9.6` ── launcher pattern に「再現条件」サブパラグラフ追加。
+  単純な `&` は valid・`& ;` パターンのみ構文エラーという境界条件を明記（spec_035
+  §1 + §3-c）。
+- `README.md` ── `v0.20.1 / 625 tests` → `v0.20.3 / 631 tests` に同期。
+- `pyproject.toml` / `ccd/__init__.py` / `tests/test_smoke.py` ── `0.20.2` → `0.20.3`。
+
 ## [0.20.2] — 2026-05-28
 
 ### Fixed

@@ -24,9 +24,14 @@ PROJECT="$(readlink -f "$PROJECT")"
 LOG=$PROJECT/_ai_workspace/logs/nightly_task.log
 mkdir -p "$(dirname "$LOG")"
 echo "[$(date -Is)] nightly-all trigger fired (wrapper)" >> "$LOG"
+if [ "$#" -eq 0 ]; then
+  echo "[$(date -Is)] WARNING: called without explicit PROJECT argument, using relative resolution" >> "$LOG"
+fi
 echo "[$(date -Is)] PROJECT: $PROJECT" >> "$LOG"
 cd "$PROJECT" || { echo "[$(date -Is)] cd failed" >> "$LOG"; exit 1; }
 echo "[$(date -Is)] using ccd: $(. .venv/bin/activate 2>/dev/null; command -v ccd 2>&1 || echo 'NOT FOUND')" >> "$LOG"
+( . .venv/bin/activate 2>/dev/null )
+echo "[$(date -Is)] venv activate exit: $?" >> "$LOG"
 nohup setsid bash -c ". .venv/bin/activate 2>/dev/null; ccd nightly-all --repo $PROJECT >> $LOG 2>&1" </dev/null >/dev/null 2>&1 &
 PID=$!
 disown 2>/dev/null || true

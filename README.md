@@ -56,9 +56,9 @@ pip install -e ".[dev]"
 動作確認:
 
 ```bash
-ccd --version          # ccd 0.20.1
+ccd --version          # ccd 0.20.3
 ruff check .
-pytest -q              # 625 passed
+pytest -q              # 631 passed
 ```
 
 ## 使い方
@@ -172,7 +172,7 @@ v2 で追加された 7 つのサブコマンド。設計詳細は [`docs/DESIGN
 - `propose` — 発見 → 修正案生成 → 検証 → ガード → **レポートに diff**（適用しない、隔離クローン内で完結し対象 repo に 1 バイトも書き込まない）。クライアント施策用。
 - `off` — 発見 → 報告のみ（修正案なし）。最小構成。
 
-> **運用ステータス**: v2 全 3 フェーズ + Phase 2.5（複数施策の sweep 運用 + 沈黙失敗の構造修正）の**実装は完了**（spec_013〜033、version 0.20.1、625 tests、subcommand 12）。Phase 2.5 の実走で炙り出された **v2 設計思想由来の欠陥 6 件すべて構造修正済み**（spec_030/031/032）。タスクスケジューラ経由起動の launcher pattern 構造修正も完了（spec_033、v0.20.1）── 週次タスク登録の信頼性向上。複数週の無人運用による実績作りはこれからの段階。「実装完了」と「運用できる」の差は埋まっていない、というのが現在地。
+> **運用ステータス**: v2 全 3 フェーズ + Phase 2.5（複数施策の sweep 運用 + 沈黙失敗の構造修正）の**実装は完了**（spec_013〜035、version 0.20.3、631 tests、subcommand 12）。Phase 2.5 の実走で炙り出された **v2 設計思想由来の欠陥 6 件すべて構造修正済み**（spec_030/031/032）。タスクスケジューラ経由起動の launcher pattern 構造修正も完了（spec_033、v0.20.1）── 週次タスク登録の信頼性向上。さらに subagent fresh review SOP の運用で抽出された launcher pattern の運用品質（relocation 耐性・診断ログ・機序訂正、spec_034 v0.20.2）と修正の品質メタ評価（防護網テスト・honest 診断ログ・運用テンプレ可視化、spec_035 v0.20.3）まで反映。複数週の無人運用による実績作りはこれからの段階。「実装完了」と「運用できる」の差は埋まっていない、というのが現在地。
 
 ## レイアウト
 
@@ -203,7 +203,7 @@ ccd/                       # import パッケージ（配布名は cowork-cc-dis
   translate.py             # 発見 → spec_auto 翻訳（AI 不使用・テンプレ穴埋め）
   nightly.py               # 単一 repo に対し Loop β を 1 回回す
   sweep.py                 # プロファイルレジストリを巡回し各 repo に nightly
-tests/                     # pytest（622 tests）
+tests/                     # pytest（631 tests）
 docs/
   DESIGN.md                # 設計の正典
   architecture.md          # モジュール構成と流れ
