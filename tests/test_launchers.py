@@ -36,3 +36,54 @@ def test_nightly_all_wrapper_is_executable() -> None:
     import stat
     mode = wrapper.stat().st_mode
     assert mode & stat.S_IXUSR, "wrapper script is not user-executable"
+
+
+def test_nightly_all_wrapper_resolves_project_relatively(tmp_path) -> None:
+    """spec_034 — wrapper の場所から PROJECT を相対解決できる。
+
+    tmp_path に repo root と scripts/launchers/wrapper を再現し、wrapper を
+    bash で実行 → PROJECT の値（ログ書き込み）が repo root に解決されること
+    を確認。
+    """
+    import shutil
+    tmp_repo = tmp_path / "Cowork-CC-dispatch"
+    (tmp_repo / "scripts" / "launchers").mkdir(parents=True)
+    (tmp_repo / "_ai_workspace" / "logs").mkdir(parents=True)
+    real_wrapper = Path(__file__).parent.parent / "scripts" / "launchers" / "nightly_all_wrapper.sh"
+    target = tmp_repo / "scripts" / "launchers" / "nightly_all_wrapper.sh"
+    shutil.copy(real_wrapper, target)
+    target.chmod(0o755)
+    # wrapper の cd と ccd nightly-all は失敗してよい (.venv も ccd も無い)
+    # ログだけ確認する
+    log = tmp_repo / "_ai_workspace" / "logs" / "nightly_task.log"
+    subprocess.run(["bash", str(target)], capture_output=True, text=True, check=False)
+    assert log.exists(), "log not created"
+    content = log.read_text(encoding="utf-8")
+    assert f"PROJECT: {tmp_repo}" in content or f"PROJECT: {tmp_repo.resolve()}" in content, (
+        f"PROJECT not resolved to tmp repo root. log content:\n{content}"
+    )
+
+
+def test_nightly_all_wrapper_accepts_explicit_project_argument(tmp_path) -> None:
+    """spec_034 — 第 1 引数で PROJECT を明示渡しできる。
+
+    register_nightly.ps1 のテンプレが `bash $WrapperScript "$ProjectDir"` で
+    呼ぶ運用パターンを想定。
+    """
+    import shutil
+    explicit_project = tmp_path / "ExplicitProject"
+    (explicit_project / "_ai_workspace" / "logs").mkdir(parents=True)
+    real_wrapper = Path(__file__).parent.parent / "scripts" / "launchers" / "nightly_all_wrapper.sh"
+    target = tmp_path / "wrapper.sh"
+    shutil.copy(real_wrapper, target)
+    target.chmod(0o755)
+    subprocess.run(
+        ["bash", str(target), str(explicit_project)],
+        capture_output=True, text=True, check=False,
+    )
+    log = explicit_project / "_ai_workspace" / "logs" / "nightly_task.log"
+    assert log.exists(), "log not created in explicit project"
+    content = log.read_text(encoding="utf-8")
+    assert str(explicit_project) in content, (
+        f"explicit PROJECT not used. log content:\n{content}"
+    )

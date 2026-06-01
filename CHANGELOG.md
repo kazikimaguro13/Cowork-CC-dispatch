@@ -2,6 +2,34 @@
 
 本プロジェクトの注目すべき変更を記録する。フォーマットは [Keep a Changelog](https://keepachangelog.com/) に準ずる。
 
+## [0.20.2] — 2026-05-28
+
+### Fixed
+
+- spec_034: spec_033 ship 直後の subagent fresh review (SOP 運用 2 件目) で抽出した
+  3 件の盲点を構造修正。
+  - **A**: wrapper の `PROJECT` ハードコードを相対解決に。repo を別パスに
+    clone しても動くよう relocation 耐性を持たせた。第 1 引数で明示渡しも可能。
+  - **B**: wrapper 起動時に `command -v ccd` の出力をログに記録。venv activate
+    失敗時に system Python の古い ccd が呼ばれても診断可能になった。
+  - **D (erratum)**: spec_033 で DESIGN.md §9.6 と CHANGELOG `[0.20.1]` に
+    書いた「`LastTaskResult=2` = `ERROR_FILE_NOT_FOUND` マッピング」は **誤認**。
+    実際は bash 構文エラーが exit 2 で wsl.exe 経由で Windows に透過した結果で、
+    exit code 2 が `ERROR_FILE_NOT_FOUND` (=2) と同じ数値だっただけ。本 spec で
+    DESIGN.md §9.6 の機序記述を訂正。
+
+### Added
+
+- `tests/test_launchers.py` ── PROJECT 相対解決のテスト 2 件（tempdir に
+  wrapper をコピー → repo root が導出される / 第 1 引数による明示渡し優先）。
+
+### Changed
+
+- `scripts/launchers/nightly_all_wrapper.sh` ── PROJECT 相対解決、command -v ccd
+  ログ追加、PROJECT 値のログ記録。
+- `docs/DESIGN.md §9.6` ── launcher pattern の機序記述を訂正。
+- `pyproject.toml` / `ccd/__init__.py` / `tests/test_smoke.py` ── `0.20.1` → `0.20.2`。
+
 ## [0.20.1] — 2026-05-28
 
 ### Fixed
