@@ -2,6 +2,36 @@
 
 本プロジェクトの注目すべき変更を記録する。フォーマットは [Keep a Changelog](https://keepachangelog.com/) に準ずる。
 
+## [0.20.4] — 2026-06-01
+
+### Fixed
+
+- spec_036: spec_035 ship 直後の subagent fresh review (SOP 運用 4 サイクル目) で
+  抽出した盲点を構造修正。
+  - **A**: wrapper の `using ccd:` 行と `venv activate exit:` 行が別々のサブシェルで
+    **別々に activate** しており、報告する ccd と測定する exit が別プロセスだった
+    （honest 診断の自己矛盾）。1 回の activate に統合し、同一行で記録するよう修正。
+  - **B**: PROJECT ハードコード検出の guardrail テストが `/home/` の文字列依存で
+    `/Users/`・`$HOME`・変数経由を見逃していた。whitelist 方式（既知の 2 代入形のみ
+    許可）に汎用化。
+  - **C-test**: WARNING テストの明示渡しケースに「渡した PROJECT が採用される」
+    assert を合流。
+  - **D**: wrapper に `set -u` 相性のコメントを明示。
+
+### Added
+
+- `tests/test_launchers.py` ── 二重 activate 解消の回帰テスト 1 件
+  （`using ccd:` と `venv activate exit:` が同一行であること）。
+
+### Changed
+
+- `scripts/launchers/nightly_all_wrapper.sh` ── 診断ログの二重 activate を 1 回に統合、
+  set -u 相性コメント追加。
+- `tests/test_launchers.py` ── guardrail を whitelist 方式に、WARNING テストに PROJECT
+  採用 assert 合流。
+- `README.md` / `docs/DESIGN.md §9` ── テスト数 `631` → `632` に同期。
+- `pyproject.toml` / `ccd/__init__.py` / `tests/test_smoke.py` ── `0.20.3` → `0.20.4`。
+
 ## [0.20.3] — 2026-06-01
 
 ### Added

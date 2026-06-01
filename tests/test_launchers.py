@@ -90,24 +90,34 @@ def test_nightly_all_wrapper_accepts_explicit_project_argument(tmp_path) -> None
 
 
 def test_nightly_all_wrapper_has_no_hardcoded_project_path() -> None:
-    """spec_035 — wrapper に PROJECT のハードコード絶対パスが復活していないこと。
+    """spec_036 — wrapper の PROJECT 代入が relocation 耐性のある既知の 2 形のみであること。
 
-    spec_034 で PROJECT を相対解決にしたが、positive test だけでは「うっかり
-    ハードコードに戻す」regression を検出できない。本テストは wrapper 本文に
-    `PROJECT=/home/...` のような絶対パス直接代入が無いことを assert する
-    guardrail（silent regression 防護網）。相対解決 idiom が残っていることも確認。
+    spec_035 は `PROJECT=/home/` の文字列不在を assert するだけで、`/Users/`・
+    `/opt/`・`$HOME`・変数経由のハードコード復活を見逃していた（subagent 指摘 B）。
+    本テストは whitelist 方式：PROJECT への代入行が
+      (1) `PROJECT="${1:-...}"` （第 1 引数優先 + 相対解決フォールバック）
+      (2) `PROJECT="$(readlink ...)"` （正規化）
+    のいずれか以外なら fail させる。これで絶対パス・$HOME・任意変数のハードコードを
+    形を問わず弾く（silent regression 防護網）。
     """
     real_wrapper = (
         Path(__file__).parent.parent / "scripts" / "launchers" / "nightly_all_wrapper.sh"
     )
     content = real_wrapper.read_text(encoding="utf-8")
-    assert "PROJECT=/home/" not in content, (
-        "PROJECT がハードコード絶対パスに戻っている（relocation 耐性が壊れる）"
+    assigns = [
+        line.strip()
+        for line in content.splitlines()
+        if line.strip().startswith("PROJECT=") and not line.strip().startswith("#")
+    ]
+    assert assigns, "PROJECT 代入が 1 つも無い（wrapper 構造が壊れている）"
+    allowed = ('PROJECT="${1:-', 'PROJECT="$(readlink')
+    for a in assigns:
+        assert a.startswith(allowed), (
+            f"想定外の PROJECT 代入（relocation 耐性を壊しうる）: {a!r}"
+        )
+    assert any(a.startswith('PROJECT="${1:-') for a in assigns), (
+        "PROJECT の相対解決 idiom (${1:-...}) が失われている"
     )
-    assert 'PROJECT="/home/' not in content, (
-        "PROJECT がハードコード絶対パス（quote 付き）に戻っている"
-    )
-    assert 'PROJECT="${1:-' in content, "PROJECT の相対解決 idiom が失われている"
 
 
 def test_register_nightly_template_exists() -> None:
@@ -159,6 +169,10 @@ def test_nightly_all_wrapper_warns_without_explicit_argument(tmp_path) -> None:
     assert "WARNING: called without explicit PROJECT argument" not in content2, (
         f"明示渡しなのに WARNING が出ている. log:\n{content2}"
     )
+    # 明示渡し → WARNING が出ない（既存）+ 渡した PROJECT が採用されている（spec_036 合流）
+    assert str(tmp_repo) in content2, (
+        f"明示渡しの PROJECT がログに採用されていない. log:\n{content2}"
+    )
 
 
 def test_nightly_all_wrapper_logs_venv_activate_exit(tmp_path) -> None:
@@ -184,4 +198,32 @@ def test_nightly_all_wrapper_logs_venv_activate_exit(tmp_path) -> None:
     content = log.read_text(encoding="utf-8")
     assert "venv activate exit:" in content, (
         f"venv activate exit code がログに記録されていない. log:\n{content}"
+    )
+
+
+def test_nightly_all_wrapper_unifies_ccd_and_activate_exit(tmp_path) -> None:
+    """spec_036 — using ccd と venv activate exit が同一行（=同一 activate）で記録される。
+
+    spec_035 は両者を別々のサブシェルで別々に activate していた（subagent 指摘 A）。
+    spec_036 で 1 回の activate に統合したことの回帰防止：`venv activate exit:` を
+    含む行は必ず `using ccd:` も含む（別行なら二重 activate の疑い）。
+    """
+    import shutil
+
+    tmp_repo = tmp_path / "Cowork-CC-dispatch"
+    (tmp_repo / "scripts" / "launchers").mkdir(parents=True)
+    (tmp_repo / "_ai_workspace" / "logs").mkdir(parents=True)
+    real_wrapper = (
+        Path(__file__).parent.parent / "scripts" / "launchers" / "nightly_all_wrapper.sh"
+    )
+    target = tmp_repo / "scripts" / "launchers" / "nightly_all_wrapper.sh"
+    shutil.copy(real_wrapper, target)
+    target.chmod(0o755)
+    subprocess.run(["bash", str(target)], capture_output=True, text=True, check=False)
+    log = tmp_repo / "_ai_workspace" / "logs" / "nightly_task.log"
+    content = log.read_text(encoding="utf-8")
+    exit_lines = [ln for ln in content.splitlines() if "venv activate exit:" in ln]
+    assert exit_lines, f"venv activate exit 行が無い. log:\n{content}"
+    assert all("using ccd:" in ln for ln in exit_lines), (
+        f"using ccd と venv activate exit が別行（二重 activate の疑い）. log:\n{content}"
     )
