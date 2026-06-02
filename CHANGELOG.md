@@ -2,6 +2,31 @@
 
 本プロジェクトの注目すべき変更を記録する。フォーマットは [Keep a Changelog](https://keepachangelog.com/) に準ずる。
 
+## [0.20.5] — 2026-06-02
+
+### Removed
+
+- `scripts/launchers/nightly_all_wrapper.sh` ── detached 起動後の
+  `disown 2>/dev/null || true` を削除。subagent fresh review (SOP 2〜4 サイクル目) で
+  繰り返し「必要性に疑問」と指摘されていた既知残 (C)。**WSL Ubuntu-24.04 で実測**した
+  結果、`nohup`（SIGHUP 無視）+ `setsid`（新セッション）で既に detach 済みであり、
+  `huponexit=off` の非対話 bash では素の `&` でもプロセスが親 exit 後に生存することを
+  確認（disown 無しでも生存）。disown は対話シェル + `huponexit on` という本番
+  （タスクスケジューラ → wsl.exe → 非対話 bash）経路では発生しない edge case 用の
+  冗長防御だったため削除（verify→simplify）。挙動は不変（本番経路で disown は一度も
+  効いていなかった）。
+
+### Added
+
+- `tests/test_launchers.py` ── disown 復活防止の回帰テスト 1 件
+  （コメント言及は許容しつつ disown コマンドの不在と nohup setsid の維持を assert）。
+
+### Changed
+
+- `README.md` / `docs/DESIGN.md §9` ── テスト数 `632` → `633`、version 表記、
+  spec 範囲を `spec_013〜037` に同期。
+- `pyproject.toml` / `ccd/__init__.py` / `tests/test_smoke.py` ── `0.20.4` → `0.20.5`。
+
 ## [0.20.4] — 2026-06-01
 
 ### Fixed
