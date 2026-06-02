@@ -227,3 +227,23 @@ def test_nightly_all_wrapper_unifies_ccd_and_activate_exit(tmp_path) -> None:
     assert all("using ccd:" in ln for ln in exit_lines), (
         f"using ccd と venv activate exit が別行（二重 activate の疑い）. log:\n{content}"
     )
+
+
+def test_nightly_all_wrapper_detaches_without_disown() -> None:
+    """spec_037 — wrapper が nohup+setsid で detach し、冗長な disown を持たないこと。
+
+    実測（bash 5.2.21 / huponexit off / 非対話 job control off）で disown は
+    プロセス生存に不要（冗長防御）と確認したため削除した。回帰防止：disown コマンドが
+    復活していない（コメント言及は許容）& nohup setsid の detach idiom は維持。
+    """
+    real_wrapper = (
+        Path(__file__).parent.parent / "scripts" / "launchers" / "nightly_all_wrapper.sh"
+    )
+    content = real_wrapper.read_text(encoding="utf-8")
+    code_lines = [
+        line for line in content.splitlines() if not line.lstrip().startswith("#")
+    ]
+    assert not any("disown" in line for line in code_lines), (
+        "冗長な disown コマンドが wrapper に復活している（spec_037 で削除済み）"
+    )
+    assert "nohup setsid" in content, "nohup setsid の detach idiom が失われている"
