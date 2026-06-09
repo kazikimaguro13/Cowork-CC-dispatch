@@ -37,11 +37,16 @@ cd "$PROJECT" || { echo "[$(date -Is)] cd failed" >> "$LOG"; exit 1; }
 # 別プロセスだった（honest 診断の自己矛盾）。1 回の activate に統合して解消する。
 CCD_INFO=$(. .venv/bin/activate 2>/dev/null; ac=$?; printf '%s|%s' "$ac" "$(command -v ccd 2>/dev/null || echo 'NOT FOUND')")
 echo "[$(date -Is)] using ccd: ${CCD_INFO#*|} (venv activate exit: ${CCD_INFO%%|*})" >> "$LOG"
-# spec_037 — detach は nohup（SIGHUP 無視）+ setsid（新セッション・制御端末なし）で完結する。
-# 実測（bash 5.2.21 / huponexit off / 非対話 bash は job control off）では、この job-table
-# 操作（旧 `disown 2>/dev/null || true`）が無くても setsid プロセスは親 exit 後も生存した
-# （素の & でも生存）。本番（タスクスケジューラ → wsl.exe → 非対話 bash）経路では一度も
-# 効いていない冗長防御だったため削除。詳細は CHANGELOG [0.20.5] と result_037 を参照。
-nohup setsid bash -c ". .venv/bin/activate 2>/dev/null; ccd nightly-all --repo $PROJECT >> $LOG 2>&1" </dev/null >/dev/null 2>&1 &
-PID=$!
-echo "[$(date -Is)] nightly-all detached (PID $PID)" >> "$LOG"
+# spec_037 — 旧実装は detach（nohup setsid）でトリガー本体を即時返していた。
+# 2026-06-07 hotfix — タスクスケジューラ → wsl.exe → 非対話 bash 経路では、
+# トリガー即時返却で wsl.exe が終了すると WSL VM がスピンダウンし、setsid 子プロセス
+# ごと刈られて nightly-all が完走しないことを実機で確認（5/28 以降 index 未生成、
+# 6/2 は detached PID 631 まで出るも完了行・index なし）。spec_037 の「setsid は親
+# exit 後も生存」は対話 WSL 前提で、本番経路では成立しなかった。
+# → タスク内で同期実行し、タスク完了まで wsl を保持する。ExecutionTimeLimit=PT6H が上限ガード。
+echo "[$(date -Is)] nightly-all starting (synchronous hotfix 2026-06-07)" >> "$LOG"
+. .venv/bin/activate 2>/dev/null
+ccd nightly-all --repo "$PROJECT" >> "$LOG" 2>&1
+rc=$?
+echo "[$(date -Is)] nightly-all finished (rc=$rc)" >> "$LOG"
+exit $rc
