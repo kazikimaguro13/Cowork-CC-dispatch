@@ -2,6 +2,60 @@
 
 本プロジェクトの注目すべき変更を記録する。フォーマットは [Keep a Changelog](https://keepachangelog.com/) に準ずる。
 
+## [0.21.0] — 2026-06-10
+
+### Added
+
+- spec_038: `safety.max_candidates_per_night` (default `1`、許容範囲 `1..5`)。
+  夜間ループの「1晩1候補」制約 (spec_023〜026) を **直列のまま** 解除し、
+  `auto` / `propose` 両モードが 1 晩で最大 K 件の候補を順次処理可能に。
+  並列化は spec_041 の領分で本 spec は入れない。
+- `ccd/nightly.py` ── 新ヘルパ `_select_candidates(..., limit=int)` を追加。
+  既存の `_select_template_a_candidate` / `_select_template_b_candidate` は
+  全件を返す `_select_template_a_candidates` / `_select_template_b_candidates`
+  に拡張、`_select_candidate` 単数版は削除（spec_038 §2-2「選択ロジックの重複を
+  残さない」）。`_run_auto_fix_loop` / `_run_propose_loop` の per-candidate
+  本体は `_process_one_auto_fix_candidate` /
+  `_process_one_propose_candidate` に切り出して直列ループから再利用。
+- `NightlyResult.auto_fix_extras: tuple[AutoFixOutcome, ...]` 追加。K=1 では
+  常に空タプルで v2 外形を維持、K>1 で 2 件目以降の per-candidate 結果を保持。
+- 朝レポート §B 複数候補対応 ── 新レンダラ
+  `_render_section_b_multi` が `### 候補 i/N` 小節を候補ごとに掲載。
+  K=1 の夜は現行 §B（Phase 1 / Phase 2 / propose）を見た目不変で出力
+  （spec_038 §2-4「0件/1件は現行と同じ見た目」）。
+- 候補間 PAUSE / 未push バックログ cap 再評価 ── K>1 で候補処理の合間に
+  `_ai_workspace/PAUSE` の出現と backlog cap 復活を `_run_auto_fix_loop` /
+  `_run_propose_loop` の**両方**で再判定し（spec_038 §2-3 逐語「未push バックログ
+  cap と PAUSE を再評価」を mode 制限なしで適用）、超過/存在なら残候補を
+  スキップして合成 skip 結果（`remaining candidate(s) skipped: ...`）を 1 件追加。
+  propose は merge しないため backlog は通常 0 のまま no-op だが、auto と
+  ブレーキ semantics を揃え operator が両モードで同じ brake を期待できる
+  ようにする。1 候補の HALT は残候補の処理を止めない（halt は候補単位）。
+- 新規 pytest 12 件（profile 5 + nightly 7）── デフォルト K=1 の外形不変、
+  K=3 × 4 候補で top-3 のみ処理、候補2件目前のバックログ cap 超過 →
+  remainder スキップ（auto / propose の両方）、候補1件目 HALT で候補2件目が
+  走ること、K=1 の brief に複数候補マーカーが出ないこと、K=3 の brief に
+  `### 候補 i/N` が並ぶこと。
+
+### Changed
+
+- `ccd/profile.py` `SafetyConfig` ── `max_candidates_per_night: int = 1`
+  フィールド追加（pydantic validator `_k_in_range` で 1..5 に loud-fail 制限）。
+  `render_profile` も新フィールドを TOML-shaped 出力に反映。
+- `ccd/nightly.py` ── `_run_auto_fix_loop` / `_run_propose_loop` の戻り型を
+  `AutoFixOutcome` → `tuple[AutoFixOutcome, tuple[AutoFixOutcome, ...]]` に
+  変更（primary + extras）。`run_nightly` がこのタプルを `NightlyResult.auto_fix`
+  と `auto_fix_extras` に分配。
+- `ccd/brief.py` `run_brief` ── `auto_fix_extras: Sequence[AutoFixOutcome] = ()`
+  キーワードを追加。`_render_section_a` / `_render_section_d` /
+  `_render_section_f` に extras を渡し、複数候補時は §A の見出しを「N 件直列
+  処理 (merge X / proposal Y / HALT Z / skip W)」に、§D の per-candidate HALT
+  は §B に既出のため抑制（duplication 回避）。
+- `README.md` / `docs/DESIGN.md §9` ── テスト数 `633` → `645`、version 表記、
+  spec 範囲を `spec_013〜038` に同期。
+- `pyproject.toml` / `ccd/__init__.py` / `tests/test_smoke.py` ── `0.20.5` → `0.21.0`
+  (minor bump — 新フィールド / 新 NightlyResult フィールド / 新 brief キーワード)。
+
 ## [0.20.5] — 2026-06-02
 
 ### Removed
