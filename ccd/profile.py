@@ -548,12 +548,25 @@ class SafetyConfig(BaseModel):
     ``"auto"`` and ``"propose"`` modes — the templates govern *which
     findings* are processable, the mode governs *what to do* with the
     verified outcome.
+
+    ``max_candidates_per_night`` (spec_038) lifts the spec_023〜026
+    "1晩1候補" cap so the loop can serially process up to K candidates
+    per night. Default ``1`` keeps the v2 外形 (dispatch count, brief
+    layout, recorded outcome shape) bit-for-bit identical. Allowed range
+    is ``1..5`` — values outside the range surface as a clear load
+    error rather than silently being clamped. Parallelism is NOT
+    introduced by this field (spec_041 territory); K candidates are
+    processed strictly in series, applying every per-candidate gate
+    (spec_auto seq, 40-min dispatch timeout, guard, halt collection)
+    and re-evaluating the PAUSE / un-pushed-backlog cap between
+    candidates.
     """
 
     model_config = ConfigDict(extra="forbid")
 
     fix_mode: str = "off"
     fix_templates: list[str] = Field(default_factory=lambda: ["A"])
+    max_candidates_per_night: int = 1
 
     @field_validator("fix_mode")
     @classmethod
@@ -561,6 +574,23 @@ class SafetyConfig(BaseModel):
         if v not in KNOWN_FIX_MODES:
             raise ValueError(
                 f"unknown fix_mode {v!r}; allowed: {list(KNOWN_FIX_MODES)!r}"
+            )
+        return v
+
+    @field_validator("max_candidates_per_night")
+    @classmethod
+    def _k_in_range(cls, v: int) -> int:
+        # spec_038 — bound K to 1..5. Below 1 makes no sense (the loop
+        # would never act); above 5 is well beyond the night's wall-clock
+        # (5 × 40 min dispatch cap = 200 min just for dispatch). Out of
+        # range loud-fails at load time, matching the SafetyConfig流儀.
+        if not isinstance(v, int) or isinstance(v, bool):
+            raise ValueError(
+                f"max_candidates_per_night must be an int; got {type(v).__name__}"
+            )
+        if v < 1 or v > 5:
+            raise ValueError(
+                f"max_candidates_per_night must be in 1..5; got {v}"
             )
         return v
 
@@ -883,6 +913,9 @@ def render_profile(result: ProfileLoadResult) -> str:
     lines.append("[safety]")
     lines.append(f'fix_mode = "{p.safety.fix_mode}"')
     lines.append("fix_templates = " + _toml_str_list(p.safety.fix_templates))
+    lines.append(
+        f"max_candidates_per_night = {p.safety.max_candidates_per_night}"
+    )
     return "\n".join(lines)
 
 

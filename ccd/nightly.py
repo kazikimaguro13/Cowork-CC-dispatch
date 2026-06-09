@@ -419,6 +419,13 @@ class NightlyResult:
     brief_report_windows: Path | None = None
     halt_reason: str = ""
     auto_fix: AutoFixOutcome | None = None
+    # spec_038 §2-3 — additional per-candidate outcomes when the profile
+    # raises ``safety.max_candidates_per_night`` above 1. Empty tuple at
+    # the default K=1 (and when the loop is off / paused), keeping the
+    # v2 NightlyResult外形 bit-for-bit identical for default profiles.
+    # ``auto_fix`` carries the first candidate's outcome (or the single
+    # skip outcome); ``auto_fix_extras`` carries the rest.
+    auto_fix_extras: tuple[AutoFixOutcome, ...] = field(default_factory=tuple)
     # spec_025 §2-1(c) — manual kill switch via ``_ai_workspace/PAUSE``.
     # When True, ``run_nightly`` returned without invoking any channel,
     # the auto-fix loop, or the brief.
@@ -574,9 +581,13 @@ def run_nightly(
         )
 
     auto_fix: AutoFixOutcome | None = None
+    auto_fix_extras: tuple[AutoFixOutcome, ...] = ()
     fix_mode = effective_profile.safety.fix_mode
+    # spec_038 — per-night candidate cap (K). Default K=1 keeps the
+    # spec_023〜026 single-candidate behavior bit-for-bit.
+    max_k = int(effective_profile.safety.max_candidates_per_night)
     if fix_mode == "auto":
-        auto_fix = _run_auto_fix_loop(
+        auto_fix, auto_fix_extras = _run_auto_fix_loop(
             repo=repo,
             channels=channel_outcomes,
             fix_templates=tuple(effective_profile.safety.fix_templates),
@@ -600,9 +611,10 @@ def run_nightly(
                 if dispatch_timeout_s is not None
                 else _AUTO_FIX_DISPATCH_TIMEOUT_S
             ),
+            max_candidates=max_k,
         )
     elif fix_mode == "propose":
-        auto_fix = _run_propose_loop(
+        auto_fix, auto_fix_extras = _run_propose_loop(
             repo=repo,
             channels=channel_outcomes,
             fix_templates=tuple(effective_profile.safety.fix_templates),
@@ -615,6 +627,12 @@ def run_nightly(
             adversarial_rechecker=adversarial_rechecker,
             guard_inspector=guard_inspector,
             git_ops=git_ops,
+            unpushed_counter=unpushed_counter,
+            unpushed_backlog_limit=(
+                unpushed_backlog_limit
+                if unpushed_backlog_limit is not None
+                else _AUTO_FIX_UNPUSHED_BACKLOG_LIMIT
+            ),
             isolated_workspace=isolated_workspace,
             dispatch_timeout_s=(
                 dispatch_timeout_s
@@ -622,12 +640,14 @@ def run_nightly(
                 else _AUTO_FIX_DISPATCH_TIMEOUT_S
             ),
             proposal_dir=proposal_dir,
+            max_candidates=max_k,
         )
 
     brief_result = run_brief_fn(
         repo=repo,
         today=today,
         auto_fix=auto_fix,
+        auto_fix_extras=auto_fix_extras,
         brief_dir=brief_dir,
         discover_dir=discover_dir,
         channel_outcomes=tuple(channel_outcomes),
@@ -649,6 +669,7 @@ def run_nightly(
         brief_report_windows=windows_path,
         halt_reason=brief_result.halt_reason if not brief_result.success else "",
         auto_fix=auto_fix,
+        auto_fix_extras=auto_fix_extras,
     )
 
 
@@ -809,6 +830,13 @@ _HALT_UNPUSHED_BACKLOG_PREFIX = (
     "un-pushed autonomous-fix commits at or above limit"
 )
 
+# spec_038 §2-3 — when the multi-candidate loop bails mid-night because
+# PAUSE appeared or the backlog cap was re-tripped, the remaining
+# candidates are summarised as one synthetic skip outcome whose
+# ``skip_reason`` starts with this prefix. The morning brief and tests
+# pin this substring.
+_HALT_REMAINING_SKIPPED_PREFIX = "remaining candidate(s) skipped"
+
 # spec_025 §2-1 — cost / halt thresholds.
 #
 # These live as module constants (not profile fields) on purpose:
@@ -863,27 +891,28 @@ def _run_auto_fix_loop(
     unpushed_counter: UnpushedCounter | None,
     unpushed_backlog_limit: int,
     dispatch_timeout_s: float,
-) -> AutoFixOutcome:
-    """Drive one autonomous-fix attempt (spec_023 §2-1〜§2-4 + spec_024
-    + spec_025 cost/halt boundaries).
+    max_candidates: int = 1,
+) -> tuple[AutoFixOutcome, tuple[AutoFixOutcome, ...]]:
+    """Drive the autonomous-fix loop for up to ``max_candidates``
+    candidates in series (spec_023 §2-1〜§2-4 + spec_024 + spec_025
+    cost/halt boundaries + spec_038 top-K extension).
 
-    Returns an :class:`AutoFixOutcome` describing exactly what happened:
-    skipped (no candidate / translate downgrade / un-pushed backlog cap
-    reached), dispatched + halted at R4/R5/guard/timeout, or
-    dispatched + merged.
+    Returns ``(primary_outcome, extras)`` — at ``max_candidates=1`` the
+    extras tuple is always empty, keeping the v2外形 (NightlyResult /
+    AutoFixOutcome shape, dispatch count, restore behaviour)
+    bit-for-bit identical for default profiles (spec_038 §3-1).
 
-    One candidate per night (论点3): the first finding that fits one of
-    the enabled templates, in priority order (A before B — test-only is
-    structurally safer than production-fix). Remaining findings stay in
-    discover JSON and surface in the morning brief.
+    Per-candidate processing (each in turn): translate → branch →
+    dispatch (40-min wall-clock cap) → R5 → R4 → guard → merge-or-halt
+    → restore. A single candidate's halt does NOT stop the loop — the
+    remaining candidates still get their own attempt (spec_038 §2-3).
 
-    spec_025 §2-1(b) — before selecting a candidate, count the
-    auto-merge commits on local ``main`` not yet pushed to
-    ``origin/main``. If that count is at or above
-    ``unpushed_backlog_limit``, the loop pauses — discovery still ran,
-    the brief still renders, but no new fix is dispatched. The reason
-    string ``_HALT_UNPUSHED_BACKLOG_PREFIX`` lets the brief render
-    "未push の自律修正が N 件。レビューして push してから続けます".
+    Between candidates (i ≥ 1) the loop re-evaluates two operator
+    brakes: the PAUSE file (`_ai_workspace/PAUSE`) and the un-pushed
+    backlog cap. Either tripping causes the remaining candidates to be
+    skipped with a synthetic rollup outcome surfacing the reason
+    (spec_038 §2-3). Per-night the un-pushed counter is consulted
+    BEFORE any candidate is selected (spec_025 §2-1(b)).
     """
 
     # spec_025 §2-1(b) — un-pushed backlog cap.
@@ -892,33 +921,160 @@ def _run_auto_fix_loop(
         if unpushed_counter is not None
         else _default_unpushed_counter
     )
-    try:
-        unpushed = int(count_unpushed(repo))
-    except Exception:
-        # Counter failing (git missing / weird repo state) is treated as
-        # "we can't tell" — fall through to the loop. The morning brief
-        # already surfaces git errors elsewhere.
-        unpushed = 0
-    if unpushed >= unpushed_backlog_limit:
-        return AutoFixOutcome(
-            skipped=True,
-            skip_reason=(
+
+    def _backlog_skip_reason() -> str:
+        """Return non-empty skip reason iff the cap is currently tripped."""
+        try:
+            unpushed_now = int(count_unpushed(repo))
+        except Exception:
+            # Counter failing (git missing / weird state) is treated as
+            # "we can't tell" — fall through. The morning brief surfaces
+            # git errors elsewhere.
+            return ""
+        if unpushed_now >= unpushed_backlog_limit:
+            return (
                 f"{_HALT_UNPUSHED_BACKLOG_PREFIX} "
-                f"({unpushed} un-pushed, limit {unpushed_backlog_limit}); "
+                f"({unpushed_now} un-pushed, "
+                f"limit {unpushed_backlog_limit}); "
                 "review and `git push origin main` before the loop resumes"
-            ),
+            )
+        return ""
+
+    initial_skip = _backlog_skip_reason()
+    if initial_skip:
+        return (
+            AutoFixOutcome(skipped=True, skip_reason=initial_skip),
+            (),
         )
 
-    template, finding, source_report, candidate_count = _select_candidate(
+    # spec_038 — clamp top-K to a positive integer, defaulting to 1.
+    # The profile validator already constrains 1..5 at load time; this
+    # second-line defence keeps direct in-process callers safe too.
+    limit = max(1, int(max_candidates or 1))
+    candidates = _select_candidates(
         channels=channels,
         repo=repo,
         fix_templates=fix_templates,
+        limit=limit,
     )
-    if finding is None:
-        return AutoFixOutcome(
-            skipped=True,
-            skip_reason=_compose_no_candidate_reason(fix_templates),
+    if not candidates:
+        return (
+            AutoFixOutcome(
+                skipped=True,
+                skip_reason=_compose_no_candidate_reason(fix_templates),
+            ),
+            (),
         )
+
+    # Resolve seams once for all candidates — there is no per-candidate
+    # difference in which dispatcher / suite / rechecker / git_ops is
+    # used; only the inputs change.
+    gops = git_ops if git_ops is not None else SubprocessGitOps()
+    dispatcher = (
+        fix_dispatcher
+        if fix_dispatcher is not None
+        else _build_default_fix_dispatcher(agent_runner)
+    )
+    run_suite = (
+        suite_runner if suite_runner is not None else _default_suite_runner
+    )
+    recheck_mutation = (
+        mutation_rechecker
+        if mutation_rechecker is not None
+        else _build_default_mutation_rechecker(mutation_runner)
+    )
+    recheck_adversarial = (
+        adversarial_rechecker
+        if adversarial_rechecker is not None
+        else _default_adversarial_rechecker
+    )
+    inspect = (
+        guard_inspector
+        if guard_inspector is not None
+        else _default_guard_inspector
+    )
+
+    outcomes: list[AutoFixOutcome] = []
+    for i, (template, finding, source_report, candidate_count) in enumerate(
+        candidates
+    ):
+        # spec_038 §2-3 — between candidates re-evaluate PAUSE + backlog
+        # cap so multi-candidate nights respect operator brakes mid-run.
+        # The initial entries are gated by ``run_nightly`` (PAUSE) and the
+        # pre-loop backlog check above, so this only fires for i ≥ 1.
+        if i > 0:
+            remaining = len(candidates) - i
+            if _pause_file_present(repo):
+                outcomes.append(
+                    AutoFixOutcome(
+                        skipped=True,
+                        skip_reason=(
+                            f"{_HALT_REMAINING_SKIPPED_PREFIX}: "
+                            f"{remaining} 件 (PAUSE: "
+                            f"`_ai_workspace/PAUSE` が現れた)"
+                        ),
+                    )
+                )
+                break
+            backlog_skip = _backlog_skip_reason()
+            if backlog_skip:
+                outcomes.append(
+                    AutoFixOutcome(
+                        skipped=True,
+                        skip_reason=(
+                            f"{_HALT_REMAINING_SKIPPED_PREFIX}: "
+                            f"{remaining} 件 ({backlog_skip})"
+                        ),
+                    )
+                )
+                break
+
+        outcomes.append(
+            _process_one_auto_fix_candidate(
+                template=template,
+                finding=finding,
+                source_report=source_report,
+                candidate_count=candidate_count,
+                repo=repo,
+                today=today,
+                gops=gops,
+                dispatcher=dispatcher,
+                run_suite=run_suite,
+                recheck_mutation=recheck_mutation,
+                recheck_adversarial=recheck_adversarial,
+                inspect=inspect,
+                dispatch_timeout_s=dispatch_timeout_s,
+            )
+        )
+
+    primary = outcomes[0]
+    extras = tuple(outcomes[1:])
+    return primary, extras
+
+
+def _process_one_auto_fix_candidate(
+    *,
+    template: str,
+    finding: Finding,
+    source_report: Path | None,
+    candidate_count: int,
+    repo: Path,
+    today: date | None,
+    gops: GitOps,
+    dispatcher: FixDispatcher,
+    run_suite: SuiteRunner,
+    recheck_mutation: MutationRechecker,
+    recheck_adversarial: AdversarialRechecker,
+    inspect: GuardInspector,
+    dispatch_timeout_s: float,
+) -> AutoFixOutcome:
+    """spec_038 §2-3 — per-candidate body extracted from spec_023's
+    monolithic loop, so the K-candidate driver can reuse it verbatim.
+
+    The 8-step flow (translate → branch → dispatch → R5 → R4 → guard →
+    decide → restore) is unchanged from spec_023〜026; only the surrounding
+    "single-pass vs K-pass" frame moved out.
+    """
 
     # 1. Translate
     tr = translate_finding(
@@ -937,26 +1093,6 @@ def _run_auto_fix_loop(
 
     assert tr.spec_auto_path is not None  # success ⇒ path exists
 
-    # 2. Resolve seams to defaults
-    gops = git_ops if git_ops is not None else SubprocessGitOps()
-    dispatcher = (
-        fix_dispatcher
-        if fix_dispatcher is not None
-        else _build_default_fix_dispatcher(agent_runner)
-    )
-    run_suite = suite_runner if suite_runner is not None else _default_suite_runner
-    recheck_mutation = (
-        mutation_rechecker
-        if mutation_rechecker is not None
-        else _build_default_mutation_rechecker(mutation_runner)
-    )
-    recheck_adversarial = (
-        adversarial_rechecker
-        if adversarial_rechecker is not None
-        else _default_adversarial_rechecker
-    )
-    inspect = guard_inspector if guard_inspector is not None else _default_guard_inspector
-
     # Per-template guard config
     if template == "A":
         allowed_files = list(_AUTO_FIX_ALLOWED_FILES_A)
@@ -966,7 +1102,7 @@ def _run_auto_fix_loop(
         # so a sprawling diff inside the named file still halts.
         allowed_files = [finding.file, "tests/"]
 
-    # 3. Branch
+    # 2. Branch
     branch = f"auto/{tr.spec_auto_id}"
     try:
         gops.create_and_checkout_branch(repo=repo, branch=branch)
@@ -986,7 +1122,7 @@ def _run_auto_fix_loop(
             halt_reason=f"branch creation failed: {type(exc).__name__}: {exc}",
         )
 
-    # 4. Dispatch the fix (spec_025 §2-1(a): wall-clock bounded).
+    # 3. Dispatch the fix (spec_025 §2-1(a): wall-clock bounded).
     try:
         dispatch_outcome = _dispatch_with_timeout(
             dispatcher=dispatcher,
@@ -1030,7 +1166,7 @@ def _run_auto_fix_loop(
             halt_reason=f"{_HALT_DISPATCH_FAILED}: {reason}",
         )
 
-    # 5. R5: template-specific verification
+    # 4. R5: template-specific verification
     r5_killed, r5_status = _verify_r5(
         template=template,
         finding=finding,
@@ -1039,14 +1175,14 @@ def _run_auto_fix_loop(
         repo=repo,
     )
 
-    # 6. R4: full suite green?
+    # 5. R4: full suite green?
     try:
         suite_outcome = run_suite(repo=repo)
         r4_passed = bool(suite_outcome.passed)
     except Exception:
         r4_passed = False
 
-    # 7. Guard
+    # 6. Guard
     diff_text = ""
     try:
         diff_text = gops.diff(repo=repo, base="main", head=branch)
@@ -1063,7 +1199,7 @@ def _run_auto_fix_loop(
             f"guard inspection failed: {type(exc).__name__}: {exc}",
         )
 
-    # 8. Decide: merge or halt
+    # 7. Decide: merge or halt
     merged = False
     halt_reason = ""
     if r5_killed and r4_passed and guard_passed:
@@ -1171,49 +1307,213 @@ def _run_propose_loop(
     adversarial_rechecker: AdversarialRechecker | None,
     guard_inspector: GuardInspector | None,
     git_ops: GitOps | None,
+    unpushed_counter: UnpushedCounter | None,
+    unpushed_backlog_limit: int,
     isolated_workspace: IsolatedWorkspace | None,
     dispatch_timeout_s: float,
     proposal_dir: Path | None = None,
-) -> AutoFixOutcome:
-    """Drive one propose-mode attempt (spec_028 §2-2).
+    max_candidates: int = 1,
+) -> tuple[AutoFixOutcome, tuple[AutoFixOutcome, ...]]:
+    """Drive the propose-mode loop for up to ``max_candidates``
+    candidates in series (spec_028 §2-2 + spec_038 top-K extension).
 
-    Mirrors :func:`_run_auto_fix_loop` but runs all the write-bearing
-    steps **inside a disposable isolated clone** of the live repo; on
-    success, captures the diff as a patch file under
-    ``<repo>/_ai_workspace/nightly/proposals/`` and returns the
-    :class:`AutoFixOutcome` with ``mode="propose"`` /
-    ``proposed=True`` / ``proposal_patch_path`` populated.
+    Returns ``(primary_outcome, extras)`` — at ``max_candidates=1`` the
+    extras tuple is always empty, keeping the v2外形 bit-for-bit
+    identical for default profiles (spec_038 §3-1).
 
-    Core invariant (spec §1, §2-2): the live working tree, branches,
-    and commits are NEVER touched. All dispatch / verification /
-    guard operations target the clone; the only live-repo write is
-    the patch file under ``proposals/`` (and the spec_auto.md the
-    translator already writes to the live ``bridge/inbox/`` — that
-    is the audit trail and is shared with auto mode).
+    Each candidate's write-bearing steps run **inside a fresh disposable
+    isolated clone** of the live repo (one clone per candidate so
+    proposals never cross-contaminate); on success the diff is captured
+    as a patch file under ``<repo>/_ai_workspace/nightly/proposals/``.
+
+    Core invariant (spec_028 §1, §2-2): the live working tree, branches,
+    and commits are NEVER touched. All dispatch / verification / guard
+    operations target the clone; the only live-repo writes are the
+    patch files under ``proposals/`` (and the spec_auto.md the
+    translator already writes to the live ``bridge/inbox/`` — that is
+    the audit trail and is shared with auto mode).
 
     Failed verification or guard HALT → the proposal is discarded
     (no patch written) and surfaces in §D, NOT §B. The promise of
-    propose mode is "動くと確認済みの修正案だけを出す" (spec §2-3) —
+    propose mode is "動くと確認済みの修正案だけを出す" (spec_028 §2-3) —
     surfacing an unverified diff as a "proposal" would break that.
+
+    spec_038 §2-3 — between candidates the propose loop re-evaluates
+    BOTH operator brakes (PAUSE file AND the un-pushed backlog cap),
+    matching the auto-mode behaviour and following the spec text
+    literally. Propose mode never merges, so in normal operation the
+    backlog counter stays at 0 and the check is a no-op; but the
+    operator may still push a stuck backlog they want to clear before
+    the propose loop continues, and a profile shared between auto and
+    propose runs should respect the same brake semantics.
     """
 
-    # 1. Select candidate. Same logic as auto mode (the templates
-    # filter findings, not modes).
-    template, finding, source_report, candidate_count = _select_candidate(
+    # spec_038 §2-3 — un-pushed backlog cap (re-evaluated between
+    # candidates, identical wiring to the auto loop).
+    count_unpushed = (
+        unpushed_counter
+        if unpushed_counter is not None
+        else _default_unpushed_counter
+    )
+
+    def _backlog_skip_reason() -> str:
+        """Return non-empty skip reason iff the cap is currently tripped."""
+        try:
+            unpushed_now = int(count_unpushed(repo))
+        except Exception:
+            return ""
+        if unpushed_now >= unpushed_backlog_limit:
+            return (
+                f"{_HALT_UNPUSHED_BACKLOG_PREFIX} "
+                f"({unpushed_now} un-pushed, "
+                f"limit {unpushed_backlog_limit}); "
+                "review and `git push origin main` before the loop resumes"
+            )
+        return ""
+
+    # spec_038 — clamp top-K to a positive integer (defaults already
+    # validated in profile but keep a second-line defence for in-process
+    # callers).
+    limit = max(1, int(max_candidates or 1))
+    candidates = _select_candidates(
         channels=channels,
         repo=repo,
         fix_templates=fix_templates,
+        limit=limit,
     )
-    if finding is None:
-        return AutoFixOutcome(
-            skipped=True,
-            skip_reason=_compose_no_candidate_reason(fix_templates),
-            mode="propose",
+    if not candidates:
+        return (
+            AutoFixOutcome(
+                skipped=True,
+                skip_reason=_compose_no_candidate_reason(fix_templates),
+                mode="propose",
+            ),
+            (),
         )
 
-    # 2. Translate against the LIVE repo. The spec_auto.md is the audit
-    # artifact even in propose mode (so the brief can link the
-    # proposal to a spec_auto_NNN.md exactly as auto mode does).
+    # Resolve seams once for all candidates.
+    gops = git_ops if git_ops is not None else SubprocessGitOps()
+    dispatcher = (
+        fix_dispatcher
+        if fix_dispatcher is not None
+        else _build_default_fix_dispatcher(agent_runner)
+    )
+    run_suite = (
+        suite_runner if suite_runner is not None else _default_suite_runner
+    )
+    recheck_mutation = (
+        mutation_rechecker
+        if mutation_rechecker is not None
+        else _build_default_mutation_rechecker(mutation_runner)
+    )
+    recheck_adversarial = (
+        adversarial_rechecker
+        if adversarial_rechecker is not None
+        else _default_adversarial_rechecker
+    )
+    inspect = (
+        guard_inspector
+        if guard_inspector is not None
+        else _default_guard_inspector
+    )
+    workspace_factory = (
+        isolated_workspace
+        if isolated_workspace is not None
+        else _default_isolated_workspace
+    )
+
+    outcomes: list[AutoFixOutcome] = []
+    for i, (template, finding, source_report, candidate_count) in enumerate(
+        candidates
+    ):
+        # spec_038 §2-3 — between candidates re-evaluate BOTH PAUSE and
+        # un-pushed backlog cap (matches the auto loop verbatim). The
+        # spec text is unambiguous: 各候補の処理開始前に未push バックログ
+        # cap と PAUSE を再評価. Propose mode never merges, so the
+        # backlog branch is a no-op in normal operation — keeping the
+        # check in line with auto keeps the brake semantics uniform.
+        if i > 0:
+            remaining = len(candidates) - i
+            if _pause_file_present(repo):
+                outcomes.append(
+                    AutoFixOutcome(
+                        skipped=True,
+                        skip_reason=(
+                            f"{_HALT_REMAINING_SKIPPED_PREFIX}: "
+                            f"{remaining} 件 (PAUSE: "
+                            f"`_ai_workspace/PAUSE` が現れた)"
+                        ),
+                        mode="propose",
+                    )
+                )
+                break
+            backlog_skip = _backlog_skip_reason()
+            if backlog_skip:
+                outcomes.append(
+                    AutoFixOutcome(
+                        skipped=True,
+                        skip_reason=(
+                            f"{_HALT_REMAINING_SKIPPED_PREFIX}: "
+                            f"{remaining} 件 ({backlog_skip})"
+                        ),
+                        mode="propose",
+                    )
+                )
+                break
+
+        outcomes.append(
+            _process_one_propose_candidate(
+                template=template,
+                finding=finding,
+                source_report=source_report,
+                candidate_count=candidate_count,
+                repo=repo,
+                today=today,
+                gops=gops,
+                dispatcher=dispatcher,
+                run_suite=run_suite,
+                recheck_mutation=recheck_mutation,
+                recheck_adversarial=recheck_adversarial,
+                inspect=inspect,
+                workspace_factory=workspace_factory,
+                dispatch_timeout_s=dispatch_timeout_s,
+                proposal_dir=proposal_dir,
+            )
+        )
+
+    primary = outcomes[0]
+    extras = tuple(outcomes[1:])
+    return primary, extras
+
+
+def _process_one_propose_candidate(
+    *,
+    template: str,
+    finding: Finding,
+    source_report: Path | None,
+    candidate_count: int,
+    repo: Path,
+    today: date | None,
+    gops: GitOps,
+    dispatcher: FixDispatcher,
+    run_suite: SuiteRunner,
+    recheck_mutation: MutationRechecker,
+    recheck_adversarial: AdversarialRechecker,
+    inspect: GuardInspector,
+    workspace_factory: IsolatedWorkspace,
+    dispatch_timeout_s: float,
+    proposal_dir: Path | None,
+) -> AutoFixOutcome:
+    """spec_038 §2-3 — per-candidate body extracted from spec_028's
+    monolithic propose loop, so the K-candidate driver can reuse it
+    verbatim.
+
+    Translates against the LIVE repo (the spec_auto.md is the audit
+    artifact for both auto and propose modes), then runs all the
+    write-bearing steps inside a fresh disposable clone.
+    """
+
+    # 1. Translate against the LIVE repo.
     tr = translate_finding(
         finding,
         repo=repo,
@@ -1231,31 +1531,6 @@ def _run_propose_loop(
 
     assert tr.spec_auto_path is not None  # success ⇒ path exists
 
-    # 3. Resolve seams.
-    gops = git_ops if git_ops is not None else SubprocessGitOps()
-    dispatcher = (
-        fix_dispatcher
-        if fix_dispatcher is not None
-        else _build_default_fix_dispatcher(agent_runner)
-    )
-    run_suite = suite_runner if suite_runner is not None else _default_suite_runner
-    recheck_mutation = (
-        mutation_rechecker
-        if mutation_rechecker is not None
-        else _build_default_mutation_rechecker(mutation_runner)
-    )
-    recheck_adversarial = (
-        adversarial_rechecker
-        if adversarial_rechecker is not None
-        else _default_adversarial_rechecker
-    )
-    inspect = guard_inspector if guard_inspector is not None else _default_guard_inspector
-    workspace_factory = (
-        isolated_workspace
-        if isolated_workspace is not None
-        else _default_isolated_workspace
-    )
-
     if template == "A":
         allowed_files = list(_AUTO_FIX_ALLOWED_FILES_A)
     else:
@@ -1263,8 +1538,8 @@ def _run_propose_loop(
 
     branch = f"propose/{tr.spec_auto_id}"
 
-    # 4. Enter the disposable clone. All writes from here on land in
-    # the clone, which is rmtree-d on context exit (spec_014 §2-1).
+    # 2. Enter a fresh disposable clone. All writes from here on land
+    # in the clone, which is rmtree-d on context exit (spec_014 §2-1).
     try:
         with workspace_factory(repo) as clone:
             clone_path = Path(clone)
@@ -1326,7 +1601,7 @@ def _run_propose_loop(
                     halt_reason=f"{_HALT_PROPOSE_DISPATCH_FAILED}: {reason}",
                 )
 
-            # 5. R5 — same verifier as auto, but pointed at the clone.
+            # 3. R5 — same verifier as auto, but pointed at the clone.
             r5_killed, _r5_status = _verify_r5(
                 template=template,
                 finding=finding,
@@ -1335,14 +1610,14 @@ def _run_propose_loop(
                 repo=clone_path,
             )
 
-            # 6. R4 — full suite green in the clone.
+            # 4. R4 — full suite green in the clone.
             try:
                 suite_outcome = run_suite(repo=clone_path)
                 r4_passed = bool(suite_outcome.passed)
             except Exception:
                 r4_passed = False
 
-            # 7. Guard — capture the diff against ``main`` in the clone,
+            # 5. Guard — capture the diff against ``main`` in the clone,
             # then run the same inspector auto mode uses.
             diff_text = ""
             try:
@@ -1362,7 +1637,7 @@ def _run_propose_loop(
                     f"guard inspection failed: {type(exc).__name__}: {exc}",
                 )
 
-            # 8. Decide: propose the diff or HALT (no patch saved).
+            # 6. Decide: propose the diff or HALT (no patch saved).
             if not (r5_killed and r4_passed and guard_passed):
                 halt_reason = _compose_propose_halt_reason(
                     r5_killed=r5_killed,
@@ -1390,7 +1665,7 @@ def _run_propose_loop(
                     proposed=False,
                 )
 
-            # 9. Diff must be non-empty — a "verified proposal" with no
+            # 7. Diff must be non-empty — a "verified proposal" with no
             # actual changes is incoherent (guard would normally catch
             # this via R0, but defend in depth).
             if not diff_text.strip():
@@ -1414,15 +1689,9 @@ def _run_propose_loop(
                     proposed=False,
                 )
 
-            # 10. Save the patch — the only live-repo write of propose
+            # 8. Save the patch — the only live-repo write of propose
             # mode (and it lands under ``_ai_workspace/`` which is
             # gitignored, so the live git state is untouched).
-            #
-            # spec_029: when the sweep entry point passes a CCD-side
-            # ``proposal_dir`` (per-policy), the patch lands there and
-            # the target repo (which may be a client) is never written
-            # to. Without an override, the legacy ``<live_repo>/_ai_workspace
-            # /nightly/proposals/`` path is used (single-policy fallback).
             patch_path = _save_proposal_patch(
                 live_repo=repo,
                 spec_auto_id=tr.spec_auto_id,
@@ -1627,42 +1896,58 @@ def _verify_r5(
     return status == "graceful_error", status
 
 
-def _select_candidate(
+def _select_candidates(
     *,
     channels: list[ChannelOutcome],
     repo: Path,
     fix_templates: tuple[str, ...],
-) -> tuple[str, Finding | None, Path | None, int]:
-    """Pick the first candidate honoring the profile's enabled templates.
+    limit: int,
+) -> list[tuple[str, Finding, Path | None, int]]:
+    """spec_038 — pick up to ``limit`` candidates honoring the profile's
+    enabled templates.
 
-    Returns ``(template, finding, source_path, total_actionable_count)``.
-    ``finding`` is ``None`` when no enabled template has a candidate
-    available; the caller distinguishes that case via the missing finding.
+    Returns a list of ``(template, finding, source_path,
+    total_actionable_count)`` tuples in priority order. Empty list when
+    no enabled template has a candidate available — the caller
+    distinguishes that case via ``len(...) == 0``.
 
     Priority order is **A before B**: template A is structurally safer
     (cannot touch production code), so when both are enabled we exhaust A
     candidates before considering B. This matches spec_024 §2-3's "A を
     一定期間信用してから B を足す" intent — even with B enabled, we don't
-    starve A.
+    starve A. Within each template, source-JSON order is preserved
+    (spec_038 §2-2: "fix_templates の宣言順、テンプレ A → B").
+
+    ``limit`` is the per-night cap from
+    :attr:`ccd.profile.SafetyConfig.max_candidates_per_night`. The
+    default ``limit=1`` reduces this helper to single-candidate selection
+    bit-for-bit identical to spec_023〜026 behavior.
     """
 
-    if "A" in fix_templates:
-        finding_a, source_a, count_a = _select_template_a_candidate(
-            channels=channels,
-            repo=repo,
-        )
-        if finding_a is not None:
-            return "A", finding_a, source_a, count_a
+    if limit <= 0:
+        return []
 
-    if "B" in fix_templates:
-        finding_b, source_b, count_b = _select_template_b_candidate(
-            channels=channels,
-            repo=repo,
-        )
-        if finding_b is not None:
-            return "B", finding_b, source_b, count_b
-
-    return "", None, None, 0
+    out: list[tuple[str, Finding, Path | None, int]] = []
+    for template in fix_templates:
+        if len(out) >= limit:
+            break
+        if template == "A":
+            matches, source, count = _select_template_a_candidates(
+                channels=channels,
+                repo=repo,
+            )
+        elif template == "B":
+            matches, source, count = _select_template_b_candidates(
+                channels=channels,
+                repo=repo,
+            )
+        else:
+            continue
+        for finding in matches:
+            if len(out) >= limit:
+                break
+            out.append((template, finding, source, count))
+    return out
 
 
 def _compose_no_candidate_reason(fix_templates: tuple[str, ...]) -> str:
@@ -1682,37 +1967,41 @@ def _compose_no_candidate_reason(fix_templates: tuple[str, ...]) -> str:
     return f"no {joined} candidate available"
 
 
-def _select_template_a_candidate(
+def _select_template_a_candidates(
     *,
     channels: list[ChannelOutcome],
     repo: Path,
-) -> tuple[Finding | None, Path | None, int]:
-    """Pick the first template-A candidate from this night's findings.
+) -> tuple[list[Finding], Path | None, int]:
+    """Pick all template-A candidates from this night's findings, in
+    source-JSON order (spec_038 §2-2 generalisation of the spec_023
+    single-pick helper).
 
     Resolution order:
 
     1. The mutation channel outcome's ``report_json_path``.
     2. The latest ``discover_NNN.json`` under ``<repo>/_ai_workspace/discover/``.
 
-    Returns ``(finding, source_path, total_actionable_count)``. The
+    Returns ``(matches, source_path, total_actionable_count)``. The
     count is the number of actionable findings in the source JSON (so
-    the brief can report "1 of N picked").
+    the brief can report "x of N picked"); ``matches`` is the subset
+    that passed the pre-filter (file / line / mutation / status="survived").
     """
 
     source = _resolve_mutation_report_path(channels=channels, repo=repo)
     if source is None or not source.exists():
-        return None, None, 0
+        return [], None, 0
 
     try:
         payload = json.loads(source.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        return None, source, 0
+        return [], source, 0
 
     actionable = payload.get("actionable") or []
     if not isinstance(actionable, list):
-        return None, source, 0
+        return [], source, 0
 
     count = len(actionable)
+    matches: list[Finding] = []
     for entry in actionable:
         if not isinstance(entry, dict):
             continue
@@ -1722,19 +2011,17 @@ def _select_template_a_candidate(
             source_report=str(source),
         )
         # Translation's own template-fit check is the canonical filter;
-        # we just need the first finding here and let translate_finding
-        # downgrade if it really doesn't fit. But we cheaply pre-filter
-        # on the obvious required fields so a half-shaped row doesn't
-        # consume the "one candidate per night" slot.
+        # we just pre-filter on the obvious required fields so a
+        # half-shaped row doesn't consume one of the K per-night slots.
         if (
             finding.file
             and finding.line > 0
             and finding.mutation
             and finding.status == "survived"
         ):
-            return finding, source, count
+            matches.append(finding)
 
-    return None, source, count
+    return matches, source, count
 
 
 def _resolve_mutation_report_path(
@@ -1759,34 +2046,37 @@ def _resolve_mutation_report_path(
     return _latest_discover_json(repo=repo, want_channel="mutation")
 
 
-def _select_template_b_candidate(
+def _select_template_b_candidates(
     *,
     channels: list[ChannelOutcome],
     repo: Path,
-) -> tuple[Finding | None, Path | None, int]:
-    """Pick the first template-B candidate from this night's findings.
+) -> tuple[list[Finding], Path | None, int]:
+    """Pick all template-B candidates from this night's findings, in
+    source-JSON order (spec_038 §2-2 generalisation).
 
-    Mirrors :func:`_select_template_a_candidate` but reads the adversarial
+    Mirrors :func:`_select_template_a_candidates` but reads the adversarial
     channel's discover JSON (``findings`` list instead of ``actionable``).
-    Returns ``(finding, source_path, total_finding_count)``. Pre-filters on
-    the obvious required fields (parser / case / exception_type / file)
-    so an ill-shaped entry doesn't consume the night's slot.
+    Returns ``(matches, source_path, total_finding_count)``. Pre-filters
+    on the obvious required fields (parser / case / exception_type /
+    file) so an ill-shaped entry never consumes one of the K per-night
+    slots.
     """
 
     source = _resolve_adversarial_report_path(channels=channels, repo=repo)
     if source is None or not source.exists():
-        return None, None, 0
+        return [], None, 0
 
     try:
         payload = json.loads(source.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        return None, source, 0
+        return [], source, 0
 
     findings = payload.get("findings") or []
     if not isinstance(findings, list):
-        return None, source, 0
+        return [], source, 0
 
     count = len(findings)
+    matches: list[Finding] = []
     for entry in findings:
         if not isinstance(entry, dict):
             continue
@@ -1796,16 +2086,16 @@ def _select_template_b_candidate(
             source_report=str(source),
         )
         # Mirror translate's _why_template_b_does_not_fit so a half-shaped
-        # entry never consumes the spec_auto seq.
+        # entry never consumes a spec_auto seq.
         if (
             finding.parser
             and finding.case_name
             and finding.exception_type
             and finding.file
         ):
-            return finding, source, count
+            matches.append(finding)
 
-    return None, source, count
+    return matches, source, count
 
 
 def _resolve_adversarial_report_path(

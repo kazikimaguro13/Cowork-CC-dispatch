@@ -167,6 +167,7 @@ def run_brief(
     discover_dir: Path | None = None,
     today: date | None = None,
     auto_fix: AutoFixOutcome | None = None,
+    auto_fix_extras: Sequence[AutoFixOutcome] = (),
     channel_outcomes: Sequence[ChannelOutcome] | None = None,
 ) -> BriefResult:
     """Render one morning report from already-completed discovery JSON.
@@ -218,6 +219,7 @@ def run_brief(
             summary=summary,
             channels=channels,
             auto_fix=auto_fix,
+            auto_fix_extras=tuple(auto_fix_extras or ()),
             repo=repo,
             channel_outcomes=channel_outcomes,
         ),
@@ -371,10 +373,19 @@ def _render_md(
     summary: BriefSummary,
     channels: list[ChannelReport],
     auto_fix: AutoFixOutcome | None = None,
+    auto_fix_extras: tuple[AutoFixOutcome, ...] = (),
     repo: Path | None = None,
     channel_outcomes: Sequence[ChannelOutcome] | None = None,
 ) -> str:
     by_channel = {c.channel: c for c in channels}
+    # spec_038 — collect all outcomes for multi-candidate brief sections.
+    # At K=1 (extras empty) the renderer falls through to the v2 layout
+    # bit-for-bit (no §B subsection enumeration). At K>1 the §B multi
+    # variant kicks in.
+    all_outcomes: tuple[AutoFixOutcome, ...] = (
+        (auto_fix, *auto_fix_extras) if auto_fix is not None else ()
+    )
+    multi_candidate = len(all_outcomes) > 1
     phase2_merge_active = (
         auto_fix is not None
         and not auto_fix.skipped
@@ -448,10 +459,22 @@ def _render_md(
         _render_section_a(
             summary,
             auto_fix=auto_fix,
+            auto_fix_extras=auto_fix_extras,
             channel_halt_count=channel_halt_count,
         )
     )
-    if phase2_merge_active:
+    if multi_candidate:
+        # spec_038 §2-4 — render §B as a per-candidate enumeration. The
+        # mechanical-channel Phase 1 §B is still appended below so the
+        # operator sees both the fix story AND the underlying findings.
+        parts.extend(
+            _render_section_b_multi(
+                outcomes=all_outcomes,
+                by_channel=by_channel,
+                repo=repo,
+            )
+        )
+    elif phase2_merge_active:
         assert auto_fix is not None  # narrowed by phase2_merge_active above
         parts.extend(_render_section_b_phase2(auto_fix=auto_fix, repo=repo))
     elif propose_active:
@@ -465,11 +488,18 @@ def _render_md(
             by_channel,
             summary,
             auto_fix=auto_fix,
+            auto_fix_extras=auto_fix_extras,
             channel_outcomes=channel_outcomes,
         )
     )
     parts.extend(_render_section_e(summary, by_channel))
-    parts.extend(_render_section_f(summary, auto_fix=auto_fix))
+    parts.extend(
+        _render_section_f(
+            summary,
+            auto_fix=auto_fix,
+            auto_fix_extras=auto_fix_extras,
+        )
+    )
 
     return "\n".join(parts).rstrip() + "\n"
 
@@ -478,6 +508,7 @@ def _render_section_a(
     summary: BriefSummary,
     *,
     auto_fix: AutoFixOutcome | None = None,
+    auto_fix_extras: tuple[AutoFixOutcome, ...] = (),
     channel_halt_count: int = 0,
 ) -> list[str]:
     bits: list[str] = []
@@ -487,7 +518,52 @@ def _render_section_a(
     # States: merged (auto §B follows), proposed (propose §B follows),
     # skipped (no candidate / paused / un-pushed backlog),
     # halted (loop ran but did not merge / propose).
-    if auto_fix is not None:
+    #
+    # spec_038 — when there are multiple candidates, summarise the
+    # aggregate counts (merged / proposed / halted / skipped) instead
+    # of the single-candidate phrasing. Default K=1 (extras empty) keeps
+    # the v2 phrasing bit-for-bit.
+    all_outcomes: tuple[AutoFixOutcome, ...] = (
+        (auto_fix, *auto_fix_extras) if auto_fix is not None else ()
+    )
+    if len(all_outcomes) > 1:
+        merged_n = sum(
+            1 for o in all_outcomes if not o.skipped and o.merged
+        )
+        proposed_n = sum(
+            1
+            for o in all_outcomes
+            if not o.skipped and getattr(o, "proposed", False)
+        )
+        halted_n = sum(
+            1
+            for o in all_outcomes
+            if not o.skipped
+            and not o.merged
+            and not getattr(o, "proposed", False)
+        )
+        skipped_n = sum(1 for o in all_outcomes if o.skipped)
+        mode = getattr(auto_fix, "mode", "auto") if auto_fix else "auto"
+        prefix = "提案モード" if mode == "propose" else "自律修正"
+        # Build the bullet so it's honest about the total K processed
+        # serially this night, then per-outcome counts.
+        parts_a: list[str] = [
+            f"**{prefix} {len(all_outcomes)} 件直列処理**"
+        ]
+        sub: list[str] = []
+        if merged_n:
+            sub.append(f"merge {merged_n}")
+        if proposed_n:
+            sub.append(f"proposal {proposed_n}")
+        if halted_n:
+            sub.append(f"HALT {halted_n}")
+        if skipped_n:
+            sub.append(f"skip {skipped_n}")
+        if sub:
+            parts_a.append(" (" + " / ".join(sub) + ")")
+        parts_a.append(" — §B に候補ごとの小節を掲載")
+        bits.append("".join(parts_a))
+    elif auto_fix is not None:
         mode = getattr(auto_fix, "mode", "auto")
         proposed = getattr(auto_fix, "proposed", False)
         if not auto_fix.skipped and auto_fix.merged:
@@ -897,6 +973,200 @@ def _compose_push_command(repo: Path | None) -> str:
     return "git push origin main"
 
 
+def _render_section_b_multi(
+    *,
+    outcomes: tuple[AutoFixOutcome, ...],
+    by_channel: dict[str, ChannelReport],
+    repo: Path | None,
+) -> list[str]:
+    """spec_038 §2-4 — render §B as per-candidate subsections when the
+    profile raised ``safety.max_candidates_per_night`` above 1.
+
+    Each outcome becomes one ``### 候補 i/N`` subsection that surfaces
+    template, signature, status (merged / proposed / halted / skipped),
+    the R-evidence, the diff (when merged or proposed), and the
+    appropriate operator one-liner (``git push`` for merged auto,
+    ``git apply`` for proposed). After the per-candidate enumeration
+    the Phase 1 mechanical-channel §B is appended so the underlying
+    findings remain visible alongside the loop's actions.
+    """
+
+    mode = (
+        getattr(outcomes[0], "mode", "auto") if outcomes else "auto"
+    )
+    heading = (
+        "## B. 昨夜の修正案 (提案モード — 複数候補, `spec_038`)"
+        if mode == "propose"
+        else "## B. 昨夜の自律修正 (複数候補 — `spec_038`)"
+    )
+    lines: list[str] = [
+        heading,
+        "",
+        f"本夜は **{len(outcomes)} 件の候補を直列処理**しました "
+        f"(`safety.max_candidates_per_night`)。候補ごとの結果は以下のとおり。",
+        "",
+    ]
+
+    n = len(outcomes)
+    for i, outcome in enumerate(outcomes, start=1):
+        lines.extend(
+            _render_one_candidate_subsection(
+                outcome=outcome,
+                index=i,
+                total=n,
+                repo=repo,
+            )
+        )
+
+    # After the per-candidate enumeration, surface the Phase 1
+    # mechanical-channel §B so the operator still sees the underlying
+    # findings (spec_038 §2-4 — multi-candidate brief includes both
+    # the loop's actions AND the mechanical-channel context).
+    lines.append("### 機械的チャンネルの発見 (Phase 1 — 参考)")
+    lines.append("")
+    lines.extend(_render_mutation_findings(by_channel.get(CHANNEL_MUTATION)))
+    lines.append("")
+    lines.extend(_render_adversarial_findings(by_channel.get(CHANNEL_ADVERSARIAL)))
+    lines.append("")
+    return lines
+
+
+def _render_one_candidate_subsection(
+    *,
+    outcome: AutoFixOutcome,
+    index: int,
+    total: int,
+    repo: Path | None,
+) -> list[str]:
+    """spec_038 §2-4 — render one candidate's subsection for multi-candidate
+    §B. Compact and honest: skipped/halted candidates get a one-line
+    note plus reason; merged/proposed candidates get the same R-evidence
+    + diff embed as the single-candidate Phase 2 / propose layouts.
+    """
+
+    template = outcome.template or "?"
+    if template == "A":
+        template_desc = "テンプレ A (mutation 生存 → test-only)"
+    elif template == "B":
+        template_desc = "テンプレ B (adversarial ungraceful → 本番修正 + 再現テスト)"
+    else:
+        template_desc = f"テンプレ {template}"
+
+    head = f"### 候補 {index}/{total}"
+    mode = getattr(outcome, "mode", "auto")
+
+    if outcome.skipped:
+        status_label = (
+            "**skip** (提案モード)" if mode == "propose" else "**skip**"
+        )
+        return [
+            head,
+            "",
+            f"- 状態: {status_label}",
+            f"- 理由: {outcome.skip_reason or '理由不明'}",
+            "",
+        ]
+
+    proposed = getattr(outcome, "proposed", False)
+    if outcome.merged:
+        status_label = "**ローカル merge 済み**"
+    elif proposed:
+        status_label = "**修正案を保存** (実 repo は無変更)"
+    else:
+        status_label = (
+            "**HALT (提案モード)**" if mode == "propose" else "**HALT**"
+        )
+
+    lines: list[str] = [
+        head,
+        "",
+        f"- 状態: {status_label}",
+        f"- テンプレ: {template_desc}",
+        f"- signature: `{outcome.finding_signature or '(不明)'}`",
+        f"- spec_auto: `{outcome.spec_auto_id or '(不明)'}`"
+        + (
+            f" ({outcome.candidate_count} 候補中)"
+            if outcome.candidate_count
+            else ""
+        ),
+        f"- branch: `{outcome.branch or '(不明)'}`",
+        "",
+    ]
+
+    if template == "A":
+        r5_label = "R5 (target mutation killed)"
+    elif template == "B":
+        r5_label = "R5 (parser now raises a graceful error)"
+    else:
+        r5_label = "R5"
+    if outcome.dispatched:
+        lines.append(
+            f"- {r5_label}: **{'pass' if outcome.r5_killed else 'fail'}**"
+        )
+        lines.append(
+            f"- R4 (`pytest -q` 全件 green): "
+            f"**{'pass' if outcome.r4_suite_passed else 'fail'}**"
+        )
+        if outcome.guard_passed:
+            lines.append("- ガード (R1〜R3): **pass**")
+        else:
+            reasons_text = (
+                "; ".join(outcome.guard_halt_reasons) or "理由不明"
+            )
+            lines.append(f"- ガード: **HALT** — {reasons_text}")
+        lines.append("")
+
+    if not outcome.merged and not proposed:
+        # HALT — record the halt_reason; no diff embed (the diff is not
+        # a reviewable artifact for a halted attempt).
+        if outcome.halt_reason:
+            lines.append(f"halt_reason: {outcome.halt_reason}")
+            lines.append("")
+        return lines
+
+    # Merged or proposed — embed the diff (truncated if huge) and the
+    # operator one-liner.
+    diff = (
+        outcome.merge_diff
+        if outcome.merged
+        else (outcome.proposal_diff or "")
+    )
+    if diff:
+        truncated = len(diff) > _PHASE2_DIFF_CAP
+        body = diff[:_PHASE2_DIFF_CAP] if truncated else diff
+        lines.append("```diff")
+        lines.extend(body.rstrip("\n").splitlines() or [""])
+        lines.append("```")
+        if truncated:
+            lines.append("")
+            lines.append(
+                f"_(diff は {_PHASE2_DIFF_CAP} byte で切り詰めました)_"
+            )
+        lines.append("")
+
+    if outcome.merged:
+        lines.append("操作: review してから")
+        lines.append("```bash")
+        lines.append(_compose_push_command(repo))
+        lines.append("```")
+        lines.append("")
+    elif proposed:
+        lines.append("採用するなら:")
+        lines.append("```bash")
+        lines.append(
+            _compose_apply_command(repo, outcome.proposal_patch_path)
+        )
+        lines.append("```")
+        if outcome.proposal_patch_path is not None:
+            lines.append("")
+            lines.append(
+                "パッチファイル: "
+                f"`{_rel_or_absolute(outcome.proposal_patch_path)}`"
+            )
+        lines.append("")
+    return lines
+
+
 def _render_section_c(by_channel: dict[str, ChannelReport]) -> list[str]:
     """AI-inference findings — visually distinct from §B (spec_017 §2-2)."""
 
@@ -953,6 +1223,7 @@ def _render_section_d(
     summary: BriefSummary,
     *,
     auto_fix: AutoFixOutcome | None = None,
+    auto_fix_extras: tuple[AutoFixOutcome, ...] = (),
     channel_outcomes: Sequence[ChannelOutcome] | None = None,
 ) -> list[str]:
     """halt / skip section — appears only when there is something to say.
@@ -1013,7 +1284,13 @@ def _render_section_d(
     # structural skips so the operator sees them in §D alongside
     # channel halts. A *merged* auto-fix and a *proposed* propose
     # outcome aren't halts; §B owns those stories.
-    if auto_fix is not None:
+    #
+    # spec_038 — when extras are present (K > 1), the multi-candidate
+    # §B already enumerates EVERY candidate's HALT/skip subsection.
+    # Suppressing the per-candidate §D lines here avoids the duplicate
+    # reporting that would otherwise repeat each HALT/skip in two
+    # sections of the same brief.
+    if auto_fix is not None and not auto_fix_extras:
         mode = getattr(auto_fix, "mode", "auto")
         proposed = getattr(auto_fix, "proposed", False)
         if auto_fix.skipped and auto_fix.skip_reason:
@@ -1091,18 +1368,26 @@ def _render_section_f(
     summary: BriefSummary,
     *,
     auto_fix: AutoFixOutcome | None = None,
+    auto_fix_extras: tuple[AutoFixOutcome, ...] = (),
 ) -> list[str]:
-    """Honesty section. Always present — anchors the Phase-1 invariant."""
+    """Honesty section. Always present — anchors the Phase-1 invariant.
 
-    phase2_merge = (
-        auto_fix is not None
-        and not auto_fix.skipped
-        and auto_fix.merged
+    spec_038 — when extras are present (K > 1), the merge / proposal
+    presence is evaluated across the full outcome list so the honesty
+    section still tells the truth on multi-candidate nights (e.g. one
+    candidate merged and two halted still warrants the auto-mode
+    honesty bullets).
+    """
+
+    all_outcomes: tuple[AutoFixOutcome, ...] = (
+        (auto_fix, *auto_fix_extras) if auto_fix is not None else ()
     )
-    proposed = (
-        auto_fix is not None
-        and not auto_fix.skipped
-        and getattr(auto_fix, "proposed", False)
+    phase2_merge = any(
+        not o.skipped and o.merged for o in all_outcomes
+    )
+    proposed = any(
+        not o.skipped and getattr(o, "proposed", False)
+        for o in all_outcomes
     )
 
     lines = ["## F. 起きなかったこと (正直さの節)", ""]

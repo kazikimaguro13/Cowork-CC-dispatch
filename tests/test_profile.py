@@ -1431,3 +1431,99 @@ def test_profile_validation_keeps_mutation_paths_unchanged(tmp_path: Path) -> No
     assert profile.schedule.weekly_day == "Tuesday"
     assert profile.discovery.adversarial is not None
     assert len(profile.discovery.adversarial.parsers) == 1
+
+
+# --------------------------------------------------------------------------- #
+# spec_038 — safety.max_candidates_per_night
+# --------------------------------------------------------------------------- #
+
+
+def test_safety_default_max_candidates_is_one() -> None:
+    """spec_038 §2-1: the default top-K is 1, preserving the spec_023〜026
+    "1晩1候補" cap bit-for-bit for any profile that doesn't explicitly
+    raise it."""
+
+    profile = Profile()
+
+    assert profile.safety.max_candidates_per_night == 1
+
+
+def test_safety_max_candidates_loaded_from_toml(tmp_path: Path) -> None:
+    """An operator opts into top-K by writing ``max_candidates_per_night``
+    in ``[safety]`` — the loader surfaces it without coercion."""
+
+    profile_path = tmp_path / "_ai_workspace" / "ccd_profile.toml"
+    profile_path.parent.mkdir(parents=True)
+    profile_path.write_text(
+        dedent(
+            """
+            [safety]
+            fix_mode = "auto"
+            max_candidates_per_night = 3
+            """
+        ).strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    profile = load_profile(tmp_path)
+
+    assert profile.safety.max_candidates_per_night == 3
+
+
+def test_safety_max_candidates_zero_raises(tmp_path: Path) -> None:
+    """spec_038 §2-1: K must be in 1..5; 0 (loop never acts) loud-fails
+    at load time."""
+
+    profile_path = tmp_path / "_ai_workspace" / "ccd_profile.toml"
+    profile_path.parent.mkdir(parents=True)
+    profile_path.write_text(
+        dedent(
+            """
+            [safety]
+            max_candidates_per_night = 0
+            """
+        ).strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError) as excinfo:
+        load_profile(tmp_path)
+    assert "max_candidates_per_night" in str(excinfo.value)
+
+
+def test_safety_max_candidates_too_high_raises(tmp_path: Path) -> None:
+    """spec_038 §2-1: K must be in 1..5; 6 (well past the night's
+    wall-clock at 40 min/candidate) loud-fails at load time."""
+
+    profile_path = tmp_path / "_ai_workspace" / "ccd_profile.toml"
+    profile_path.parent.mkdir(parents=True)
+    profile_path.write_text(
+        dedent(
+            """
+            [safety]
+            max_candidates_per_night = 6
+            """
+        ).strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError) as excinfo:
+        load_profile(tmp_path)
+    assert "max_candidates_per_night" in str(excinfo.value)
+
+
+def test_safety_max_candidates_renders_in_profile_block(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """``ccd profile`` surfaces ``max_candidates_per_night`` in the
+    TOML-shaped render so an operator can see / copy the effective K."""
+
+    rc = cli.main(["profile", "--repo", str(tmp_path)])
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "max_candidates_per_night = 1" in out

@@ -3552,8 +3552,11 @@ def test_propose_mode_dispatch_failed_drops_proposal(tmp_path: Path) -> None:
 def test_propose_mode_never_calls_merge_or_unpushed_counter(
     tmp_path: Path,
 ) -> None:
-    """spec §2-2 / §3 — propose mode never merges and does not consult
-    the un-pushed backlog counter (spec_025 (b) is auto-only)."""
+    """spec §2-2 / §3 — propose mode never merges. At K=1 (default) the
+    un-pushed backlog counter is also never consulted, since the spec_038
+    candidate-間 re-check only fires for i ≥ 1 (a multi-candidate
+    propose run does re-evaluate the cap — see
+    ``test_propose_k3_backlog_cap_between_candidates_skips_remainder``)."""
 
     _write_mutation_discover_json(repo=tmp_path)
     clone_dir = tmp_path / "_propose_clone"
@@ -3816,3 +3819,366 @@ def test_propose_default_isolated_workspace_is_disposable_clone(
         assert str(workspace).startswith("/tmp/") or "/tmp/" in str(workspace)
     # After exit, the workspace was rmtree-d.
     assert not workspace.exists()
+
+
+# --------------------------------------------------------------------------- #
+# spec_038 — top-K candidate selection (multi-candidate per night, 直列)
+# --------------------------------------------------------------------------- #
+
+
+def _multi_actionable(n: int) -> list[dict[str, Any]]:
+    """Build n synthetic mutation actionable entries with distinct
+    signatures so the loop can tell them apart in the dispatch trail."""
+
+    return [
+        {
+            "file": f"ccd/file_{i}.py",
+            "line": 10 + i,
+            "mutation": f"a{i} → b{i}",
+            "status": "survived",
+            "signature": f"ccd/file_{i}.py:{10 + i}:a{i} → b{i}",
+        }
+        for i in range(n)
+    ]
+
+
+def _autofix_profile_k(*, k: int) -> Profile:
+    """K-candidate auto-mode profile (spec_038)."""
+    return Profile(
+        discovery=DiscoveryConfig(channels=["mutation"]),
+        schedule=ScheduleConfig(),
+        safety=SafetyConfig(fix_mode="auto", max_candidates_per_night=k),
+    )
+
+
+def test_default_k1_dispatch_count_unchanged_vs_v2(tmp_path: Path) -> None:
+    """spec_038 §3-1: with ``max_candidates_per_night`` unspecified (K=1
+    default), the夜間処理 外形 (dispatch count, NightlyResult shape) is
+    identical to spec_023〜026 — 1 dispatch, 1 merge, no extras."""
+
+    _write_mutation_discover_json(repo=tmp_path, actionable=_multi_actionable(4))
+    dispatcher = _FakeFixDispatcher()
+    suite = _FakeSuiteRunner()
+    recheck = _FakeMutationRechecker(status="killed")
+    guard = _FakeGuardInspector()
+    gops = _FakeGitOps()
+    brief_runner, _ = _make_fake_brief_runner()
+
+    result = run_nightly(
+        repo=tmp_path,
+        profile=_autofix_profile(autonomous=True),  # default K=1
+        channel_runner=_RecordingChannelRunner(),
+        brief_runner=brief_runner,
+        windows_mirror=lambda _p: None,
+        fix_dispatcher=dispatcher,
+        suite_runner=suite,
+        mutation_rechecker=recheck,
+        guard_inspector=guard,
+        git_ops=gops,
+    )
+
+    assert len(dispatcher.calls) == 1
+    assert result.auto_fix is not None
+    assert result.auto_fix.merged is True
+    assert result.auto_fix_extras == ()
+
+
+def test_k3_with_four_candidates_processes_only_top_three(
+    tmp_path: Path,
+) -> None:
+    """spec_038 §3-2: K=3 and 4 candidates in the source JSON →
+    exactly the top 3 are dispatched in priority (source-JSON) order.
+    The 4th candidate stays unprocessed."""
+
+    _write_mutation_discover_json(repo=tmp_path, actionable=_multi_actionable(4))
+    dispatcher = _FakeFixDispatcher()
+    suite = _FakeSuiteRunner()
+    recheck = _FakeMutationRechecker(status="killed")
+    guard = _FakeGuardInspector()
+    gops = _FakeGitOps()
+    brief_runner, _ = _make_fake_brief_runner()
+
+    result = run_nightly(
+        repo=tmp_path,
+        profile=_autofix_profile_k(k=3),
+        channel_runner=_RecordingChannelRunner(),
+        brief_runner=brief_runner,
+        windows_mirror=lambda _p: None,
+        fix_dispatcher=dispatcher,
+        suite_runner=suite,
+        mutation_rechecker=recheck,
+        guard_inspector=guard,
+        git_ops=gops,
+    )
+
+    # 3 dispatches, 3 merges (all R5/R4/guard pass in this fake setup).
+    assert len(dispatcher.calls) == 3
+    assert len(gops.merges) == 3
+    # Primary + 2 extras = 3 total outcomes recorded.
+    assert result.auto_fix is not None
+    assert len(result.auto_fix_extras) == 2
+    all_outs = (result.auto_fix, *result.auto_fix_extras)
+    sigs = [o.finding_signature for o in all_outs]
+    assert sigs == [
+        "ccd/file_0.py:10:a0 → b0",
+        "ccd/file_1.py:11:a1 → b1",
+        "ccd/file_2.py:12:a2 → b2",
+    ]
+
+
+def test_k3_backlog_cap_between_candidates_skips_remainder(
+    tmp_path: Path,
+) -> None:
+    """spec_038 §3-3: with K=3, if the un-pushed backlog cap is hit
+    BEFORE candidate 2 starts (e.g. candidate 1 merged → cap reached),
+    the remaining candidates are skipped and the reason is recorded."""
+
+    _write_mutation_discover_json(repo=tmp_path, actionable=_multi_actionable(3))
+    dispatcher = _FakeFixDispatcher()
+    suite = _FakeSuiteRunner()
+    recheck = _FakeMutationRechecker(status="killed")
+    guard = _FakeGuardInspector()
+    gops = _FakeGitOps()
+    brief_runner, _ = _make_fake_brief_runner()
+
+    # Counter returns 0 first (loop entry), then 3 (after candidate 1
+    # merged, simulating a now-tripped backlog).
+    call_counts: list[int] = []
+
+    def _counter(_repo: Path) -> int:
+        call_counts.append(1)
+        return 0 if len(call_counts) == 1 else 3
+
+    result = run_nightly(
+        repo=tmp_path,
+        profile=_autofix_profile_k(k=3),
+        channel_runner=_RecordingChannelRunner(),
+        brief_runner=brief_runner,
+        windows_mirror=lambda _p: None,
+        fix_dispatcher=dispatcher,
+        suite_runner=suite,
+        mutation_rechecker=recheck,
+        guard_inspector=guard,
+        git_ops=gops,
+        unpushed_counter=_counter,
+    )
+
+    # Only candidate 1 dispatched + merged; remainder bailed.
+    assert len(dispatcher.calls) == 1
+    assert len(gops.merges) == 1
+    assert result.auto_fix is not None
+    assert result.auto_fix.merged is True
+    # The rollup skip outcome shows up as the single extra.
+    assert len(result.auto_fix_extras) == 1
+    skip = result.auto_fix_extras[0]
+    assert skip.skipped is True
+    assert "remaining candidate(s) skipped" in skip.skip_reason
+    assert "un-pushed autonomous-fix commits" in skip.skip_reason
+    assert "2 件" in skip.skip_reason
+
+
+def test_k3_first_candidate_halt_does_not_stop_second(
+    tmp_path: Path,
+) -> None:
+    """spec_038 §3-4: a candidate-1 HALT (guard rejects, R5 fails, etc.)
+    does NOT stop the loop — candidate 2 still gets its full per-candidate
+    attempt. spec_038 §2-3: "1候補の失敗は残候補の処理を止めない"."""
+
+    _write_mutation_discover_json(repo=tmp_path, actionable=_multi_actionable(2))
+    dispatcher = _FakeFixDispatcher()
+    suite = _FakeSuiteRunner()
+    # Recheck returns "survived" → R5 fails → candidate 1 halts.
+    # But the rechecker is shared across candidates; switch its status
+    # mid-run via a stateful counter.
+    state = {"calls": 0}
+
+    def _stateful_recheck(
+        *,
+        repo: Path,
+        file: str,
+        line: int,
+        mutation: str,
+        signature: str,
+    ) -> str:
+        state["calls"] += 1
+        # First candidate: fail R5. Second candidate: pass R5.
+        return "survived" if state["calls"] == 1 else "killed"
+
+    guard = _FakeGuardInspector()
+    gops = _FakeGitOps()
+    brief_runner, _ = _make_fake_brief_runner()
+
+    result = run_nightly(
+        repo=tmp_path,
+        profile=_autofix_profile_k(k=3),
+        channel_runner=_RecordingChannelRunner(),
+        brief_runner=brief_runner,
+        windows_mirror=lambda _p: None,
+        fix_dispatcher=dispatcher,
+        suite_runner=suite,
+        mutation_rechecker=_stateful_recheck,
+        guard_inspector=guard,
+        git_ops=gops,
+    )
+
+    # 2 dispatches (1 halt + 1 merge).
+    assert len(dispatcher.calls) == 2
+    assert len(gops.merges) == 1
+    assert result.auto_fix is not None
+    assert result.auto_fix.merged is False
+    assert result.auto_fix.r5_killed is False
+    assert "R5 failed" in result.auto_fix.halt_reason
+    assert len(result.auto_fix_extras) == 1
+    extra = result.auto_fix_extras[0]
+    assert extra.merged is True
+    assert extra.r5_killed is True
+
+
+def test_k1_default_brief_layout_identical(tmp_path: Path) -> None:
+    """spec_038 §3-1: at K=1, the morning report contains no
+    multi-candidate §B markers — the v2 layout is preserved unchanged."""
+
+    _write_mutation_discover_json(repo=tmp_path)
+    dispatcher = _FakeFixDispatcher()
+    suite = _FakeSuiteRunner()
+    recheck = _FakeMutationRechecker(status="killed")
+    guard = _FakeGuardInspector()
+    gops = _FakeGitOps()
+
+    # Use the real brief (not the fake) so we can assert on the rendered
+    # markdown. Patch the windows mirror to a no-op.
+    result = run_nightly(
+        repo=tmp_path,
+        profile=_autofix_profile(autonomous=True),  # default K=1
+        channel_runner=_RecordingChannelRunner(),
+        windows_mirror=lambda _p: None,
+        fix_dispatcher=dispatcher,
+        suite_runner=suite,
+        mutation_rechecker=recheck,
+        guard_inspector=guard,
+        git_ops=gops,
+    )
+
+    assert result.success
+    assert result.brief_report_wsl is not None
+    md = result.brief_report_wsl.read_text(encoding="utf-8")
+    # K=1 keeps the v2 §B Phase 2 layout.
+    assert "Phase 2" in md
+    # Multi-candidate marker MUST NOT appear at K=1.
+    assert "候補ごとの小節" not in md
+    assert "件直列処理" not in md
+    assert "候補 1/" not in md
+
+
+def test_k3_brief_renders_multi_candidate_section_b(tmp_path: Path) -> None:
+    """spec_038 §2-4: at K>1, §B switches to per-candidate subsections
+    with one ``### 候補 i/N`` entry per outcome (primary + extras)."""
+
+    _write_mutation_discover_json(repo=tmp_path, actionable=_multi_actionable(3))
+    dispatcher = _FakeFixDispatcher()
+    suite = _FakeSuiteRunner()
+    recheck = _FakeMutationRechecker(status="killed")
+    guard = _FakeGuardInspector()
+    gops = _FakeGitOps()
+
+    result = run_nightly(
+        repo=tmp_path,
+        profile=_autofix_profile_k(k=3),
+        channel_runner=_RecordingChannelRunner(),
+        windows_mirror=lambda _p: None,
+        fix_dispatcher=dispatcher,
+        suite_runner=suite,
+        mutation_rechecker=recheck,
+        guard_inspector=guard,
+        git_ops=gops,
+    )
+
+    assert result.success
+    assert result.brief_report_wsl is not None
+    md = result.brief_report_wsl.read_text(encoding="utf-8")
+    assert "3 件直列処理" in md
+    assert "### 候補 1/3" in md
+    assert "### 候補 2/3" in md
+    assert "### 候補 3/3" in md
+
+
+def _propose_profile_k(*, k: int) -> Profile:
+    """K-candidate propose-mode profile (spec_038)."""
+    return Profile(
+        discovery=DiscoveryConfig(channels=["mutation"]),
+        schedule=ScheduleConfig(),
+        safety=SafetyConfig(
+            fix_mode="propose",
+            fix_templates=["A"],
+            max_candidates_per_night=k,
+        ),
+    )
+
+
+def test_propose_k3_backlog_cap_between_candidates_skips_remainder(
+    tmp_path: Path,
+) -> None:
+    """spec_038 §2-3 (literal) — between candidates the propose loop
+    re-evaluates BOTH PAUSE and the un-pushed backlog cap (spec says
+    "未push バックログ cap と PAUSE を再評価" without a mode restriction).
+
+    Setup: K=3 with 3 candidates in the source JSON. The un-pushed
+    counter returns 0 for the first call (before candidate 1) and 3 on
+    every subsequent call so the cap trips between candidates. The
+    propose loop must therefore process candidate 1 and emit a rollup
+    skip outcome for the remaining 2 candidates.
+    """
+
+    _write_mutation_discover_json(repo=tmp_path, actionable=_multi_actionable(3))
+    clone_dir = tmp_path / "_propose_clone_k3"
+    factory = _fake_isolated_workspace_factory(clone_dir)
+    dispatcher = _FakeFixDispatcher(
+        outcome=FixDispatchOutcome(status="done", commits_made=1)
+    )
+    suite = _FakeSuiteRunner(outcome=SuiteOutcome(passed=True))
+    recheck = _FakeMutationRechecker(status="killed")
+    guard = _FakeGuardInspector()
+    gops = _FakeGitOps(canned_diff="diff --git a/x b/x\n+y\n")
+    brief_runner, _ = _make_fake_brief_runner()
+
+    # Propose mode has NO pre-loop backlog check (auto's initial gate
+    # is auto-only), so the first counter invocation is the
+    # inter-candidate re-evaluation that fires before candidate 2.
+    # Returning 3 (= default cap) immediately trips the gate.
+    counter_calls: list[int] = []
+
+    def _counter(_repo: Path) -> int:
+        counter_calls.append(1)
+        return 3
+
+    result = run_nightly(
+        repo=tmp_path,
+        profile=_propose_profile_k(k=3),
+        channel_runner=_RecordingChannelRunner(),
+        brief_runner=brief_runner,
+        windows_mirror=lambda _p: None,
+        fix_dispatcher=dispatcher,
+        suite_runner=suite,
+        mutation_rechecker=recheck,
+        guard_inspector=guard,
+        git_ops=gops,
+        isolated_workspace=factory,
+        unpushed_counter=_counter,
+    )
+
+    # Candidate 1 dispatched and produced a proposal; candidates 2-3
+    # were skipped because the cap tripped between them.
+    assert len(dispatcher.calls) == 1
+    assert result.auto_fix is not None
+    assert result.auto_fix.mode == "propose"
+    assert result.auto_fix.proposed is True
+    # The rollup skip outcome surfaces in extras with the backlog reason.
+    assert len(result.auto_fix_extras) == 1
+    skip = result.auto_fix_extras[0]
+    assert skip.skipped is True
+    assert skip.mode == "propose"
+    assert "remaining candidate(s) skipped" in skip.skip_reason
+    assert "un-pushed autonomous-fix commits" in skip.skip_reason
+    assert "2 件" in skip.skip_reason
+    # The counter was consulted at least once between candidates.
+    assert len(counter_calls) >= 1
