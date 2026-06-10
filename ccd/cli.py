@@ -40,7 +40,13 @@ from ccd.discover import (
 )
 from ccd.guard import DEFAULT_PROD_DIFF_LIMIT, fetch_diff, inspect_diff
 from ccd.integrate import DEFAULT_SMOKE_COMMANDS
-from ccd.metrics import aggregate, render_report
+from ccd.metrics import (
+    aggregate,
+    aggregate_v3,
+    load_night_snapshots,
+    render_report,
+    render_v3_report,
+)
 from ccd.models import DispatchRecord, DispatchStatus
 from ccd.nightly import BriefRunner, ChannelRunner, WindowsMirror, run_nightly
 from ccd.profile import load_profile_with_source, render_profile
@@ -162,7 +168,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_report = sub.add_parser(
         "report",
         help="Render a metrics report from the most recent run.",
-        description="Aggregate the saved run record into a Markdown metrics report.",
+        description=(
+            "Aggregate the saved run record into a Markdown metrics "
+            "report. When ``<repo>/_ai_workspace/nightly/records/`` "
+            "holds spec_042 night snapshots (one ``night_<date>.json`` "
+            "per nightly orchestration) a **v3 nightly metrics** section "
+            "is appended — convergence rate, iterations-to-green "
+            "distribution, marginal parallel yield, conflict / drop "
+            "rate (理由別), and dispatch minutes per merged fix. Each "
+            "metric carries an explicit population note so the reader "
+            "sees the denominator the rate is computed against."
+        ),
     )
     p_report.add_argument("--repo", type=Path, default=None)
     p_report.add_argument(
@@ -173,6 +189,17 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Path to the run JSON to read "
             f"(default: <repo>/{DEFAULT_LAST_RUN_PATH})."
+        ),
+    )
+    p_report.add_argument(
+        "--v3-records",
+        dest="v3_records_dir",
+        type=Path,
+        default=None,
+        help=(
+            "Override the directory holding v3 night snapshots "
+            "(default: <repo>/_ai_workspace/nightly/records/). When "
+            "empty / absent, the v3 section is omitted."
         ),
     )
 
@@ -532,6 +559,10 @@ def main(
     # canned ``NightlyResult`` shapes so failure isolation can be
     # exercised without invoking real channels / dispatch / guard.
     nightly_runner: Any | None = None,
+    # spec_042 — per-night v3 snapshot directory override (forwarded
+    # to ``ccd nightly``). Used by tests that want to redirect snapshot
+    # writes to ``tmp_path``; production reads the profile default.
+    record_dir: Path | None = None,
 ) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -571,6 +602,7 @@ def main(
             dispatch_timeout_s=dispatch_timeout_s,
             isolated_workspace=isolated_workspace,
             apply_patch=apply_patch,
+            record_dir=record_dir,
         )
     if args.command == "nightly-all":
         return _cmd_nightly_all(
@@ -690,6 +722,20 @@ def _cmd_report(args: argparse.Namespace) -> int:
     records = _load_records(path)
     report = aggregate(records)
     print(render_report(report))
+
+    # spec_042 — v3 nightly metrics section. Appended only when there
+    # are snapshots to read; otherwise the v1 report stands alone (the
+    # default ``ccd report`` output stays bit-for-bit identical when no
+    # nightly has run yet).
+    v3_dir = (
+        Path(args.v3_records_dir).resolve()
+        if getattr(args, "v3_records_dir", None) is not None
+        else repo / Path("_ai_workspace") / "nightly" / "records"
+    )
+    snapshots = load_night_snapshots(v3_dir)
+    if snapshots:
+        v3_report = aggregate_v3(snapshots)
+        print(render_v3_report(v3_report))
     return 0
 
 
@@ -867,6 +913,7 @@ def _cmd_nightly(
     dispatch_timeout_s: float | None = None,
     isolated_workspace: Any | None = None,
     apply_patch: Any | None = None,
+    record_dir: Path | None = None,
 ) -> int:
     repo = _resolve_repo(args.repo)
     profile_path = getattr(args, "profile_path", None)
@@ -890,6 +937,7 @@ def _cmd_nightly(
         dispatch_timeout_s=dispatch_timeout_s,
         isolated_workspace=isolated_workspace,
         apply_patch=apply_patch,
+        record_dir=record_dir,
     )
 
     # spec_025 §2-1(c) — PAUSE short-circuit. Surface the pause and

@@ -539,3 +539,90 @@ def test_run_file_round_trip_through_loader(tmp_path: Path) -> None:
     assert len(loaded) == 1
     assert loaded[0].project == "example"
     assert loaded[0].records[0].spec_id == "spec_001"
+
+
+# --------------------------------------------------------------------------- #
+# spec_042 — v3 nightly panel                                                 #
+# --------------------------------------------------------------------------- #
+
+
+def test_render_dashboard_omits_v3_panel_when_no_snapshots() -> None:
+    runs = load_runs(FIXTURES)
+    html = render_dashboard(runs, generated_at=datetime(2026, 6, 10, tzinfo=UTC))
+    # Without snapshots, the panel must be absent so the v1 layout is
+    # bit-for-bit identical (spec_042 受け入れ基準: 「snapshot 無し → v3 節は出ない」).
+    assert "v3 nightly metrics" not in html
+
+
+def test_render_dashboard_includes_v3_panel_when_snapshots_present() -> None:
+    from ccd.metrics import NightSnapshot, WorkerInterval
+
+    runs = load_runs(FIXTURES)
+    snapshot = NightSnapshot(
+        night_id="2026-06-10",
+        fix_loop_starts=2,
+        converged=2,
+        iterations_to_green=(1, 2),
+        merges=2,
+        parallelism=2,
+        achieved_max_concurrency=2,
+        drop_reasons=("max merges per night cap reached",),
+        worker_intervals=(
+            WorkerInterval(
+                worker_id="w1",
+                started_at="2026-06-10T02:00:00+00:00",
+                finished_at="2026-06-10T02:10:00+00:00",
+                merged=True,
+            ),
+            WorkerInterval(
+                worker_id="w2",
+                started_at="2026-06-10T02:05:00+00:00",
+                finished_at="2026-06-10T02:15:00+00:00",
+                merged=True,
+            ),
+        ),
+    )
+
+    html = render_dashboard(
+        runs,
+        generated_at=datetime(2026, 6, 10, tzinfo=UTC),
+        night_snapshots=(snapshot,),
+    )
+    assert "v3 nightly metrics (spec_042)" in html
+    # The five v3 metric labels show up, each with its population note row.
+    assert "convergence" in html
+    assert "iterations_to_green" in html
+    assert "marginal parallel yield" in html
+    assert "conflict / drop rate" in html
+    assert "dispatch 分/merge" in html
+    # Population note anchor (Japanese 母集団) appears in the rendered panel.
+    assert "母集団" in html
+
+
+def test_render_to_writes_v3_panel_when_snapshots_present(tmp_path: Path) -> None:
+    runs_dir = _stage_runs(tmp_path)
+    # Place a snapshot file under the conventional sibling path
+    # ``<runs_dir>/../nightly/records/``.
+    records_dir = tmp_path / "nightly" / "records"
+    records_dir.mkdir(parents=True)
+    (records_dir / "night_2026-06-10.json").write_text(
+        json.dumps(
+            {
+                "night_id": "2026-06-10",
+                "fix_loop_starts": 1,
+                "converged": 1,
+                "iterations_to_green": [1],
+                "merges": 1,
+                "parallelism": 1,
+                "achieved_max_concurrency": 1,
+                "drop_reasons": [],
+                "worker_intervals": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    output = tmp_path / "dashboard.html"
+    render_to(runs_dir, output)
+    html = output.read_text(encoding="utf-8")
+    assert "v3 nightly metrics (spec_042)" in html

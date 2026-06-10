@@ -452,3 +452,431 @@ def test_interrupted_appears_in_failure_taxonomy_and_is_safe_halted() -> None:
     # Both failures are classified → safe halt rate is 2/2.
     assert report.safe_halt_rate.numerator == 2
     assert report.safe_halt_rate.denominator == 2
+
+
+# --------------------------------------------------------------------------- #
+# spec_042 — v3 nightly metrics tests
+# --------------------------------------------------------------------------- #
+
+
+import json  # noqa: E402
+
+from ccd.metrics import (  # noqa: E402
+    NightSnapshot,
+    V3MetricsReport,
+    V3Rate,
+    WorkerInterval,
+    aggregate_v3,
+    load_night_snapshots,
+    render_v3_report,
+)
+
+
+def _snap(
+    night_id: str,
+    *,
+    fix_loop_starts: int = 0,
+    converged: int = 0,
+    iterations_to_green: tuple[int, ...] = (),
+    merges: int = 0,
+    parallelism: int = 1,
+    achieved_max_concurrency: int = 1,
+    drop_reasons: tuple[str, ...] = (),
+    worker_intervals: tuple[WorkerInterval, ...] = (),
+    total_dispatch_seconds: float | None = None,
+) -> NightSnapshot:
+    return NightSnapshot(
+        night_id=night_id,
+        fix_loop_starts=fix_loop_starts,
+        converged=converged,
+        iterations_to_green=iterations_to_green,
+        merges=merges,
+        parallelism=parallelism,
+        achieved_max_concurrency=achieved_max_concurrency,
+        drop_reasons=drop_reasons,
+        worker_intervals=worker_intervals,
+        total_dispatch_seconds=total_dispatch_seconds,
+    )
+
+
+def test_v3_empty_input_produces_zero_rates_with_population_notes() -> None:
+    report = aggregate_v3([])
+
+    assert isinstance(report, V3MetricsReport)
+    assert report.nights == 0
+    assert report.fix_loop_starts == 0
+    assert report.total_merges == 0
+    # All rates: 0/0 with value 0.0 and a non-empty population note.
+    for r in (report.convergence_rate, report.conflict_drop_rate):
+        assert isinstance(r, V3Rate)
+        assert r.denominator == 0
+        assert r.value == 0.0
+        assert r.population_note  # non-empty
+    assert report.iterations_to_green.samples == 0
+    # No nights at all → dispatch-minutes is unknown (None) with a note.
+    assert report.dispatch_minutes_per_merged_fix is None
+    assert report.total_dispatch_minutes is None
+    assert "計算不能" in report.dispatch_minutes_note
+    # No workers anywhere → parallel yield is observable (0/0 with note).
+    assert report.marginal_parallel_yield is not None
+    assert report.marginal_parallel_yield.denominator == 0
+
+
+def test_v3_single_night_all_converged_one_iteration_each() -> None:
+    snap = _snap(
+        "2026-06-01",
+        fix_loop_starts=3,
+        converged=3,
+        iterations_to_green=(1, 1, 1),
+        merges=3,
+        parallelism=1,
+        achieved_max_concurrency=1,
+    )
+
+    report = aggregate_v3([snap])
+
+    assert report.convergence_rate.numerator == 3
+    assert report.convergence_rate.denominator == 3
+    assert report.convergence_rate.value == 1.0
+    # Iteration histogram: all 1s → "loop is insurance" signal.
+    assert report.iterations_to_green.one == 3
+    assert report.iterations_to_green.two == 0
+    assert report.iterations_to_green.three_or_more == 0
+    assert report.iterations_to_green.samples == 3
+    # No drops → drop rate 0/3 (merge=3, drop=0).
+    assert report.conflict_drop_rate.numerator == 0
+    assert report.conflict_drop_rate.denominator == 3
+    assert report.drop_reasons == ()
+    # No worker intervals → minutes-per-merge is 0.0 / merge=3 = 0.0
+    # (total = 0 because no workers contributed time, but observable).
+    assert report.dispatch_minutes_per_merged_fix == 0.0
+    assert report.total_dispatch_minutes == 0.0
+
+
+def test_v3_iterations_histogram_three_plus_bucket() -> None:
+    snap = _snap(
+        "2026-06-02",
+        fix_loop_starts=5,
+        converged=4,
+        iterations_to_green=(1, 2, 3, 5),
+        merges=4,
+    )
+
+    report = aggregate_v3([snap])
+
+    # 1 → bucket "one"; 2 → bucket "two"; 3 and 5 → bucket "three_or_more".
+    assert report.iterations_to_green.one == 1
+    assert report.iterations_to_green.two == 1
+    assert report.iterations_to_green.three_or_more == 2
+    assert report.iterations_to_green.samples == 4
+    # convergence: 4 of 5 starts.
+    assert report.convergence_rate.numerator == 4
+    assert report.convergence_rate.denominator == 5
+
+
+def test_v3_convergence_rate_excludes_skipped_from_denominator() -> None:
+    # 5 candidates entered the loop, only 2 converged, plus snapshot
+    # implicitly excludes any skip outcomes (build_night_snapshot doesn't
+    # count them toward fix_loop_starts).
+    snap = _snap(
+        "2026-06-03",
+        fix_loop_starts=5,
+        converged=2,
+        iterations_to_green=(1, 2),
+        merges=2,
+    )
+
+    report = aggregate_v3([snap])
+
+    assert report.convergence_rate.numerator == 2
+    assert report.convergence_rate.denominator == 5
+    assert "skipped" in report.convergence_rate.population_note
+
+
+def test_v3_drop_reasons_bucketed_into_known_categories() -> None:
+    snap = _snap(
+        "2026-06-04",
+        fix_loop_starts=4,
+        converged=4,
+        iterations_to_green=(1, 1, 1, 1),
+        merges=1,
+        drop_reasons=(
+            "max merges per night cap reached (1 merges, limit 1)",
+            "apply failed in live re-verification",
+            "PAUSE file detected before integration",
+        ),
+    )
+
+    report = aggregate_v3([snap])
+
+    # 1 merge + 3 drops = 4 processed.
+    assert report.conflict_drop_rate.numerator == 3
+    assert report.conflict_drop_rate.denominator == 4
+    bucket_names = {b.category for b in report.drop_reasons}
+    assert "cap" in bucket_names
+    assert "conflict" in bucket_names
+    assert "pause" in bucket_names
+
+
+def test_v3_marginal_parallel_yield_overlap_counts() -> None:
+    # Two workers that overlap → both their merges count toward overlap.
+    snap = _snap(
+        "2026-06-05",
+        fix_loop_starts=2,
+        converged=2,
+        iterations_to_green=(1, 1),
+        merges=2,
+        parallelism=2,
+        achieved_max_concurrency=2,
+        worker_intervals=(
+            WorkerInterval(
+                worker_id="w1",
+                started_at="2026-06-05T02:00:00+00:00",
+                finished_at="2026-06-05T02:10:00+00:00",
+                merged=True,
+            ),
+            WorkerInterval(
+                worker_id="w2",
+                started_at="2026-06-05T02:05:00+00:00",
+                finished_at="2026-06-05T02:15:00+00:00",
+                merged=True,
+            ),
+        ),
+    )
+
+    report = aggregate_v3([snap])
+
+    assert report.marginal_parallel_yield is not None
+    assert report.marginal_parallel_yield.numerator == 2
+    assert report.marginal_parallel_yield.denominator == 2
+    assert report.marginal_parallel_yield.value == 1.0
+
+
+def test_v3_marginal_parallel_yield_no_overlap_when_serial() -> None:
+    # Two workers run strictly back-to-back — no overlap.
+    snap = _snap(
+        "2026-06-06",
+        fix_loop_starts=2,
+        converged=2,
+        iterations_to_green=(1, 1),
+        merges=2,
+        parallelism=2,
+        achieved_max_concurrency=1,
+        worker_intervals=(
+            WorkerInterval(
+                worker_id="w1",
+                started_at="2026-06-06T02:00:00+00:00",
+                finished_at="2026-06-06T02:05:00+00:00",
+                merged=True,
+            ),
+            WorkerInterval(
+                worker_id="w2",
+                started_at="2026-06-06T02:05:00+00:00",
+                finished_at="2026-06-06T02:10:00+00:00",
+                merged=True,
+            ),
+        ),
+    )
+
+    report = aggregate_v3([snap])
+
+    assert report.marginal_parallel_yield is not None
+    assert report.marginal_parallel_yield.numerator == 0
+    assert report.marginal_parallel_yield.denominator == 2
+
+
+def test_v3_marginal_parallel_yield_unknown_when_timestamps_missing() -> None:
+    # Two workers with no timestamps → night is unobservable.
+    snap = _snap(
+        "2026-06-07",
+        fix_loop_starts=2,
+        converged=2,
+        iterations_to_green=(1, 1),
+        merges=2,
+        parallelism=2,
+        achieved_max_concurrency=2,
+        worker_intervals=(
+            WorkerInterval(worker_id="w1", merged=True),
+            WorkerInterval(worker_id="w2", merged=True),
+        ),
+    )
+
+    report = aggregate_v3([snap])
+
+    assert report.marginal_parallel_yield is None
+    assert "不明" in report.marginal_parallel_yield_note
+    assert "2026-06-07" in report.marginal_parallel_yield_note
+
+
+def test_v3_dispatch_minutes_per_merged_fix_uses_intervals() -> None:
+    snap = _snap(
+        "2026-06-08",
+        fix_loop_starts=1,
+        converged=1,
+        iterations_to_green=(1,),
+        merges=1,
+        parallelism=1,
+        worker_intervals=(
+            WorkerInterval(
+                worker_id="w1",
+                started_at="2026-06-08T02:00:00+00:00",
+                finished_at="2026-06-08T02:12:00+00:00",
+                merged=True,
+            ),
+        ),
+    )
+
+    report = aggregate_v3([snap])
+
+    # 12 minutes / 1 merge = 12.0.
+    assert report.dispatch_minutes_per_merged_fix == 12.0
+    assert report.total_dispatch_minutes == 12.0
+
+
+def test_v3_dispatch_minutes_when_merges_zero_shows_total_with_zero() -> None:
+    snap = _snap(
+        "2026-06-09",
+        fix_loop_starts=1,
+        converged=0,
+        iterations_to_green=(),
+        merges=0,
+        parallelism=1,
+        worker_intervals=(
+            WorkerInterval(
+                worker_id="w1",
+                started_at="2026-06-09T02:00:00+00:00",
+                finished_at="2026-06-09T02:20:00+00:00",
+                merged=False,
+            ),
+        ),
+    )
+
+    report = aggregate_v3([snap])
+
+    # merge=0 → rate is None; total minutes is shown, note flags merge=0.
+    assert report.dispatch_minutes_per_merged_fix is None
+    assert report.total_dispatch_minutes == 20.0
+    assert "merge=0" in report.dispatch_minutes_note
+
+
+def test_v3_backfill_old_records_without_v3_fields_do_not_crash() -> None:
+    # An "old" record JSON might only have night_id; everything else
+    # should fall back to defaults and aggregate without raising.
+    payload = {"night_id": "2026-05-01"}
+    old_snap = NightSnapshot.model_validate(payload)
+
+    # parallelism + achieved_max_concurrency are validated >= 1 so the
+    # defaults of 1 stick. Everything else: zero.
+    assert old_snap.parallelism == 1
+    assert old_snap.merges == 0
+    assert old_snap.worker_intervals == ()
+
+    report = aggregate_v3([old_snap])
+    # Doesn't crash; rates are 0/0.
+    assert report.convergence_rate.denominator == 0
+    assert report.iterations_to_green.samples == 0
+
+
+def test_v3_backfill_tolerates_unknown_extra_fields_via_extra_ignore() -> None:
+    # spec_009 流儀 — old records can carry fields the v3 schema doesn't
+    # know about; ``extra="ignore"`` swallows them silently.
+    payload = {
+        "night_id": "2026-05-02",
+        "unknown_future_field": [1, 2, 3],
+        "merges": 1,
+    }
+    snap = NightSnapshot.model_validate(payload)
+    assert snap.merges == 1
+
+
+def test_v3_multiple_nights_aggregate_across_observations() -> None:
+    nights = [
+        _snap(
+            "2026-06-10",
+            fix_loop_starts=2,
+            converged=2,
+            iterations_to_green=(1, 1),
+            merges=2,
+        ),
+        _snap(
+            "2026-06-11",
+            fix_loop_starts=3,
+            converged=1,
+            iterations_to_green=(2,),
+            merges=1,
+            drop_reasons=("backlog cap reached",),
+        ),
+    ]
+
+    report = aggregate_v3(nights)
+
+    assert report.nights == 2
+    assert report.fix_loop_starts == 5
+    assert report.total_merges == 3
+    assert report.convergence_rate.numerator == 3
+    assert report.convergence_rate.denominator == 5
+    # One drop across both nights, falls into "cap" bucket.
+    by_cat = {b.category: b for b in report.drop_reasons}
+    assert by_cat["cap"].count == 1
+
+
+def test_v3_render_includes_all_metrics_with_population_notes() -> None:
+    nights = [
+        _snap(
+            "2026-06-12",
+            fix_loop_starts=2,
+            converged=2,
+            iterations_to_green=(1, 2),
+            merges=2,
+            parallelism=2,
+            achieved_max_concurrency=2,
+            worker_intervals=(
+                WorkerInterval(
+                    worker_id="w1",
+                    started_at="2026-06-12T02:00:00+00:00",
+                    finished_at="2026-06-12T02:10:00+00:00",
+                    merged=True,
+                ),
+                WorkerInterval(
+                    worker_id="w2",
+                    started_at="2026-06-12T02:05:00+00:00",
+                    finished_at="2026-06-12T02:15:00+00:00",
+                    merged=True,
+                ),
+            ),
+        ),
+    ]
+    report = aggregate_v3(nights)
+    md = render_v3_report(report)
+
+    assert "# v3 nightly metrics" in md
+    assert "Convergence rate" in md
+    assert "Iterations to green" in md
+    assert "Marginal parallel yield" in md
+    assert "Conflict / drop rate" in md
+    assert "Dispatch minutes per merged fix" in md
+    # Population notes are present (Japanese 母集団 anchor).
+    assert "母集団" in md
+
+
+def test_v3_load_night_snapshots_from_directory_skips_malformed(tmp_path) -> None:
+    good = tmp_path / "night_2026-06-13.json"
+    good.write_text(
+        json.dumps({"night_id": "2026-06-13", "merges": 1}),
+        encoding="utf-8",
+    )
+    malformed = tmp_path / "night_2026-06-14.json"
+    malformed.write_text("not-json", encoding="utf-8")
+    other = tmp_path / "not_a_snapshot.json"  # doesn't match glob
+    other.write_text("{}", encoding="utf-8")
+
+    snapshots = load_night_snapshots(tmp_path)
+    # The malformed file is silently skipped; the unrelated file is
+    # ignored by the glob pattern.
+    assert [s.night_id for s in snapshots] == ["2026-06-13"]
+    assert snapshots[0].merges == 1
+
+
+def test_v3_load_night_snapshots_returns_empty_for_missing_dir(tmp_path) -> None:
+    snapshots = load_night_snapshots(tmp_path / "does-not-exist")
+    assert snapshots == []
