@@ -41,6 +41,37 @@ def test_parse_spec_extracts_id_title_and_body(tmp_path: Path) -> None:
     assert spec.body.rstrip().endswith("do the thing")
 
 
+def test_parse_spec_skips_lines_before_heading(tmp_path: Path) -> None:
+    """Non-heading lines preceding the `# id: title` heading must be skipped.
+
+    The scan loop uses `continue` to step past every line that does not start
+    with `"# "` until it reaches the heading. If that `continue` became a
+    `break`, the very first non-heading line (here a leading blank line) would
+    abort the scan and `parse_spec` would wrongly raise "no top-level heading".
+    """
+
+    p = _write(
+        tmp_path / "spec_777.md",
+        dedent(
+            """\
+
+            # spec_777: leading blank line
+
+            - **Author**: Cowork
+
+            body here
+            """
+        ),
+    )
+
+    spec = parse_spec(p)
+
+    assert spec.id == "spec_777"
+    assert spec.title == "leading blank line"
+    assert spec.body.startswith("- **Author**: Cowork")
+    assert spec.body.rstrip().endswith("body here")
+
+
 def test_parse_spec_raises_when_no_heading(tmp_path: Path) -> None:
     p = _write(tmp_path / "broken.md", "no heading here\njust text\n")
     with pytest.raises(ValueError, match="no top-level"):
