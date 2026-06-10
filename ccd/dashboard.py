@@ -36,13 +36,25 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
-from .metrics import MetricsReport, Rate, aggregate
+from .metrics import (
+    MetricsReport,
+    NightSnapshot,
+    Rate,
+    V3MetricsReport,
+    aggregate,
+    aggregate_v3,
+    load_night_snapshots,
+)
 from .models import DispatchRecord, DispatchStatus, RunFile
 
 logger = logging.getLogger(__name__)
 
 _DEFAULT_RUNS_REL = Path("_ai_workspace") / "runs"
 _DEFAULT_OUTPUT_REL = Path("docs") / "index.html"
+# spec_042 — directory of per-night v3 snapshots. When empty / missing
+# the dashboard skips the v3 panel and the existing v1 layout renders
+# unchanged.
+_DEFAULT_V3_RECORDS_REL = Path("_ai_workspace") / "nightly" / "records"
 
 # Generation tags whose runs may have synthetic defaults from backfill
 # (attempts=1, intervention=False). Used to drive the data-quality banner.
@@ -140,24 +152,41 @@ def _record_sort_key(record: DispatchRecord) -> datetime:
 # --------------------------------------------------------------------------- #
 
 
-def render_dashboard(runs: Sequence[RunFile], *, generated_at: datetime | None = None) -> str:
-    """Render the full dashboard HTML for the given runs."""
+def render_dashboard(
+    runs: Sequence[RunFile],
+    *,
+    generated_at: datetime | None = None,
+    night_snapshots: Sequence[NightSnapshot] = (),
+) -> str:
+    """Render the full dashboard HTML for the given runs.
+
+    spec_042: ``night_snapshots`` (when non-empty) adds a v3 nightly
+    metrics panel above the run table — convergence rate,
+    iterations-to-green distribution, marginal parallel yield,
+    conflict / drop rate breakdown, and dispatch minutes per merged
+    fix. When the sequence is empty (no nightly has run, or the
+    snapshot directory is missing) the panel is omitted so the v1
+    layout stays bit-for-bit identical.
+    """
 
     records = pool_records(runs)
     report = aggregate(records)
     trend = build_trend(records)
     generated = generated_at or datetime.now(UTC)
 
-    body = "\n".join(
-        [
-            _render_header(generated, total_runs=len(runs), total_records=len(records)),
-            _render_quality_note(runs),
-            _render_hero(report, project_count=len(runs)),
-            _render_failure_taxonomy(report),
-            _render_trend(trend),
-            _render_runs_table(runs),
-        ]
-    )
+    panels: list[str] = [
+        _render_header(generated, total_runs=len(runs), total_records=len(records)),
+        _render_quality_note(runs),
+        _render_hero(report, project_count=len(runs)),
+        _render_failure_taxonomy(report),
+        _render_trend(trend),
+    ]
+    if night_snapshots:
+        v3_report = aggregate_v3(night_snapshots)
+        panels.append(_render_v3_panel(v3_report, night_count=len(night_snapshots)))
+    panels.append(_render_runs_table(runs))
+
+    body = "\n".join(panels)
 
     return _HTML_DOCUMENT.format(
         title="ccd dashboard",
@@ -598,6 +627,121 @@ def _representative_date(run: RunFile, records: Sequence[DispatchRecord]) -> str
     return "—"
 
 
+# --- v3 panel (spec_042) -------------------------------------------------- #
+
+
+def _render_v3_panel(report: V3MetricsReport, *, night_count: int) -> str:
+    """Render the spec_042 v3 nightly metrics panel.
+
+    Every metric carries an explicit population note (mirrors
+    :func:`render_v3_report`'s 流儀) so the operator never reads a
+    bare 100% without seeing the denominator. ``unknown`` shows up
+    as 不明 — spec_042 §2-1 「でっち上げ禁止」.
+    """
+
+    convergence = _v3_metric_row(
+        label="収束率 (convergence)",
+        value_html=_v3_rate_html(report.convergence_rate.numerator,
+                                 report.convergence_rate.denominator,
+                                 report.convergence_rate.value),
+        note=report.convergence_rate.population_note,
+    )
+    iterations = _v3_metric_row(
+        label="iterations_to_green",
+        value_html=(
+            f"1={report.iterations_to_green.one} / "
+            f"2={report.iterations_to_green.two} / "
+            f"3+={report.iterations_to_green.three_or_more} "
+            f"(n={report.iterations_to_green.samples})"
+        ),
+        note=report.iterations_to_green.population_note,
+    )
+    if report.marginal_parallel_yield is None:
+        parallel_value = "不明"
+    else:
+        py = report.marginal_parallel_yield
+        parallel_value = _v3_rate_html(py.numerator, py.denominator, py.value)
+    parallel = _v3_metric_row(
+        label="marginal parallel yield",
+        value_html=parallel_value,
+        note=report.marginal_parallel_yield_note,
+    )
+    conflict = _v3_metric_row(
+        label="conflict / drop rate",
+        value_html=_v3_rate_html(
+            report.conflict_drop_rate.numerator,
+            report.conflict_drop_rate.denominator,
+            report.conflict_drop_rate.value,
+        ),
+        note=report.conflict_drop_rate.population_note,
+    )
+    if report.dispatch_minutes_per_merged_fix is None:
+        if report.total_dispatch_minutes is None:
+            minutes_value = "不明"
+        else:
+            minutes_value = (
+                f"総 {report.total_dispatch_minutes:.1f} 分 / merge=0"
+            )
+    else:
+        minutes_value = (
+            f"{report.dispatch_minutes_per_merged_fix:.1f} 分/merge"
+            f" (総 {report.total_dispatch_minutes:.1f} 分 / "
+            f"merge {report.total_merges})"
+        )
+    minutes = _v3_metric_row(
+        label="dispatch 分/merge",
+        value_html=minutes_value,
+        note=report.dispatch_minutes_note,
+    )
+
+    drops_html = ""
+    if report.drop_reasons:
+        items: list[str] = []
+        for item in report.drop_reasons:
+            items.append(
+                f'<li><strong>{html.escape(item.category)}</strong>: '
+                f"{item.count} ({item.share * 100:.1f}%)</li>"
+            )
+        drops_html = (
+            '<div class="v3-drops">'
+            '<div class="v3-drops-label">drop 理由内訳</div>'
+            f'<ul class="v3-drops-list">{"".join(items)}</ul>'
+            "</div>"
+        )
+
+    return (
+        '<section class="panel v3-panel" aria-label="v3 nightly metrics">'
+        "<h2>v3 nightly metrics (spec_042)</h2>"
+        f'<p class="caption">夜間 record {night_count} 件 · '
+        f"FixLoop 起動 {report.fix_loop_starts} 件 · "
+        f"merge {report.total_merges} 件。各指標に母集団・観測限界の注記つき "
+        "(spec_042 §2-1 「数字が正直に言う」流儀)。</p>"
+        '<div class="v3-grid">'
+        + convergence
+        + iterations
+        + parallel
+        + conflict
+        + minutes
+        + "</div>"
+        + drops_html
+        + "</section>"
+    )
+
+
+def _v3_metric_row(*, label: str, value_html: str, note: str) -> str:
+    return (
+        '<div class="v3-row">'
+        f'<div class="v3-row-label">{html.escape(label)}</div>'
+        f'<div class="v3-row-value">{html.escape(value_html)}</div>'
+        f'<div class="v3-row-note">{html.escape(note)}</div>'
+        "</div>"
+    )
+
+
+def _v3_rate_html(numerator: int, denominator: int, value: float) -> str:
+    return f"{numerator}/{denominator} ({value * 100:.1f}%)"
+
+
 # --- helpers --------------------------------------------------------------- #
 
 
@@ -704,6 +848,22 @@ details summary { cursor: pointer; color: var(--muted); padding: 4px 0;
   font-size: 0.85rem; }
 table.specs { margin-top: 6px; background: rgba(15,23,42,0.4);
   border-radius: 6px; overflow: hidden; }
+.v3-panel .caption { color: var(--muted); margin: 0 0 12px;
+  font-size: 0.85rem; }
+.v3-grid { display: grid; grid-template-columns: 1fr; gap: 10px; }
+.v3-row { background: rgba(15,23,42,0.55); border-radius: 8px;
+  padding: 10px 12px; }
+.v3-row-label { color: var(--muted); font-size: 0.78rem;
+  text-transform: uppercase; letter-spacing: 0.04em; }
+.v3-row-value { font-size: 1.05rem; margin-top: 2px;
+  font-variant-numeric: tabular-nums; }
+.v3-row-note { color: var(--muted); font-size: 0.78rem; margin-top: 3px;
+  line-height: 1.4; }
+.v3-drops { margin-top: 14px; }
+.v3-drops-label { color: var(--muted); font-size: 0.78rem;
+  text-transform: uppercase; letter-spacing: 0.04em; margin-bottom: 4px; }
+.v3-drops-list { margin: 0; padding-left: 18px; font-size: 0.9rem;
+  color: var(--text); }
 """
 
 _HTML_DOCUMENT = """<!doctype html>
@@ -733,11 +893,30 @@ def render_to(
     output: Path,
     *,
     generated_at: datetime | None = None,
+    v3_records_dir: Path | None = None,
 ) -> Path:
-    """Load runs from ``runs_dir`` and write the dashboard HTML to ``output``."""
+    """Load runs from ``runs_dir`` and write the dashboard HTML to ``output``.
+
+    spec_042: when ``v3_records_dir`` resolves to a directory holding
+    ``night_*.json`` snapshots, a v3 nightly metrics panel is added
+    above the run table. Default reads from
+    ``<runs_dir.parent>/nightly/records/`` to keep the existing v1
+    dashboard call site working unchanged.
+    """
 
     runs = load_runs(runs_dir)
-    html_text = render_dashboard(runs, generated_at=generated_at)
+    if v3_records_dir is None:
+        # Default heuristic — ``runs_dir`` is conventionally under
+        # ``<repo>/_ai_workspace/runs/`` so its sibling ``nightly/records``
+        # is the standard snapshot home. If neither path makes sense the
+        # loader returns ``[]`` and the panel is silently omitted.
+        v3_records_dir = runs_dir.parent / "nightly" / "records"
+    snapshots = load_night_snapshots(v3_records_dir)
+    html_text = render_dashboard(
+        runs,
+        generated_at=generated_at,
+        night_snapshots=snapshots,
+    )
     output = Path(output)
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(html_text, encoding="utf-8")

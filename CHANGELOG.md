@@ -2,6 +2,94 @@
 
 本プロジェクトの注目すべき変更を記録する。フォーマットは [Keep a Changelog](https://keepachangelog.com/) に準ずる。
 
+## [0.25.0] — 2026-06-10
+
+### Added
+
+- spec_042: **v3 メトリクス + dashboard 表示 + ドキュメント同期**。spec_038〜041 で
+  乗ったレールの上に「**実際に価値を生んでいるか**」を **数字が正直に言う** メトリクス
+  層を載せる。v1 からの一貫テーマ「成功率は観測できた母集団の中の率」を踏襲し、
+  各指標に **母集団・観測限界の注記** を必ず付ける。0 除算をごまかさない (`merge=0`
+  なら「総分数 + merge 0」と書く)、per-worker timestamp が欠損した夜は推定でなく
+  **不明** と書く、`marginal_parallel_yield` が観測できない夜は `None` を返す。
+- `ccd/metrics.py` ── 新 Pydantic モデル `NightSnapshot` (一晩分の v3 metric
+  feedstock、`extra="ignore"` で backfill 寛容) / `WorkerInterval` (per-worker
+  start/finish + merged フラグ) / `V3Rate` (population_note 付き) /
+  `IterationsHistogram` (1/2/3+ バケット) / `DropReasonBreakdown` /
+  `V3MetricsReport`。
+- `ccd/metrics.py` ── 新関数 `aggregate_v3(snapshots)` ── 5 指標を集計:
+  - `convergence_rate` — 母集団 = FixLoop が起動した候補数。skipped 候補は分母に
+    含めない (生存バイアス対策)。
+  - `iterations_to_green` ヒストグラム — 1 / 2 / 3+ バケット。1 が支配的ならループ
+    は保険、2-3 が多いならループが価値を生んでいるシグナル。
+  - `marginal_parallel_yield` — worker lifespan が他の worker と重なった merge を
+    分子。per-worker timestamp が欠損した夜は **None** (でっち上げ禁止)。
+  - `conflict_drop_rate` — Integrator drop 率。理由別バケット (conflict / cap /
+    pause / window / other) は drop_reasons の anchor 文字列で分類。
+  - `dispatch_minutes_per_merged_fix` — 総 dispatch 時間 ÷ merge 数。merge=0 の
+    夜は「総分数 + merge 0」を表示 (0 除算回避)。
+- `ccd/metrics.py` ── 新関数 `render_v3_report(report)` (`ccd report` の v3 節を
+  Markdown で render) / `load_night_snapshots(path)` (ディレクトリから snapshot
+  JSON を集める、不正ファイルは skip)。
+- `ccd/nightly.py` ── 新関数 `build_night_snapshot(result, night_id)` ──
+  `NightlyResult` を v3 snapshot dict に投影 (auto_fix + auto_fix_extras から
+  `fix_loop_starts` / `converged` / `iterations_to_green` / `merges` /
+  `worker_intervals` を計算)。
+- `ccd/nightly.py` ── 新関数 `save_night_snapshot(result, night_id, record_dir)` ──
+  `<record_dir>/night_<id>.json` に snapshot を JSON dump (sort_keys=True で
+  決定的、`ensure_ascii=False` で日本語 anchor が読みやすい)。
+- `ccd/nightly.py` ── `run_nightly()` に新 kwarg `record_dir: Path | None`。
+  既定 `<repo>/_ai_workspace/nightly/records/`。完了時に snapshot を best-effort
+  で save (write 失敗で nightly 全体は止めない)。新定数
+  `_NIGHTLY_RECORDS_DIR_REL`。
+- `ccd/sweep.py` ── 各 policy ごとに `record_dir` を `<ccd_repo>/_ai_workspace/
+  nightly/<policy>/records/` に redirect (client repo に write が漏れない構造を
+  proposal_dir と同じ流儀で維持)。fallback mode (legacy 単一 profile) は record_dir
+  も `None` で既定経路。
+- `ccd/dashboard.py` ── 新 v3 panel renderer `_render_v3_panel(report, night_count)`
+  ── 5 指標 + drop 理由内訳をインライン SVG なしの軽量 HTML で表示。`render_dashboard()`
+  / `render_to()` が `v3_records_dir` を読んで非空なら panel を追加 (v1 layout は
+  snapshot が無い限り bit-for-bit 不変)。
+- `ccd/cli.py` ── `ccd report` に `--v3-records DIR` flag 追加。記録があれば v1
+  scoreboard の後に v3 節を追記 (snapshot 無し → v1 のみで bit-for-bit 互換)。
+  `ccd nightly` / `ccd nightly-all` は `record_dir` kwarg を尊重。
+- 新規 pytest:
+  - `tests/test_metrics.py` ── v3 集計テスト 13 件 (空 / 単一夜 / 複数夜 / 0 除算 /
+    backfill 寛容性 / `marginal_parallel_yield` 不明 / 旧 record 混在 / drop_reasons
+    分類 / iteration ヒストグラム / dispatch 分計算 / 順序不変 / render 出力 /
+    population_note 文字列)。
+  - `tests/test_nightly.py` ── snapshot 永続化テスト 2 件
+    (`test_build_night_snapshot_projects_v3_fields` / `test_save_night_snapshot_writes_json`)。
+  - `tests/test_dashboard.py` ── v3 panel テスト 2 件 (snapshot 無し / 有り)。
+
+### Changed
+
+- `docs/DESIGN.md` ── v3 シリーズ §10 を追加 (旧 `docs/DESIGN_v3_draft.md` の §10.1〜
+  §10.9 をそのまま取り込み、§10.10 に **実装の記録 + 予想と違った点 4 点** を追記)。
+  draft ファイルは削除。
+- `docs/DESIGN_v3_draft.md` ── **削除** (上記 §10 に取り込み済み)。
+- `README.md` ── version 0.24.0 → 0.25.0、テスト数を spec_042 反映後の値に同期、
+  運用ステータス節に v3 シリーズ 5/5 (メトリクス + dashboard) を追記、推奨の段階的
+  有効化手順 (K=2 → loop_max_iterations=3 → P=2) を 1 段落追加 (spec §2-4 逐語)。
+- `pyproject.toml` / `ccd/__init__.py` / `tests/test_smoke.py` ── `0.24.0` →
+  `0.25.0` (minor bump — v3 metric layer + snapshot persistence 追加)。
+
+### Notes
+
+- spec_042 §2-4 「有効化はしない」を逐語遵守: `_ai_workspace/ccd_profile.toml` /
+  `_ai_workspace/profiles/*.toml` は **変更していない**。K / P / loop_max_iterations の
+  既定値は v2 のまま (1 / 1 / 1) で、merge しても挙動は変わらない。operator が朝
+  レポートを見ながら段階的に有効化する (README 末尾の推奨手順)。
+- spec_042 §3-2 「v3 フィールドが無い古い record が混ざっても集計が落ちない」を
+  Pydantic の `extra="ignore"` + 全フィールドにデフォルト値で構造的に満たす
+  (`tests/test_metrics.py` の backfill テストが pin)。
+- spec_042 §3-3 「report / brief / dashboard で同一夜の数字が一致」── 同じ
+  `NightlyResult` の `merged` フィールドを 3 経路すべてが参照するので merge 数は
+  必ず一致。`drop_reasons` も `NightlyResult.drop_reasons` 経由で 3 経路一致 (brief
+  の §B 「drop=N」は「候補のうち merge しなかった広義の drop」で別概念 — v3 metric
+  の `conflict_drop_rate` は「Integration gate-trip の狭義 drop」、note 文字列で
+  明示)。
+
 ## [0.24.0] — 2026-06-10
 
 ### Added

@@ -314,6 +314,7 @@ def _process_policy(
         discover_dir: Path | None = None
         brief_dir: Path | None = None
         proposal_dir: Path | None = None
+        record_dir: Path | None = None
     else:
         discover_dir = (
             ccd_repo / "_ai_workspace" / "discover" / entry.name
@@ -322,6 +323,7 @@ def _process_policy(
             ccd_repo / "_ai_workspace" / "nightly" / entry.name
         ).resolve()
         proposal_dir = (brief_dir / "proposals").resolve()
+        record_dir = (brief_dir / "records").resolve()
 
     # spec_030 — profile-driven adversarial parser injection. In
     # genuine registry mode (NOT fallback) a施策 that lists
@@ -368,6 +370,7 @@ def _process_policy(
     call_kwargs["discover_dir"] = discover_dir
     call_kwargs["brief_dir"] = brief_dir
     call_kwargs["proposal_dir"] = proposal_dir
+    call_kwargs["record_dir"] = record_dir
     if adversarial_parsers is not None:
         call_kwargs["adversarial_parsers"] = adversarial_parsers
     if channel_skips:

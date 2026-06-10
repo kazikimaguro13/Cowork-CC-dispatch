@@ -6,6 +6,8 @@
 
 **v2 では、これに加えて「夜間（週次）に無人で自分自身を保守するループ」（Loop β）を実装した** ── 発見 3 チャンネル（ミューテーション・敵対的入力・AI 推論）でテストの隙間を炙り出し、インチキ修正ガード（修正係の自己申告ではなく実 diff を機械検査）と R5/R4 検証ゲートを通った修正だけをローカル `main` に merge する。`auto` / `propose` / `off` の 3 モードを信頼度で使い分け、プロファイル 1 行で施策ごとに「どこまで自走させるか」を刻む。設計詳細と実走で炙り出された 3 つの欠陥は [`docs/DESIGN.md §9`](docs/DESIGN.md) を参照。
 
+**v3 では、夜間ループを「複数候補 × 並列ワーカー × 候補ごとの収束ループ」に拡張した** ── 既定値（K=1 / P=1 / `loop_max_iterations=1`）で v2 と外形完全一致を保ちつつ、`safety.max_candidates_per_night` (1..5) / `safety.parallelism` (1..4) / `safety.loop_max_iterations` (1..5) を operator が刻める。auto モードは propose と同じ使い捨て隔離クローンで fix を回し、live への書き込みは直列 Integrator のみ（apply 失敗 / 再検証失敗で drop + restore）。`marginal_parallel_yield` / `convergence_rate` / `dispatch_minutes_per_merged_fix` を含む **v3 nightly metrics** を `ccd report` / `ccd dashboard` で集計表示（各指標に母集団・観測限界の注記つき、生存バイアス対策と同じ流儀）。設計詳細は [`docs/DESIGN.md §10`](docs/DESIGN.md) を参照。
+
 ```
 spec_NNN.md ──dispatch──▶ Claude Code ──実装──▶ result_NNN.md
      │                                              │
@@ -56,9 +58,9 @@ pip install -e ".[dev]"
 動作確認:
 
 ```bash
-ccd --version          # ccd 0.24.0
+ccd --version          # ccd 0.25.0
 ruff check .
-pytest -q              # 682 passed
+pytest -q              # ~700 passed
 ```
 
 ## 使い方
@@ -172,7 +174,9 @@ v2 で追加された 7 つのサブコマンド。設計詳細は [`docs/DESIGN
 - `propose` — 発見 → 修正案生成 → 検証 → ガード → **レポートに diff**（適用しない、隔離クローン内で完結し対象 repo に 1 バイトも書き込まない）。クライアント施策用。
 - `off` — 発見 → 報告のみ（修正案なし）。最小構成。
 
-> **運用ステータス**: v2 全 3 フェーズ + Phase 2.5（複数施策の sweep 運用 + 沈黙失敗の構造修正）の**実装は完了**（spec_013〜041、version 0.24.0、682 tests、subcommand 12）。Phase 2.5 の実走で炙り出された **v2 設計思想由来の欠陥 6 件すべて構造修正済み**（spec_030/031/032）。タスクスケジューラ経由起動の launcher pattern 構造修正も完了（spec_033、v0.20.1）── 週次タスク登録の信頼性向上。さらに subagent fresh review SOP の運用で抽出された launcher pattern の運用品質（relocation 耐性・診断ログ・機序訂正、spec_034 v0.20.2）と修正の品質メタ評価（防護網テスト・honest 診断ログ・運用テンプレ可視化、spec_035 v0.20.3）、修正の自己整合性メタ評価（二重 activate の統合・guardrail 汎用化・診断テストの穴埋め、spec_036 v0.20.4）、冗長な disown 削除の実測決着（verify→simplify、spec_037 v0.20.5）まで反映。v3 シリーズ 1/5 として「1晩1候補」制約の解除（top-K 直列、spec_038 v0.21.0）を投入 ── 既定 K=1 で v2 外形完全一致、operator opt-in で K=2..5 を直列処理。v3 シリーズ 2/5 として **FixLoop ── 収束ループ + 無進捗検知**（spec_039 v0.22.0）を投入 ── 既定 `loop_max_iterations=1` で v2 単発と外形完全一致、operator opt-in で 1..5 イテレーションを R5/R4/guard が green になるまで繰り返す（自己申告 promise でなく機械検証で完了判定）。v3 シリーズ 3/5 として **隔離の統一 ── auto モードの clone-and-patch 化と Integrator 導入**（spec_040 v0.23.0）を投入 ── auto モードも propose と同じ使い捨て隔離クローンで fix を実行し、live への書き込みは直列 Integrator のみが行う形に統一。v3 シリーズ 4/5 として **WorkerPool ── 複数 CC dispatch の並列化と直列 Integration queue**（spec_041 v0.24.0）を投入 ── K 候補を並列度 P (1..4) のワーカープールで処理し、完了 patch を直列 Integrator に投入。`max_merges_per_night` cap + PAUSE / 未push backlog / 夜間窓 wall-clock の 4 ゲートが integration 前に再評価され、trip した残 patch は退避。既定 P=1 で spec_038〜040 と外形完全一致。複数週の無人運用による実績作りはこれからの段階。「実装完了」と「運用できる」の差は埋まっていない、というのが現在地。
+> **運用ステータス**: v2 全 3 フェーズ + Phase 2.5（複数施策の sweep 運用 + 沈黙失敗の構造修正）の**実装は完了**（spec_013〜042、version 0.25.0、~700 tests、subcommand 12）。Phase 2.5 の実走で炙り出された **v2 設計思想由来の欠陥 6 件すべて構造修正済み**（spec_030/031/032）。タスクスケジューラ経由起動の launcher pattern 構造修正も完了（spec_033、v0.20.1）── 週次タスク登録の信頼性向上。さらに subagent fresh review SOP の運用で抽出された launcher pattern の運用品質（relocation 耐性・診断ログ・機序訂正、spec_034 v0.20.2）と修正の品質メタ評価（防護網テスト・honest 診断ログ・運用テンプレ可視化、spec_035 v0.20.3）、修正の自己整合性メタ評価（二重 activate の統合・guardrail 汎用化・診断テストの穴埋め、spec_036 v0.20.4）、冗長な disown 削除の実測決着（verify→simplify、spec_037 v0.20.5）まで反映。v3 シリーズ 1/5 として「1晩1候補」制約の解除（top-K 直列、spec_038 v0.21.0）を投入 ── 既定 K=1 で v2 外形完全一致、operator opt-in で K=2..5 を直列処理。v3 シリーズ 2/5 として **FixLoop ── 収束ループ + 無進捗検知**（spec_039 v0.22.0）を投入 ── 既定 `loop_max_iterations=1` で v2 単発と外形完全一致、operator opt-in で 1..5 イテレーションを R5/R4/guard が green になるまで繰り返す（自己申告 promise でなく機械検証で完了判定）。v3 シリーズ 3/5 として **隔離の統一 ── auto モードの clone-and-patch 化と Integrator 導入**（spec_040 v0.23.0）を投入 ── auto モードも propose と同じ使い捨て隔離クローンで fix を実行し、live への書き込みは直列 Integrator のみが行う形に統一。v3 シリーズ 4/5 として **WorkerPool ── 複数 CC dispatch の並列化と直列 Integration queue**（spec_041 v0.24.0）を投入 ── K 候補を並列度 P (1..4) のワーカープールで処理し、完了 patch を直列 Integrator に投入。`max_merges_per_night` cap + PAUSE / 未push backlog / 夜間窓 wall-clock の 4 ゲートが integration 前に再評価され、trip した残 patch は退避。既定 P=1 で spec_038〜040 と外形完全一致。v3 シリーズ 5/5 として **v3 メトリクス + dashboard 表示 + ドキュメント同期**（spec_042 v0.25.0）を投入 ── `convergence_rate` / `iterations_to_green` / `marginal_parallel_yield` / `conflict_drop_rate` / `dispatch_minutes_per_merged_fix` を `ccd report` / `ccd dashboard` で表示。各指標に **母集団・観測限界の注記つき** で生存バイアス対策と同じ流儀。複数週の無人運用による実績作りはこれからの段階。「実装完了」と「運用できる」の差は埋まっていない、というのが現在地。
+
+**v3 の段階的有効化手順 (operator 向け)** ── spec を merge しても既定値は v2 互換なので何も変わらない。朝レポートを見ながら次の順で profile を刻む: (1) `safety.max_candidates_per_night = 2` で K を 2 に上げて「1 晩 2 候補・直列」を観察 → 朝レポート §B が複数候補小節を出す。問題なければ (2) `safety.loop_max_iterations = 3` で FixLoop を 3 反復まで許可し `iterations_to_green` 分布が 1 支配か 2-3 が出るかで「ループが価値を生んでいるか」を測る (`convergence_rate` も同時に観察)。最後に (3) `safety.parallelism = 2` で並列ワーカーを点火し `marginal_parallel_yield` で並列化が merge を増やしているかを実測 (増えていなければ無価値と数字が言う)。`dispatch_minutes_per_merged_fix` をコスト代理変数として横で追う。
 
 ## レイアウト
 

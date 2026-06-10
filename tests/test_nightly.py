@@ -30,7 +30,9 @@ from ccd.nightly import (
     FixDispatchOutcome,
     NightlyResult,
     SuiteOutcome,
+    build_night_snapshot,
     run_nightly,
+    save_night_snapshot,
 )
 from ccd.profile import (
     DiscoveryConfig,
@@ -5632,3 +5634,109 @@ def test_rate_limit_dispatch_failure_is_transient_for_fixloop(
     assert af.merged is True
     assert af.iterations == 2
     assert af.converged is True
+
+
+# --------------------------------------------------------------------------- #
+# spec_042 — per-night v3 snapshot persistence tests
+# --------------------------------------------------------------------------- #
+
+
+def _profile_for_snapshot_test() -> Profile:
+    """Minimal profile that exercises the snapshot writer path."""
+    return Profile(
+        discovery=DiscoveryConfig(channels=()),
+        safety=SafetyConfig(fix_mode="off"),
+        schedule=ScheduleConfig(),
+    )
+
+
+def test_build_night_snapshot_projects_v3_fields_from_nightly_result() -> None:
+    # Mix of skipped / merged / converged outcomes with per-worker
+    # timestamps + drop reasons to cover all fields.
+    primary = AutoFixOutcome(
+        skipped=False,
+        merged=True,
+        iterations=1,
+        converged=True,
+        worker_id="w1",
+        worker_started_at="2026-06-10T02:00:00+00:00",
+        worker_finished_at="2026-06-10T02:05:00+00:00",
+    )
+    extras = (
+        AutoFixOutcome(
+            skipped=False,
+            merged=False,
+            iterations=2,
+            converged=False,
+            worker_id="w2",
+            worker_started_at="2026-06-10T02:00:00+00:00",
+            worker_finished_at="2026-06-10T02:06:00+00:00",
+        ),
+        AutoFixOutcome(
+            skipped=True,
+            skip_reason="no candidates",
+        ),
+    )
+    result = NightlyResult(
+        success=True,
+        profile=_profile_for_snapshot_test(),
+        auto_fix=primary,
+        auto_fix_extras=extras,
+        parallelism=2,
+        achieved_max_concurrency=2,
+        drop_reasons=("backlog cap reached",),
+    )
+
+    snapshot = build_night_snapshot(result, night_id="2026-06-10")
+
+    # Two FixLoop starts (skip excluded), one convergence, one merge.
+    assert snapshot["night_id"] == "2026-06-10"
+    assert snapshot["fix_loop_starts"] == 2
+    assert snapshot["converged"] == 1
+    assert snapshot["iterations_to_green"] == [1]
+    assert snapshot["merges"] == 1
+    assert snapshot["parallelism"] == 2
+    assert snapshot["achieved_max_concurrency"] == 2
+    assert snapshot["drop_reasons"] == ["backlog cap reached"]
+    # Only outcomes with worker_id produce intervals; skip outcome (no
+    # worker_id) contributes nothing.
+    assert len(snapshot["worker_intervals"]) == 2
+    assert snapshot["worker_intervals"][0]["worker_id"] == "w1"
+    assert snapshot["worker_intervals"][0]["merged"] is True
+
+
+def test_save_night_snapshot_writes_deterministic_json(tmp_path) -> None:
+    result = NightlyResult(
+        success=True,
+        profile=_profile_for_snapshot_test(),
+        auto_fix=AutoFixOutcome(
+            skipped=False,
+            merged=True,
+            iterations=1,
+            converged=True,
+            worker_id="w1",
+            worker_started_at="2026-06-10T02:00:00+00:00",
+            worker_finished_at="2026-06-10T02:05:00+00:00",
+        ),
+        parallelism=1,
+        achieved_max_concurrency=1,
+        drop_reasons=(),
+    )
+
+    path = save_night_snapshot(
+        result,
+        night_id="2026-06-10",
+        record_dir=tmp_path,
+    )
+
+    assert path.exists()
+    assert path.name == "night_2026-06-10.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    # Round-trips through NightSnapshot without crashing (the same
+    # consumer the report / dashboard will use).
+    from ccd.metrics import NightSnapshot
+
+    snap = NightSnapshot.model_validate(payload)
+    assert snap.night_id == "2026-06-10"
+    assert snap.merges == 1
+    assert snap.fix_loop_starts == 1

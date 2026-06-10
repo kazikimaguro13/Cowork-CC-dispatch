@@ -542,6 +542,11 @@ def run_nightly(
     discover_dir: Path | None = None,
     brief_dir: Path | None = None,
     proposal_dir: Path | None = None,
+    # spec_042 — per-night v3 snapshot directory. ``None`` keeps the
+    # default ``<repo>/_ai_workspace/nightly/records/``. The sweep entry
+    # point passes a per-policy directory so client repos never see a
+    # write (mirrors the proposal_dir invariant).
+    record_dir: Path | None = None,
     # spec_030 — profile-driven adversarial parser injection +
     # synthetic channel-skip surfacing. ``adversarial_parsers`` is a
     # tuple of resolved adversarial parsers (see
@@ -757,7 +762,7 @@ def run_nightly(
         except OSError:
             windows_path = None
 
-    return NightlyResult(
+    nightly_result = NightlyResult(
         success=brief_result.success,
         profile=effective_profile,
         channels_run=tuple(channel_outcomes),
@@ -774,6 +779,26 @@ def run_nightly(
             night_drop_reasons if fix_mode == "auto" else ()
         ),
     )
+
+    # spec_042 — persist the v3 snapshot (best-effort; a write failure
+    # never blocks the nightly's overall success — the brief is the
+    # operator-facing artifact, the snapshot is the metric feedstock).
+    snapshot_root = (
+        Path(record_dir).resolve()
+        if record_dir is not None
+        else repo / _NIGHTLY_RECORDS_DIR_REL
+    )
+    night_id_str = (today if today is not None else _utc_today()).isoformat()
+    try:
+        save_night_snapshot(
+            nightly_result,
+            night_id=night_id_str,
+            record_dir=snapshot_root,
+        )
+    except OSError:
+        pass
+
+    return nightly_result
 
 
 # --------------------------------------------------------------------------- #
@@ -2324,6 +2349,14 @@ def _verify_iteration_auto(
 # step 4 / §6, ``_ai_workspace/nightly/proposals/`` is the recommended
 # location and the morning brief points the operator at this directory.
 _PROPOSAL_DIR_REL: Path = Path("_ai_workspace") / "nightly" / "proposals"
+
+# spec_042 — per-night JSON snapshot directory. One file per nightly
+# orchestration (``night_<date>.json``) carrying the v3 metric fields
+# (FixLoop start count, iterations_to_green, worker_intervals, drop_reasons,
+# total dispatch seconds). ``ccd report --v3`` / ``ccd dashboard`` consume
+# this directory. Per-policy sweeps redirect via ``record_dir`` so client
+# repos never receive a write.
+_NIGHTLY_RECORDS_DIR_REL: Path = Path("_ai_workspace") / "nightly" / "records"
 
 # Halt anchors specific to propose mode. Auto-mode anchors above stay
 # unchanged so spec_023〜026 tests keep matching their exact substrings.
@@ -4181,6 +4214,102 @@ def _utc_today() -> date:
     return datetime.now(UTC).date()
 
 
+# --------------------------------------------------------------------------- #
+# spec_042 — per-night v3 snapshot persistence
+# --------------------------------------------------------------------------- #
+
+
+def build_night_snapshot(
+    result: NightlyResult,
+    *,
+    night_id: str,
+) -> dict[str, Any]:
+    """Project :class:`NightlyResult` onto the v3 :class:`NightSnapshot` shape.
+
+    Returned as a plain dict so :func:`ccd.metrics.NightSnapshot.model_validate`
+    can consume it directly (or so callers can persist it as JSON without
+    importing the schema). The fields mirror ``ccd.metrics.NightSnapshot``:
+
+    - ``fix_loop_starts`` — outcomes that actually entered the FixLoop
+      (``skipped=False and iterations >= 1``). Skipped outcomes do not
+      count toward convergence_rate's denominator (生存バイアス対策,
+      spec_042 §2-1).
+    - ``converged`` / ``iterations_to_green`` — read from ``AutoFixOutcome``
+      (spec_039 fields).
+    - ``merges`` — outcomes with ``merged=True``.
+    - ``parallelism`` / ``achieved_max_concurrency`` / ``drop_reasons`` —
+      surfaced from :class:`NightlyResult` (spec_041 fields).
+    - ``worker_intervals`` — per-worker ISO-8601 timestamps (spec_041)
+      for outcomes that flowed through a WorkerPool (``worker_id``
+      populated). Outcomes without a worker_id contribute nothing — they
+      predate the WorkerPool or were skip outcomes.
+    """
+
+    outcomes: list[AutoFixOutcome] = []
+    if result.auto_fix is not None:
+        outcomes.append(result.auto_fix)
+    outcomes.extend(result.auto_fix_extras)
+
+    fix_loop_starts = sum(
+        1 for o in outcomes if not o.skipped and o.iterations >= 1
+    )
+    converged = sum(1 for o in outcomes if o.converged)
+    iterations_to_green = tuple(
+        o.iterations for o in outcomes if o.converged and o.iterations >= 1
+    )
+    merges = sum(1 for o in outcomes if o.merged)
+
+    intervals: list[dict[str, Any]] = []
+    for o in outcomes:
+        if not o.worker_id:
+            continue
+        intervals.append(
+            {
+                "worker_id": o.worker_id,
+                "started_at": o.worker_started_at,
+                "finished_at": o.worker_finished_at,
+                "merged": bool(o.merged),
+            }
+        )
+
+    return {
+        "night_id": night_id,
+        "fix_loop_starts": fix_loop_starts,
+        "converged": converged,
+        "iterations_to_green": list(iterations_to_green),
+        "merges": merges,
+        "parallelism": int(result.parallelism),
+        "achieved_max_concurrency": int(result.achieved_max_concurrency),
+        "drop_reasons": list(result.drop_reasons),
+        "worker_intervals": intervals,
+    }
+
+
+def save_night_snapshot(
+    result: NightlyResult,
+    *,
+    night_id: str,
+    record_dir: Path,
+) -> Path:
+    """Write :func:`build_night_snapshot` to ``<record_dir>/night_<id>.json``.
+
+    The file format is a single JSON object with the keys the v3
+    :class:`ccd.metrics.NightSnapshot` model expects. Writes are
+    idempotent — re-running on the same night overwrites the prior
+    snapshot (the snapshot represents the most recent run).
+    """
+
+    record_dir = Path(record_dir)
+    record_dir.mkdir(parents=True, exist_ok=True)
+    payload = build_night_snapshot(result, night_id=night_id)
+    out = record_dir / f"night_{night_id}.json"
+    out.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    return out
+
+
 __all__ = [
     "AdversarialRechecker",
     "AutoFixOutcome",
@@ -4197,5 +4326,7 @@ __all__ = [
     "SuiteOutcome",
     "SuiteRunner",
     "UnpushedCounter",
+    "build_night_snapshot",
     "run_nightly",
+    "save_night_snapshot",
 ]
