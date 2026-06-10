@@ -1527,3 +1527,99 @@ def test_safety_max_candidates_renders_in_profile_block(
     assert rc == 0
     out = capsys.readouterr().out
     assert "max_candidates_per_night = 1" in out
+
+
+# --------------------------------------------------------------------------- #
+# spec_039 — safety.loop_max_iterations
+# --------------------------------------------------------------------------- #
+
+
+def test_safety_default_loop_max_iterations_is_one() -> None:
+    """spec_039 §2-2 — default ``loop_max_iterations`` is 1, preserving
+    the spec_023〜038 single-shot dispatch behavior bit-for-bit."""
+
+    profile = Profile()
+
+    assert profile.safety.loop_max_iterations == 1
+
+
+def test_safety_loop_max_iterations_loaded_from_toml(tmp_path: Path) -> None:
+    """An operator opts into the convergence loop by writing
+    ``loop_max_iterations`` in ``[safety]`` — the loader surfaces it
+    without coercion."""
+
+    profile_path = tmp_path / "_ai_workspace" / "ccd_profile.toml"
+    profile_path.parent.mkdir(parents=True)
+    profile_path.write_text(
+        dedent(
+            """
+            [safety]
+            fix_mode = "auto"
+            loop_max_iterations = 3
+            """
+        ).strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    profile = load_profile(tmp_path)
+
+    assert profile.safety.loop_max_iterations == 3
+
+
+def test_safety_loop_max_iterations_zero_raises(tmp_path: Path) -> None:
+    """spec_039 §2-2 — ``loop_max_iterations`` must be in 1..5; 0 (the
+    loop never dispatches) loud-fails at load time."""
+
+    profile_path = tmp_path / "_ai_workspace" / "ccd_profile.toml"
+    profile_path.parent.mkdir(parents=True)
+    profile_path.write_text(
+        dedent(
+            """
+            [safety]
+            loop_max_iterations = 0
+            """
+        ).strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError) as excinfo:
+        load_profile(tmp_path)
+    assert "loop_max_iterations" in str(excinfo.value)
+
+
+def test_safety_loop_max_iterations_too_high_raises(tmp_path: Path) -> None:
+    """spec_039 §2-2 — ``loop_max_iterations`` must be in 1..5; 6 (well
+    past the 40-min per-candidate budget) loud-fails at load time."""
+
+    profile_path = tmp_path / "_ai_workspace" / "ccd_profile.toml"
+    profile_path.parent.mkdir(parents=True)
+    profile_path.write_text(
+        dedent(
+            """
+            [safety]
+            loop_max_iterations = 6
+            """
+        ).strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError) as excinfo:
+        load_profile(tmp_path)
+    assert "loop_max_iterations" in str(excinfo.value)
+
+
+def test_safety_loop_max_iterations_renders_in_profile_block(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """``ccd profile`` surfaces ``loop_max_iterations`` in the
+    TOML-shaped render so an operator can see the effective value."""
+
+    rc = cli.main(["profile", "--repo", str(tmp_path)])
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "loop_max_iterations = 1" in out

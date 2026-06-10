@@ -2,6 +2,63 @@
 
 本プロジェクトの注目すべき変更を記録する。フォーマットは [Keep a Changelog](https://keepachangelog.com/) に準ずる。
 
+## [0.22.0] — 2026-06-10
+
+### Added
+
+- spec_039: **FixLoop ── 収束ループ (ralph 型外側ループ + 無進捗検知)**。
+  夜間 fix の dispatch を「単発 + 検証」から「**検証が green になるまで反復する
+  収束ループ**」に昇格。ralph loop の思想（完了条件を満たすまで同じ仕事に戻し
+  続ける）だけを借り、完了判定は自己申告ではなく **R5/R4/guard の機械検証**に
+  置く。**既定 `loop_max_iterations=1` で v2 (spec_023〜038) と外形完全一致**。
+- 新モジュール `ccd/loop.py` ── `run_fix_loop`、`FixLoopOutcome`、
+  `IterationVerification` と halt anchor 定数群（`LOOP_HALT_MAX_ITERATIONS` /
+  `LOOP_HALT_BUDGET` / `LOOP_HALT_NO_PROGRESS` / `LOOP_HALT_IMMEDIATE`）。
+  per-iteration の dispatch + verify を `max_iterations` だけ回し、green / 予算
+  超過 / 無進捗 / 即 halt カテゴリのいずれかで停止。
+- `ccd/profile.py` `SafetyConfig.loop_max_iterations: int = 1`（範囲 1..5、
+  validator `_loop_iterations_in_range` で loud-fail）。`render_profile` も
+  新フィールドを TOML-shaped 出力に反映。
+- `ccd/nightly.py` `AutoFixOutcome` ── 新フィールド `iterations: int = 0` /
+  `converged: bool = False` / `loop_halt_reason: str = ""`。後段（spec_042）が
+  夜間 record JSON から集計できる形で永続化。
+- `ccd/retry.py` `dispatch_with_retry` ── `initial_feedback: Path | None = None`
+  キーワードを追加（FixLoop が convergence loop の feedback 入口として使用）。
+  既存呼び出しは default `None` のまま変化なし。
+- `ccd/retry.py` `is_failure_immediate_halt()` ── 公開ヘルパ関数。
+  retry.py の `_HALT_ON_CATEGORIES` + BLOCKED 判定を loop.py と共有することで、
+  chain-side smoke-retry と nightly-side 収束ループの「即 halt」境界を一元化。
+- 新規 pytest 21 件（loop 10 + nightly 6 + profile 5）── 1 回失敗→2 回目 green
+  で converged=True / iterations=2、毎回同一シグネチャ fail で iter 3 開始前
+  に halt、wall-clock 予算超過で `LOOP_HALT_BUDGET`、`blocked` / `environment`
+  カテゴリで 1 回 halt、`smoke_failed` は retryable で feedback 経由でループ続行、
+  デフォルト K=1 / iter=1 brief に `収束:` / `未収束:` 行が出ないこと、を pin。
+
+### Changed
+
+- `ccd/nightly.py` `_process_one_auto_fix_candidate` /
+  `_process_one_propose_candidate` ── dispatch + R5 + R4 + guard の per-iteration
+  ロジックを :func:`ccd.loop.run_fix_loop` 経由に置換。verifier closure に R5
+  (`_verify_r5`) / R4 (suite runner) / guard (inspector + diff capture) を注入し、
+  FixLoop は IterationVerification の green を基に converged を判定。新ヘルパ
+  `_verify_iteration_auto` を切り出して auto / propose 両モードで verifier 内部
+  を共有。
+- `ccd/nightly.py` `_run_auto_fix_loop` / `_run_propose_loop` ── 新キーワード
+  `loop_max_iterations: int = 1` を追加し `_process_one_*_candidate` に流す。
+  `run_nightly` が `profile.safety.loop_max_iterations` を読み取って配線。
+- `ccd/nightly.py` `_build_default_fix_dispatcher` ── 内部 `_dispatcher` に
+  `feedback: Path | None = None` キーワードを追加し `dispatch_with_retry` の
+  `initial_feedback=` に転送。`loop_max_iterations=1` では feedback は常に None
+  なので v2 prompt shape は完全に維持。
+- `ccd/brief.py` ── §B の auto Phase 2 / propose / per-candidate subsection に
+  `_format_fix_loop_summary(auto_fix)` を呼ぶ 1 行追加（"- 収束: N iterations" /
+  "- 未収束: N iterations (無進捗検知で halt)"）。**iter=1 + converged では行を
+  抑制** ── v2 デフォルト profile の朝レポートは見た目不変。
+- `README.md` / `docs/DESIGN.md §9` ── テスト数 `645` → `666`、version 表記、
+  spec 範囲を `spec_013〜039` に同期。
+- `pyproject.toml` / `ccd/__init__.py` / `tests/test_smoke.py` ── `0.21.0` → `0.22.0`
+  (minor bump — 新フィールド / 新 FixLoop モジュール / 新 brief 行)。
+
 ## [0.21.0] — 2026-06-10
 
 ### Added

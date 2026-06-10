@@ -67,12 +67,20 @@ def dispatch_with_retry(
     max_attempts: int = 1,
     smoke_commands: Sequence[Sequence[str]] = DEFAULT_SMOKE_COMMANDS,
     feedback_dir: Path | None = None,
+    initial_feedback: Path | None = None,
 ) -> DispatchRecord:
     """Run ``dispatch_one`` + smoke up to ``max_attempts`` times with feedback.
 
     The library-default ``max_attempts=1`` reproduces single-shot behavior
     (no retry) — callers (`run_chain`, `_cmd_dispatch`) opt in by passing
     a larger value. The CLI's ``--max-attempts`` default is 3.
+
+    spec_039: ``initial_feedback`` lets an outer convergence loop
+    (:func:`ccd.loop.run_fix_loop`) inject a pre-existing feedback
+    Markdown into the very first attempt's prompt. This is how the
+    nightly fix-loop forwards R5/R4/guard feedback into a re-dispatch
+    when ``loop_max_iterations > 1``. Default ``None`` preserves the
+    pre-spec_039 behavior bit-for-bit (no input feedback on attempt 1).
     """
 
     repo = Path(repo)
@@ -87,7 +95,7 @@ def dispatch_with_retry(
 
     first_started_at: datetime | None = None
     last_record: DispatchRecord | None = None
-    feedback_path_for_next: Path | None = None
+    feedback_path_for_next: Path | None = initial_feedback
 
     for attempt in range(1, max_attempts + 1):
         attempt_started_at = datetime.now(UTC)
@@ -162,6 +170,37 @@ def _is_retryable(record: DispatchRecord) -> bool:
     if cat in _HALT_ON_CATEGORIES:
         return False
     return cat in _RETRYABLE_CATEGORIES
+
+
+def is_failure_immediate_halt(
+    *,
+    failure_category: FailureCategory | None,
+    blocked: bool = False,
+) -> bool:
+    """spec_039 — public version of :func:`_is_retryable`'s halt branch.
+
+    Returns True iff the failure should halt an outer loop **immediately**
+    (no further retries, no feedback writing). Used by both
+    :func:`dispatch_with_retry` (here in retry.py) and
+    :func:`ccd.loop.run_fix_loop` so the chain-side smoke-retry and the
+    nightly-side convergence loop share the same "give up" boundary —
+    a single rename here re-classifies in both places.
+
+    Inputs:
+
+    - ``failure_category`` — the dispatch's failure category (or None
+      if unclassified). None never halts immediately (the loop should
+      keep trying).
+    - ``blocked`` — whether the dispatch's status was ``BLOCKED``.
+      BLOCKED is treated as immediate halt regardless of category
+      (the spec_010 contract: BLOCKED means "agent gave up explicitly").
+    """
+
+    if blocked:
+        return True
+    if failure_category is None:
+        return False
+    return failure_category in _HALT_ON_CATEGORIES
 
 
 def _timeout_record(spec_id: str, *, started_at: datetime) -> DispatchRecord:

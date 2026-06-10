@@ -140,6 +140,13 @@ from ccd.discover import (
     run_discovery,
 )
 from ccd.guard import GuardResult, inspect_diff
+from ccd.loop import (
+    LOOP_HALT_IMMEDIATE,
+    LOOP_HALT_MAX_ITERATIONS,
+    FixLoopOutcome,
+    IterationVerification,
+    run_fix_loop,
+)
 from ccd.profile import Profile, effective_mutation_config, load_profile
 from ccd.protocol import parse_spec
 from ccd.translate import Finding, translate_finding
@@ -392,6 +399,21 @@ class AutoFixOutcome:
     proposed: bool = False
     proposal_patch_path: Path | None = None
     proposal_diff: str = ""
+    # spec_039 — FixLoop telemetry. ``iterations`` counts how many
+    # dispatch attempts the convergence loop made (0 for skipped
+    # candidates, ≥ 1 once the loop body started). ``converged`` is
+    # True iff the LAST iteration's R5/R4/guard verification was all
+    # green. ``loop_halt_reason`` carries the structural reason the
+    # loop ended when it did NOT converge — one of the LOOP_HALT_*
+    # anchors from :mod:`ccd.loop`. At the default
+    # ``loop_max_iterations=1`` this collapses to ``iterations=1`` and
+    # ``converged`` mirrors whether the single iteration was green,
+    # keeping the v2 dispatch count + brief layout bit-for-bit
+    # identical (spec_039 §3-1). spec_042 consumes these fields for
+    # the convergence dashboard.
+    iterations: int = 0
+    converged: bool = False
+    loop_halt_reason: str = ""
 
 
 @dataclass
@@ -586,6 +608,9 @@ def run_nightly(
     # spec_038 — per-night candidate cap (K). Default K=1 keeps the
     # spec_023〜026 single-candidate behavior bit-for-bit.
     max_k = int(effective_profile.safety.max_candidates_per_night)
+    # spec_039 — per-candidate FixLoop iteration cap. Default 1 keeps
+    # the spec_023〜038 single-shot behavior bit-for-bit.
+    loop_max_iters = int(effective_profile.safety.loop_max_iterations)
     if fix_mode == "auto":
         auto_fix, auto_fix_extras = _run_auto_fix_loop(
             repo=repo,
@@ -612,6 +637,7 @@ def run_nightly(
                 else _AUTO_FIX_DISPATCH_TIMEOUT_S
             ),
             max_candidates=max_k,
+            loop_max_iterations=loop_max_iters,
         )
     elif fix_mode == "propose":
         auto_fix, auto_fix_extras = _run_propose_loop(
@@ -641,6 +667,7 @@ def run_nightly(
             ),
             proposal_dir=proposal_dir,
             max_candidates=max_k,
+            loop_max_iterations=loop_max_iters,
         )
 
     brief_result = run_brief_fn(
@@ -892,6 +919,7 @@ def _run_auto_fix_loop(
     unpushed_backlog_limit: int,
     dispatch_timeout_s: float,
     max_candidates: int = 1,
+    loop_max_iterations: int = 1,
 ) -> tuple[AutoFixOutcome, tuple[AutoFixOutcome, ...]]:
     """Drive the autonomous-fix loop for up to ``max_candidates``
     candidates in series (spec_023 §2-1〜§2-4 + spec_024 + spec_025
@@ -1044,6 +1072,7 @@ def _run_auto_fix_loop(
                 recheck_adversarial=recheck_adversarial,
                 inspect=inspect,
                 dispatch_timeout_s=dispatch_timeout_s,
+                loop_max_iterations=loop_max_iterations,
             )
         )
 
@@ -1067,13 +1096,18 @@ def _process_one_auto_fix_candidate(
     recheck_adversarial: AdversarialRechecker,
     inspect: GuardInspector,
     dispatch_timeout_s: float,
+    loop_max_iterations: int = 1,
 ) -> AutoFixOutcome:
-    """spec_038 §2-3 — per-candidate body extracted from spec_023's
-    monolithic loop, so the K-candidate driver can reuse it verbatim.
+    """spec_038 §2-3 — per-candidate body, extended by spec_039 §2-3
+    to drive the convergence loop instead of a single dispatch+verify.
 
-    The 8-step flow (translate → branch → dispatch → R5 → R4 → guard →
-    decide → restore) is unchanged from spec_023〜026; only the surrounding
-    "single-pass vs K-pass" frame moved out.
+    The 8-step flow (translate → branch → run-fix-loop[ dispatch → R5 →
+    R4 → guard, repeat until green or halt] → decide → restore) is the
+    same skeleton as spec_023〜026 with the middle replaced by
+    :func:`ccd.loop.run_fix_loop`. At the default
+    ``loop_max_iterations=1`` the FixLoop runs exactly one iteration so
+    dispatch count / brief layout / record外形 stay bit-for-bit
+    identical to spec_023〜038.
     """
 
     # 1. Translate
@@ -1122,14 +1156,34 @@ def _process_one_auto_fix_candidate(
             halt_reason=f"branch creation failed: {type(exc).__name__}: {exc}",
         )
 
-    # 3. Dispatch the fix (spec_025 §2-1(a): wall-clock bounded).
+    # 3. Build the per-iteration verifier — closes over the per-candidate
+    # template / finding / R5+R4+guard seams so FixLoop only deals in
+    # opaque IterationVerification objects.
+    def _verifier(*, repo: Path, branch: str) -> IterationVerification:
+        return _verify_iteration_auto(
+            template=template,
+            finding=finding,
+            allowed_files=allowed_files,
+            repo=repo,
+            branch=branch,
+            gops=gops,
+            run_suite=run_suite,
+            recheck_mutation=recheck_mutation,
+            recheck_adversarial=recheck_adversarial,
+            inspect=inspect,
+        )
+
+    # 4. Run the spec_039 convergence loop.
     try:
-        dispatch_outcome = _dispatch_with_timeout(
-            dispatcher=dispatcher,
+        fl: FixLoopOutcome = run_fix_loop(
             spec_path=tr.spec_auto_path,
             repo=repo,
             branch=branch,
-            timeout_s=dispatch_timeout_s,
+            dispatcher=dispatcher,
+            verifier=_verifier,
+            max_iterations=loop_max_iterations,
+            wall_clock_budget_s=dispatch_timeout_s,
+            spec_id=tr.spec_auto_id,
         )
     except Exception as exc:
         _restore_repo_after_halt(gops=gops, repo=repo, branch=branch)
@@ -1146,13 +1200,22 @@ def _process_one_auto_fix_candidate(
                 f"{_HALT_DISPATCH_FAILED}: "
                 f"{type(exc).__name__}: {exc}".strip()
             ),
+            iterations=0,
+            converged=False,
+            loop_halt_reason=LOOP_HALT_IMMEDIATE,
         )
 
-    dispatch_status = dispatch_outcome.status
-    dispatch_ok = dispatch_status == "done"
-    if not dispatch_ok:
+    verif = fl.final_verification
+
+    # 5a. Dispatch failed entirely (verifier never ran) → halt.
+    if verif is None:
         _restore_repo_after_halt(gops=gops, repo=repo, branch=branch)
-        reason = dispatch_outcome.halt_reason or _HALT_DISPATCH_FAILED
+        dispatch_status = fl.final_dispatch_status or "failed"
+        reason = (
+            fl.final_dispatch_halt_reason
+            or fl.halt_reason
+            or _HALT_DISPATCH_FAILED
+        )
         return AutoFixOutcome(
             skipped=False,
             spec_auto_id=tr.spec_auto_id,
@@ -1161,48 +1224,24 @@ def _process_one_auto_fix_candidate(
             candidate_count=candidate_count,
             template=template,
             branch=branch,
-            dispatched=True,
+            dispatched=fl.final_dispatched,
             dispatch_status=dispatch_status,
             halt_reason=f"{_HALT_DISPATCH_FAILED}: {reason}",
+            iterations=fl.iterations,
+            converged=False,
+            loop_halt_reason=fl.halt_reason,
         )
 
-    # 4. R5: template-specific verification
-    r5_killed, r5_status = _verify_r5(
-        template=template,
-        finding=finding,
-        recheck_mutation=recheck_mutation,
-        recheck_adversarial=recheck_adversarial,
-        repo=repo,
-    )
+    # 5b. Decide: merge if converged, else halt with per-gate reason.
+    r5_killed = verif.r5_passed
+    r4_passed = verif.r4_passed
+    guard_passed = verif.guard_passed
+    guard_reasons = verif.guard_reasons
+    diff_text = verif.diff
 
-    # 5. R4: full suite green?
-    try:
-        suite_outcome = run_suite(repo=repo)
-        r4_passed = bool(suite_outcome.passed)
-    except Exception:
-        r4_passed = False
-
-    # 6. Guard
-    diff_text = ""
-    try:
-        diff_text = gops.diff(repo=repo, base="main", head=branch)
-        guard_result = inspect(
-            diff=diff_text,
-            allowed_files=allowed_files,
-            template=template,
-        )
-        guard_passed = bool(guard_result.passed)
-        guard_reasons = tuple(guard_result.halt_reasons)
-    except Exception as exc:
-        guard_passed = False
-        guard_reasons = (
-            f"guard inspection failed: {type(exc).__name__}: {exc}",
-        )
-
-    # 7. Decide: merge or halt
     merged = False
     halt_reason = ""
-    if r5_killed and r4_passed and guard_passed:
+    if fl.converged:
         try:
             gops.merge_branch_into_main(repo=repo, branch=branch)
             merged = True
@@ -1214,11 +1253,29 @@ def _process_one_auto_fix_candidate(
         halt_reason = _compose_halt_reason(
             template=template,
             r5_killed=r5_killed,
-            r5_status=r5_status,
+            r5_status=verif.r5_status,
             r4_passed=r4_passed,
             guard_passed=guard_passed,
             guard_reasons=guard_reasons,
         )
+        # Annotate the halt reason with the loop's structural cause when
+        # it isn't the trivial "max iterations of 1 exhausted" — the
+        # latter is implied by loop_max_iterations=1 and would be noise.
+        if (
+            fl.halt_reason
+            and fl.halt_reason != LOOP_HALT_MAX_ITERATIONS
+            and loop_max_iterations > 1
+        ):
+            halt_reason = f"{halt_reason} [{fl.halt_reason}]"
+        elif (
+            fl.halt_reason
+            and fl.halt_reason == LOOP_HALT_MAX_ITERATIONS
+            and loop_max_iterations > 1
+        ):
+            halt_reason = (
+                f"{halt_reason} [fix-loop exhausted "
+                f"{loop_max_iterations} iterations]"
+            )
 
     # spec_026 §2-2 — every HALT path restores the repo to its pre-run
     # state (discard uncommitted edits → main → delete auto branch);
@@ -1244,7 +1301,7 @@ def _process_one_auto_fix_candidate(
         template=template,
         branch=branch,
         dispatched=True,
-        dispatch_status=dispatch_status,
+        dispatch_status=fl.final_dispatch_status,
         r5_killed=r5_killed,
         r4_suite_passed=r4_passed,
         guard_passed=guard_passed,
@@ -1252,6 +1309,77 @@ def _process_one_auto_fix_candidate(
         merged=merged,
         halt_reason=halt_reason,
         merge_diff=surfaced_diff,
+        iterations=fl.iterations,
+        converged=fl.converged,
+        loop_halt_reason=fl.halt_reason,
+    )
+
+
+def _verify_iteration_auto(
+    *,
+    template: str,
+    finding: Finding,
+    allowed_files: list[str],
+    repo: Path,
+    branch: str,
+    gops: GitOps,
+    run_suite: SuiteRunner,
+    recheck_mutation: MutationRechecker,
+    recheck_adversarial: AdversarialRechecker,
+    inspect: GuardInspector,
+) -> IterationVerification:
+    """Run R5 + R4 + guard for a single iteration in auto mode.
+
+    Extracted so the propose loop and the auto loop share the same
+    verifier internals, and so tests can spot-check one iteration
+    without mounting the whole FixLoop.
+
+    Exception handling mirrors the pre-spec_039 inline flow: R5 inside
+    :func:`_verify_r5` already absorbs rechecker exceptions; R4 / guard
+    do their own try/except so a single misbehaving seam degrades to
+    "this iteration failed" rather than propagating out of FixLoop.
+    """
+
+    r5_passed, r5_status = _verify_r5(
+        template=template,
+        finding=finding,
+        recheck_mutation=recheck_mutation,
+        recheck_adversarial=recheck_adversarial,
+        repo=repo,
+    )
+
+    try:
+        suite_outcome = run_suite(repo=repo)
+        r4_passed = bool(suite_outcome.passed)
+        suite_output = str(getattr(suite_outcome, "output", "") or "")
+    except Exception:
+        r4_passed = False
+        suite_output = ""
+
+    diff_text = ""
+    try:
+        diff_text = gops.diff(repo=repo, base="main", head=branch)
+        guard_result = inspect(
+            diff=diff_text,
+            allowed_files=allowed_files,
+            template=template,
+        )
+        guard_passed = bool(guard_result.passed)
+        guard_reasons: tuple[str, ...] = tuple(guard_result.halt_reasons)
+    except Exception as exc:
+        guard_passed = False
+        guard_reasons = (
+            f"guard inspection failed: {type(exc).__name__}: {exc}",
+        )
+
+    return IterationVerification(
+        r5_passed=r5_passed,
+        r4_passed=r4_passed,
+        guard_passed=guard_passed,
+        r5_status=r5_status,
+        guard_reasons=guard_reasons,
+        diff=diff_text,
+        suite_output=suite_output,
     )
 
 
@@ -1313,6 +1441,7 @@ def _run_propose_loop(
     dispatch_timeout_s: float,
     proposal_dir: Path | None = None,
     max_candidates: int = 1,
+    loop_max_iterations: int = 1,
 ) -> tuple[AutoFixOutcome, tuple[AutoFixOutcome, ...]]:
     """Drive the propose-mode loop for up to ``max_candidates``
     candidates in series (spec_028 §2-2 + spec_038 top-K extension).
@@ -1478,6 +1607,7 @@ def _run_propose_loop(
                 workspace_factory=workspace_factory,
                 dispatch_timeout_s=dispatch_timeout_s,
                 proposal_dir=proposal_dir,
+                loop_max_iterations=loop_max_iterations,
             )
         )
 
@@ -1503,14 +1633,18 @@ def _process_one_propose_candidate(
     workspace_factory: IsolatedWorkspace,
     dispatch_timeout_s: float,
     proposal_dir: Path | None,
+    loop_max_iterations: int = 1,
 ) -> AutoFixOutcome:
-    """spec_038 §2-3 — per-candidate body extracted from spec_028's
-    monolithic propose loop, so the K-candidate driver can reuse it
-    verbatim.
+    """spec_038 §2-3 — per-candidate body, extended by spec_039 §2-3 to
+    run the dispatch + verify cycle through :func:`ccd.loop.run_fix_loop`
+    inside the disposable clone.
 
     Translates against the LIVE repo (the spec_auto.md is the audit
     artifact for both auto and propose modes), then runs all the
-    write-bearing steps inside a fresh disposable clone.
+    write-bearing steps — including the convergence loop's feedback
+    files — inside the fresh disposable clone. At
+    ``loop_max_iterations=1`` the loop dispatches exactly once and the
+    spec_028 propose semantics carry through unchanged.
     """
 
     # 1. Translate against the LIVE repo.
@@ -1566,13 +1700,37 @@ def _process_one_propose_candidate(
                     ),
                 )
 
+            # spec_039 — build the iteration verifier closure and run
+            # the convergence loop inside the clone. The verifier
+            # mirrors the auto-mode one; ``repo`` it receives is the
+            # clone path.
+            def _verifier(
+                *, repo: Path, branch: str
+            ) -> IterationVerification:
+                return _verify_iteration_auto(
+                    template=template,
+                    finding=finding,
+                    allowed_files=allowed_files,
+                    repo=repo,
+                    branch=branch,
+                    gops=gops,
+                    run_suite=run_suite,
+                    recheck_mutation=recheck_mutation,
+                    recheck_adversarial=recheck_adversarial,
+                    inspect=inspect,
+                )
+
             try:
-                dispatch_outcome = _dispatch_with_timeout(
-                    dispatcher=dispatcher,
+                fl: FixLoopOutcome = run_fix_loop(
                     spec_path=spec_auto_in_clone,
                     repo=clone_path,
                     branch=branch,
-                    timeout_s=dispatch_timeout_s,
+                    dispatcher=dispatcher,
+                    verifier=_verifier,
+                    max_iterations=loop_max_iterations,
+                    wall_clock_budget_s=dispatch_timeout_s,
+                    feedback_dir=clone_path / "_ai_workspace" / "logs",
+                    spec_id=tr.spec_auto_id,
                 )
             except Exception as exc:
                 return _propose_halt_outcome(
@@ -1587,64 +1745,53 @@ def _process_one_propose_candidate(
                     ),
                 )
 
-            dispatch_status = dispatch_outcome.status
-            if dispatch_status != "done":
-                reason = dispatch_outcome.halt_reason or "no reason"
-                return _propose_halt_outcome(
+            dispatch_status = fl.final_dispatch_status
+            verif = fl.final_verification
+
+            # 5a. Dispatch failed entirely → propose HALT outcome.
+            if verif is None:
+                reason = (
+                    fl.final_dispatch_halt_reason
+                    or fl.halt_reason
+                    or "no reason"
+                )
+                halt_outcome = _propose_halt_outcome(
                     template=template,
                     finding=finding,
                     tr=tr,
                     candidate_count=candidate_count,
                     branch=branch,
-                    dispatched=True,
-                    dispatch_status=dispatch_status,
+                    dispatched=fl.final_dispatched,
+                    dispatch_status=dispatch_status or "failed",
                     halt_reason=f"{_HALT_PROPOSE_DISPATCH_FAILED}: {reason}",
                 )
-
-            # 3. R5 — same verifier as auto, but pointed at the clone.
-            r5_killed, _r5_status = _verify_r5(
-                template=template,
-                finding=finding,
-                recheck_mutation=recheck_mutation,
-                recheck_adversarial=recheck_adversarial,
-                repo=clone_path,
-            )
-
-            # 4. R4 — full suite green in the clone.
-            try:
-                suite_outcome = run_suite(repo=clone_path)
-                r4_passed = bool(suite_outcome.passed)
-            except Exception:
-                r4_passed = False
-
-            # 5. Guard — capture the diff against ``main`` in the clone,
-            # then run the same inspector auto mode uses.
-            diff_text = ""
-            try:
-                diff_text = gops.diff(
-                    repo=clone_path, base="main", head=branch
-                )
-                guard_result = inspect(
-                    diff=diff_text,
-                    allowed_files=allowed_files,
-                    template=template,
-                )
-                guard_passed = bool(guard_result.passed)
-                guard_reasons = tuple(guard_result.halt_reasons)
-            except Exception as exc:
-                guard_passed = False
-                guard_reasons = (
-                    f"guard inspection failed: {type(exc).__name__}: {exc}",
+                return _attach_loop_meta(
+                    outcome=halt_outcome,
+                    iterations=fl.iterations,
+                    converged=False,
+                    loop_halt_reason=fl.halt_reason,
                 )
 
-            # 6. Decide: propose the diff or HALT (no patch saved).
-            if not (r5_killed and r4_passed and guard_passed):
+            r5_killed = verif.r5_passed
+            r4_passed = verif.r4_passed
+            guard_passed = verif.guard_passed
+            guard_reasons = verif.guard_reasons
+            diff_text = verif.diff
+
+            # 5b. Verification rejected → propose HALT (no patch saved).
+            if not fl.converged:
                 halt_reason = _compose_propose_halt_reason(
                     r5_killed=r5_killed,
                     r4_passed=r4_passed,
                     guard_passed=guard_passed,
                     guard_reasons=guard_reasons,
                 )
+                if (
+                    fl.halt_reason
+                    and fl.halt_reason != LOOP_HALT_MAX_ITERATIONS
+                    and loop_max_iterations > 1
+                ):
+                    halt_reason = f"{halt_reason} [{fl.halt_reason}]"
                 return AutoFixOutcome(
                     skipped=False,
                     spec_auto_id=tr.spec_auto_id,
@@ -1663,6 +1810,9 @@ def _process_one_propose_candidate(
                     halt_reason=halt_reason,
                     mode="propose",
                     proposed=False,
+                    iterations=fl.iterations,
+                    converged=False,
+                    loop_halt_reason=fl.halt_reason,
                 )
 
             # 7. Diff must be non-empty — a "verified proposal" with no
@@ -1687,6 +1837,9 @@ def _process_one_propose_candidate(
                     halt_reason=_HALT_PROPOSE_NO_DIFF,
                     mode="propose",
                     proposed=False,
+                    iterations=fl.iterations,
+                    converged=False,
+                    loop_halt_reason=fl.halt_reason,
                 )
 
             # 8. Save the patch — the only live-repo write of propose
@@ -1720,6 +1873,9 @@ def _process_one_propose_candidate(
                 proposed=True,
                 proposal_patch_path=patch_path,
                 proposal_diff=diff_text,
+                iterations=fl.iterations,
+                converged=True,
+                loop_halt_reason="",
             )
     except Exception as exc:
         return _propose_halt_outcome(
@@ -1733,6 +1889,32 @@ def _process_one_propose_candidate(
                 f"{type(exc).__name__}: {exc}"
             ),
         )
+
+
+def _attach_loop_meta(
+    *,
+    outcome: AutoFixOutcome,
+    iterations: int,
+    converged: bool,
+    loop_halt_reason: str,
+) -> AutoFixOutcome:
+    """Return a copy of ``outcome`` with the spec_039 loop telemetry set.
+
+    Convenience helper: :class:`AutoFixOutcome` is a frozen dataclass,
+    so we rebuild via :func:`dataclasses.replace`. Used by propose-mode
+    halt paths (where the helper :func:`_propose_halt_outcome` is
+    already loop-unaware) to fold in the FixLoop telemetry without
+    touching the helper's signature.
+    """
+
+    from dataclasses import replace
+
+    return replace(
+        outcome,
+        iterations=iterations,
+        converged=converged,
+        loop_halt_reason=loop_halt_reason,
+    )
 
 
 def _copy_spec_auto_into_clone(
@@ -2365,9 +2547,21 @@ def _build_default_fix_dispatcher(
         spec_path: Path,
         repo: Path,
         branch: str,  # noqa: ARG001 — branch is implicit (already checked out)
+        feedback: Path | None = None,
     ) -> FixDispatchOutcome:
+        # spec_039 — ``feedback`` (when set by the convergence loop) is
+        # forwarded as ``initial_feedback`` so the next attempt's
+        # ``dispatch_one`` embeds it in the agent prompt verbatim. At
+        # ``loop_max_iterations=1`` no feedback is ever supplied,
+        # preserving v2 prompt shape bit-for-bit.
         spec = parse_spec(spec_path)
-        record = dispatch_with_retry(spec, runner, repo=repo, max_attempts=1)
+        record = dispatch_with_retry(
+            spec,
+            runner,
+            repo=repo,
+            max_attempts=1,
+            initial_feedback=feedback,
+        )
         return FixDispatchOutcome(
             status=record.status.value,
             halt_reason=(

@@ -4182,3 +4182,325 @@ def test_propose_k3_backlog_cap_between_candidates_skips_remainder(
     assert "2 件" in skip.skip_reason
     # The counter was consulted at least once between candidates.
     assert len(counter_calls) >= 1
+
+
+# --------------------------------------------------------------------------- #
+# spec_039 — FixLoop integration (nightly side)
+# --------------------------------------------------------------------------- #
+
+
+def _autofix_profile_loop(*, iterations: int) -> Profile:
+    """spec_039 — auto-mode profile with ``loop_max_iterations`` set."""
+
+    return Profile(
+        discovery=DiscoveryConfig(channels=["mutation"]),
+        schedule=ScheduleConfig(),
+        safety=SafetyConfig(
+            fix_mode="auto",
+            loop_max_iterations=iterations,
+        ),
+    )
+
+
+@dataclass
+class _ScriptedAutoDispatcher:
+    """Like ``_FakeFixDispatcher`` but returns canned outcomes in turn AND
+    accepts the spec_039 ``feedback=`` kwarg."""
+
+    outcomes: list[FixDispatchOutcome] = field(
+        default_factory=lambda: [
+            FixDispatchOutcome(status="done", commits_made=1)
+        ]
+    )
+    calls: list[dict[str, Any]] = field(default_factory=list)
+
+    def __call__(
+        self,
+        *,
+        spec_path: Path,
+        repo: Path,
+        branch: str,
+        feedback: Path | None = None,
+    ) -> FixDispatchOutcome:
+        self.calls.append(
+            {
+                "spec_path": Path(spec_path),
+                "repo": Path(repo),
+                "branch": branch,
+                "feedback": feedback,
+            }
+        )
+        idx = min(len(self.calls), len(self.outcomes)) - 1
+        return self.outcomes[idx]
+
+
+@dataclass
+class _StatefulMutationRechecker:
+    """Returns the next status string from ``sequence`` each call.
+
+    Used to simulate "1st iter R5 fail → 2nd iter R5 pass" — the loop's
+    convergence path drives the rechecker once per iteration; we feed
+    different statuses to verify the loop iterated.
+    """
+
+    sequence: list[str] = field(default_factory=lambda: ["killed"])
+    calls: list[tuple[str, int, str]] = field(default_factory=list)
+
+    def __call__(
+        self,
+        *,
+        repo: Path,  # noqa: ARG002
+        file: str,
+        line: int,
+        mutation: str,  # noqa: ARG002
+        signature: str,
+    ) -> str:
+        self.calls.append((file, line, signature))
+        idx = min(len(self.calls), len(self.sequence)) - 1
+        return self.sequence[idx]
+
+
+def test_default_loop_max_iterations_is_one(tmp_path: Path) -> None:
+    """spec_039 §3-1 — default profile keeps ``loop_max_iterations=1``,
+    so the FixLoop wraps a single dispatch+verify with no behavioral
+    change relative to spec_023〜038."""
+
+    _write_mutation_discover_json(repo=tmp_path)
+    dispatcher = _FakeFixDispatcher()
+    suite = _FakeSuiteRunner()
+    recheck = _FakeMutationRechecker(status="killed")
+    guard = _FakeGuardInspector()
+    gops = _FakeGitOps(canned_diff="diff --git a/tests/x.py b/tests/x.py\n")
+    brief_runner, _ = _make_fake_brief_runner()
+
+    result = run_nightly(
+        repo=tmp_path,
+        # plain auto profile = default loop_max_iterations
+        profile=_autofix_profile(autonomous=True),
+        channel_runner=_RecordingChannelRunner(),
+        brief_runner=brief_runner,
+        windows_mirror=lambda _p: None,
+        fix_dispatcher=dispatcher,
+        suite_runner=suite,
+        mutation_rechecker=recheck,
+        guard_inspector=guard,
+        git_ops=gops,
+    )
+
+    af = result.auto_fix
+    assert af is not None
+    # Exactly one dispatch — the v2 single-shot behavior is preserved.
+    assert len(dispatcher.calls) == 1
+    # spec_039 telemetry: iterations=1, converged=True (verifier was green).
+    assert af.iterations == 1
+    assert af.converged is True
+    # Loop did not need to halt — halt anchor is empty for a converged run.
+    assert af.loop_halt_reason == ""
+
+
+def test_loop_converges_at_iteration_2_when_recheck_flips(
+    tmp_path: Path,
+) -> None:
+    """spec_039 §3-2 — fake runner "iter 1 R5 fail → iter 2 R5 pass"
+    converges with ``iterations=2`` and the loop merges."""
+
+    _write_mutation_discover_json(repo=tmp_path)
+    # The dispatcher returns "done" both times; the spec_039 verifier
+    # judges convergence, NOT the dispatcher self-report.
+    dispatcher = _ScriptedAutoDispatcher(
+        outcomes=[
+            FixDispatchOutcome(status="done", commits_made=1),
+            FixDispatchOutcome(status="done", commits_made=1),
+        ]
+    )
+    suite = _FakeSuiteRunner()
+    # Iter 1 → R5 fails (mutation still survived), iter 2 → R5 passes.
+    recheck = _StatefulMutationRechecker(sequence=["survived", "killed"])
+    guard = _FakeGuardInspector()
+    gops = _FakeGitOps(canned_diff="diff --git a/tests/x.py b/tests/x.py\n")
+    brief_runner, _ = _make_fake_brief_runner()
+
+    result = run_nightly(
+        repo=tmp_path,
+        profile=_autofix_profile_loop(iterations=3),
+        channel_runner=_RecordingChannelRunner(),
+        brief_runner=brief_runner,
+        windows_mirror=lambda _p: None,
+        fix_dispatcher=dispatcher,
+        suite_runner=suite,
+        mutation_rechecker=recheck,
+        guard_inspector=guard,
+        git_ops=gops,
+    )
+
+    af = result.auto_fix
+    assert af is not None
+    assert af.iterations == 2
+    assert af.converged is True
+    assert af.merged is True
+    # Dispatcher called twice; iter 2 received a feedback path.
+    assert len(dispatcher.calls) == 2
+    assert dispatcher.calls[0]["feedback"] is None
+    assert dispatcher.calls[1]["feedback"] is not None
+    assert Path(dispatcher.calls[1]["feedback"]).exists()
+
+
+def test_loop_no_progress_halts_before_iteration_3(
+    tmp_path: Path,
+) -> None:
+    """spec_039 §3-3 — same failure twice in a row halts the loop
+    before iteration 3 starts (max_iterations=5 here)."""
+
+    _write_mutation_discover_json(repo=tmp_path)
+    dispatcher = _ScriptedAutoDispatcher(
+        outcomes=[FixDispatchOutcome(status="done", commits_made=1)]
+    )
+    suite = _FakeSuiteRunner()
+    # Same R5 failure every time → no progress.
+    recheck = _StatefulMutationRechecker(
+        sequence=["survived", "survived", "killed"]
+    )
+    guard = _FakeGuardInspector()
+    gops = _FakeGitOps(canned_diff="diff --git a/tests/x.py b/tests/x.py\n")
+    brief_runner, _ = _make_fake_brief_runner()
+
+    result = run_nightly(
+        repo=tmp_path,
+        profile=_autofix_profile_loop(iterations=5),
+        channel_runner=_RecordingChannelRunner(),
+        brief_runner=brief_runner,
+        windows_mirror=lambda _p: None,
+        fix_dispatcher=dispatcher,
+        suite_runner=suite,
+        mutation_rechecker=recheck,
+        guard_inspector=guard,
+        git_ops=gops,
+    )
+
+    af = result.auto_fix
+    assert af is not None
+    # Two dispatches, two recheck calls (verifier ran twice); iter 3
+    # was NOT started.
+    assert len(dispatcher.calls) == 2
+    assert len(recheck.calls) == 2
+    assert af.iterations == 2
+    assert af.converged is False
+    assert af.merged is False
+    # Halt reason carries the no-progress anchor.
+    assert "no-progress" in af.loop_halt_reason
+
+
+def test_loop_immediate_halt_on_blocked_status_does_not_iterate(
+    tmp_path: Path,
+) -> None:
+    """spec_039 §3-5 — a BLOCKED dispatch halts the loop after one
+    iteration even when ``loop_max_iterations`` allows more. No feedback
+    file is written; no verifier ran."""
+
+    _write_mutation_discover_json(repo=tmp_path)
+    dispatcher = _ScriptedAutoDispatcher(
+        outcomes=[
+            FixDispatchOutcome(
+                status="blocked",
+                halt_reason="agent declared BLOCKED",
+            )
+        ]
+    )
+    suite = _FakeSuiteRunner()
+    recheck = _StatefulMutationRechecker(sequence=["killed"])
+    guard = _FakeGuardInspector()
+    gops = _FakeGitOps()
+    brief_runner, _ = _make_fake_brief_runner()
+
+    result = run_nightly(
+        repo=tmp_path,
+        profile=_autofix_profile_loop(iterations=5),
+        channel_runner=_RecordingChannelRunner(),
+        brief_runner=brief_runner,
+        windows_mirror=lambda _p: None,
+        fix_dispatcher=dispatcher,
+        suite_runner=suite,
+        mutation_rechecker=recheck,
+        guard_inspector=guard,
+        git_ops=gops,
+    )
+
+    af = result.auto_fix
+    assert af is not None
+    assert len(dispatcher.calls) == 1
+    # Verifier never ran → recheck untouched.
+    assert recheck.calls == []
+    assert suite.calls == []
+    assert af.iterations == 1
+    assert af.converged is False
+    assert "immediate-halt" in af.loop_halt_reason
+
+
+def test_brief_renders_fix_loop_summary_line(tmp_path: Path) -> None:
+    """spec_039 §2-3 — when the convergence loop ran more than once the
+    morning brief surfaces ``- 収束: N iterations`` or ``- 未収束:`` in §B."""
+
+    _write_mutation_discover_json(repo=tmp_path)
+    dispatcher = _ScriptedAutoDispatcher(
+        outcomes=[
+            FixDispatchOutcome(status="done", commits_made=1),
+            FixDispatchOutcome(status="done", commits_made=1),
+        ]
+    )
+    suite = _FakeSuiteRunner()
+    recheck = _StatefulMutationRechecker(sequence=["survived", "killed"])
+    guard = _FakeGuardInspector()
+    gops = _FakeGitOps(canned_diff="diff --git a/tests/x.py b/tests/x.py\n")
+    mirror, _ = _make_recording_mirror()
+
+    result = run_nightly(
+        repo=tmp_path,
+        profile=_autofix_profile_loop(iterations=3),
+        channel_runner=_RecordingChannelRunner(),
+        # real brief runner exercises rendering path
+        windows_mirror=mirror,
+        fix_dispatcher=dispatcher,
+        suite_runner=suite,
+        mutation_rechecker=recheck,
+        guard_inspector=guard,
+        git_ops=gops,
+        today=date(2026, 5, 25),
+    )
+
+    assert result.brief_report_wsl is not None
+    body = result.brief_report_wsl.read_text(encoding="utf-8")
+    # Converged after iter 2 → brief shows "収束: 2 iterations".
+    assert "収束: 2 iterations" in body
+
+
+def test_default_k1_iter1_brief_does_not_mention_fix_loop(
+    tmp_path: Path,
+) -> None:
+    """spec_039 §3-1 — the default K=1 / iter=1 brief is bit-for-bit
+    identical to spec_038; no "収束" / "未収束" line appears."""
+
+    _write_mutation_discover_json(repo=tmp_path)
+    dispatcher = _FakeFixDispatcher()
+    suite = _FakeSuiteRunner()
+    recheck = _FakeMutationRechecker(status="killed")
+    guard = _FakeGuardInspector()
+    gops = _FakeGitOps(canned_diff="diff --git a/tests/x.py b/tests/x.py\n")
+    mirror, _ = _make_recording_mirror()
+
+    result = run_nightly(
+        repo=tmp_path,
+        profile=_autofix_profile(autonomous=True),
+        channel_runner=_RecordingChannelRunner(),
+        windows_mirror=mirror,
+        fix_dispatcher=dispatcher,
+        suite_runner=suite,
+        mutation_rechecker=recheck,
+        guard_inspector=guard,
+        git_ops=gops,
+        today=date(2026, 5, 25),
+    )
+
+    assert result.brief_report_wsl is not None
+    body = result.brief_report_wsl.read_text(encoding="utf-8")
+    assert "収束:" not in body
+    assert "未収束:" not in body
