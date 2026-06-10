@@ -560,6 +560,21 @@ class SafetyConfig(BaseModel):
     (spec_auto seq, 40-min dispatch timeout, guard, halt collection)
     and re-evaluating the PAUSE / un-pushed-backlog cap between
     candidates.
+
+    ``loop_max_iterations`` (spec_039) lifts the spec_023〜038 single-
+    shot dispatch model to a convergence loop. The nightly loop now
+    dispatches a candidate, runs R5/R4/guard verification, and if
+    verification failed writes a feedback Markdown into
+    ``_ai_workspace/logs/`` then re-dispatches with that feedback in
+    the prompt — repeating until verification is green OR one of three
+    halt conditions fires (max iterations reached, the per-candidate
+    wall-clock budget is exhausted, or two consecutive iterations
+    produced the same failure signature). Default ``1`` reproduces the
+    v2 single-shot behavior bit-for-bit (only iteration-1 runs, no
+    feedback file written). Allowed range is ``1..5`` — five gives the
+    agent four feedback-augmented retries before halting, which is
+    enough to cover transient agent slips without burning the 40-min
+    budget on a stuck candidate.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -567,6 +582,7 @@ class SafetyConfig(BaseModel):
     fix_mode: str = "off"
     fix_templates: list[str] = Field(default_factory=lambda: ["A"])
     max_candidates_per_night: int = 1
+    loop_max_iterations: int = 1
 
     @field_validator("fix_mode")
     @classmethod
@@ -591,6 +607,23 @@ class SafetyConfig(BaseModel):
         if v < 1 or v > 5:
             raise ValueError(
                 f"max_candidates_per_night must be in 1..5; got {v}"
+            )
+        return v
+
+    @field_validator("loop_max_iterations")
+    @classmethod
+    def _loop_iterations_in_range(cls, v: int) -> int:
+        # spec_039 — bound to 1..5. Below 1 makes no sense (a "0 iteration"
+        # loop never dispatches); above 5 risks the per-candidate 40-min
+        # budget catching every iteration mid-dispatch without ever
+        # converging. Out-of-range loud-fails at load time.
+        if not isinstance(v, int) or isinstance(v, bool):
+            raise ValueError(
+                f"loop_max_iterations must be an int; got {type(v).__name__}"
+            )
+        if v < 1 or v > 5:
+            raise ValueError(
+                f"loop_max_iterations must be in 1..5; got {v}"
             )
         return v
 
@@ -915,6 +948,9 @@ def render_profile(result: ProfileLoadResult) -> str:
     lines.append("fix_templates = " + _toml_str_list(p.safety.fix_templates))
     lines.append(
         f"max_candidates_per_night = {p.safety.max_candidates_per_night}"
+    )
+    lines.append(
+        f"loop_max_iterations = {p.safety.loop_max_iterations}"
     )
     return "\n".join(lines)
 

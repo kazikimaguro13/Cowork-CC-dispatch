@@ -783,6 +783,13 @@ def _render_section_b_phase2(
     else:
         reasons_text = "; ".join(auto_fix.guard_halt_reasons) or "理由不明"
         lines.append(f"- ガード: **HALT** — {reasons_text}")
+    # spec_039 — surface the convergence loop's iteration count when
+    # the profile raised ``safety.loop_max_iterations`` above 1. At the
+    # default 1 the line is suppressed so the §B layout is bit-for-bit
+    # identical to spec_025〜038.
+    fix_loop_line = _format_fix_loop_summary(auto_fix)
+    if fix_loop_line:
+        lines.append(fix_loop_line)
 
     lines.append("")
     lines.append("### 修正の diff")
@@ -889,6 +896,9 @@ def _render_section_b_propose(
     else:
         reasons_text = "; ".join(auto_fix.guard_halt_reasons) or "理由不明"
         lines.append(f"- ガード: **HALT** — {reasons_text}")
+    fix_loop_line = _format_fix_loop_summary(auto_fix)
+    if fix_loop_line:
+        lines.append(fix_loop_line)
 
     lines.append("")
     lines.append("### 修正案の diff")
@@ -971,6 +981,67 @@ def _compose_push_command(repo: Path | None) -> str:
             repo_str = str(repo)
         return f"git -C {repo_str} push origin main"
     return "git push origin main"
+
+
+def _format_fix_loop_summary(auto_fix: AutoFixOutcome) -> str:
+    """spec_039 — return a one-line iteration summary or "" to suppress.
+
+    Format examples:
+
+    - converged after 2 iterations  → ``- 収束: 2 iterations``
+    - halted after 5 iterations on no-progress detection →
+      ``- 未収束: 5 iterations, 無進捗検知で halt``
+
+    Returns ``""`` (suppressed) when the candidate is skipped, when
+    ``iterations`` is zero (no loop body ran), or when the loop ran
+    exactly once and converged — at the default
+    ``loop_max_iterations=1`` the single-iteration converged path is
+    the spec_023〜038 happy path, so omitting the line keeps §B
+    bit-for-bit identical to v2 for default profiles (spec_039 §3-1).
+    """
+
+    iterations = int(getattr(auto_fix, "iterations", 0) or 0)
+    converged = bool(getattr(auto_fix, "converged", False))
+    loop_halt = str(getattr(auto_fix, "loop_halt_reason", "") or "")
+
+    if auto_fix.skipped:
+        return ""
+    if iterations <= 0:
+        return ""
+    if iterations == 1 and converged and not loop_halt:
+        # v2 single-shot happy path — suppress the line so the K=1 /
+        # iter=1 brief stays exactly as it was before spec_039.
+        return ""
+
+    if converged:
+        return f"- 収束: {iterations} iterations"
+
+    cause = _shorten_loop_halt_reason(loop_halt)
+    suffix = f" ({cause})" if cause else ""
+    return f"- 未収束: {iterations} iterations{suffix}"
+
+
+def _shorten_loop_halt_reason(reason: str) -> str:
+    """Map :data:`ccd.loop.LOOP_HALT_*` anchors to a 1-phrase
+    operator-facing cause.
+
+    The full anchors carry "fix-loop: " prefix that is helpful in
+    machine logs but noisy in a one-line brief summary. Strip the
+    prefix and map the well-known causes to compact phrasing.
+    """
+
+    if not reason:
+        return ""
+    body = reason.removeprefix("fix-loop: ")
+    if "no-progress" in body:
+        return "無進捗検知で halt"
+    if "max_iterations" in body:
+        return "max_iterations 到達"
+    if "wall-clock budget" in body:
+        return "wall-clock 予算 exhausted"
+    if "immediate-halt" in body:
+        return "immediate-halt カテゴリ"
+    return body
 
 
 def _render_section_b_multi(
@@ -1114,6 +1185,9 @@ def _render_one_candidate_subsection(
                 "; ".join(outcome.guard_halt_reasons) or "理由不明"
             )
             lines.append(f"- ガード: **HALT** — {reasons_text}")
+        fix_loop_line = _format_fix_loop_summary(outcome)
+        if fix_loop_line:
+            lines.append(fix_loop_line)
         lines.append("")
 
     if not outcome.merged and not proposed:
