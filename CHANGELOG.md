@@ -2,6 +2,81 @@
 
 本プロジェクトの注目すべき変更を記録する。フォーマットは [Keep a Changelog](https://keepachangelog.com/) に準ずる。
 
+## [0.23.0] — 2026-06-10
+
+### Added
+
+- spec_040: **隔離の統一 ── auto モードの clone-and-patch 化と Integrator 導入**。
+  spec_028 で propose モードが導入したクローン隔離ワークフローを **auto モードにも
+  一本化**。すべての fix 作業 (translate → branch → dispatch → R5 + R4 + guard
+  → 収束ループ) は使い捨て隔離クローン内で実行され、live repo に触れるのは
+  **新設の直列 Integrator** のみ。Integrator は worker が検証済みの patch を
+  受け取り、live の feat branch に apply → guard + R4 を **live 上で再検証** →
+  main へ local merge (push しない) → feat branch 削除。apply 失敗 / 再検証
+  失敗 / merge 失敗のいずれでも **drop + live 復元** (rebase も再 dispatch も
+  しない、spec_040 §2-2 逐語)。狙い: (1) spec_041 の並列ワーカーが live を
+  奪い合う事故を構造的に排除、(2) auto / propose のコードパスを統一、
+  (3) ワーカーの暴走 git 書き込みを clone に閉じ込める (spec_014 の発見隔離
+  と同じ思想を修正側に適用)。
+- `ccd/nightly.py` ── 新型 `PatchApplier = Callable[..., None]` (Integrator
+  patch 適用 seam) + デフォルト実装 `_default_patch_applier()` (subprocess
+  `git apply --index --whitespace=nowarn` → `git commit -m "auto-fix: <spec_id>"`)。
+- `ccd/nightly.py` ── Integrator 本体 `_integrate_one_candidate()` を新設。
+  branch 作成 → patch 適用 → live diff 取得 → guard 再検証 → R4 再検証 →
+  merge → branch 削除を 1 関数で表現。失敗時は `_restore_repo_after_halt()`
+  (spec_026 §2-2 リストア primitive) を呼ぶ。
+- `ccd/nightly.py` ── Integrator 用 halt anchor 定数群:
+  `_HALT_INTEGRATOR_APPLY_FAILED` / `_HALT_INTEGRATOR_GUARD_FAILED` /
+  `_HALT_INTEGRATOR_R4_FAILED` / `_HALT_INTEGRATOR_BRANCH_FAILED` /
+  `_HALT_INTEGRATOR_MERGE_FAILED` / `_HALT_INTEGRATOR_EMPTY_PATCH`。
+  朝レポート §D が "live drift / live regression" を判別できる。
+- `run_nightly()` / `_run_auto_fix_loop()` / `_process_one_auto_fix_candidate()`
+  に `isolated_workspace` + `apply_patch` キーワードを追加 (propose と同じ
+  seam を auto でも使う)。`cli.main()` / `_cmd_nightly()` / `_cmd_nightly_all()`
+  も `apply_patch` を素通しで forward。
+- 新規 pytest 5 件 (test_nightly.py) ──
+  `test_auto_mode_worker_phase_does_not_write_to_live` (構造不変条件: worker
+  phase で live への書き込みが一切ないことを `repo=` 引数バケットで pin)、
+  `test_auto_mode_integrator_drops_when_apply_fails` (apply 衝突 → drop +
+  live 復元)、`test_auto_mode_integrator_drops_when_live_r4_fails` (clone
+  green / live red の R4 ドリフト → drop)、
+  `test_auto_mode_integrator_drops_when_live_guard_fails` (live guard
+  ドリフト → drop)、`test_auto_mode_e2e_v2_external_state_preserved`
+  (外形 v2 互換: `merged=True` / `merge_diff` / `auto_fix.dispatch_status`
+  の shape が spec_023〜038 と bit-for-bit 一致)。
+
+### Changed
+
+- `ccd/nightly.py` ── `_process_one_auto_fix_candidate()` を全面書き換え。
+  v2 では live のワーキングツリー上で dispatch → R5/R4/guard → merge を
+  順に実行していた (spec_028 で propose のみクローン化)。spec_040 で auto も
+  クローン内ワーカー + 後段 Integrator に分離:
+  - Worker phase (クローン内): translate → `isolated_clone` → clone に
+    spec_auto.md コピー → `gops.create_and_checkout_branch(repo=clone)` →
+    `run_fix_loop(repo=clone, ...)` (dispatcher / R5 / R4 / guard すべて
+    clone を見る) → 検証済み diff を抽出。
+  - Integrator phase (live): `_integrate_one_candidate()` が patch を live
+    に適用し guard + R4 を再検証して merge。worker の `proposal_diff` /
+    `verif` を入力として受け取り、`AutoFixOutcome.merged=True` / `merge_diff`
+    を produce する。
+- `ccd/nightly.py` `_copy_spec_auto_into_clone()` ── clone == live の縮退
+  (テスト fixture の degenerate factory) を `SameFileError` 回避のため
+  no-op として扱う (本番では別 tmpdir を yield するので影響なし)。
+- `ccd/cli.py` `cli.main()` / `_cmd_nightly()` / `_cmd_nightly_all()` ──
+  `apply_patch: Any | None = None` を追加し `run_nightly` に forward。
+- spec_026 §2-2 のリストア primitive (`_restore_repo_after_halt`) の発火
+  経路が変わった: worker phase の R5 / R4 / guard / dispatch 失敗では
+  **live を一切書き換えないので restore も不要** (clone は workspace
+  context-manager に rmtree-d)。Integrator 失敗時にだけ live restore が
+  fire。既存のスペック_026 系テスト 6 件を spec_040 後の挙動に rewrite。
+- `tests/test_nightly.py` ── 既存 auto テスト 51 件に `_auto_fix_test_seams(tmp_path)`
+  (`isolated_workspace` + `apply_patch` の test fake) を inject。
+  `_FakeGitOps.canned_diff` のデフォルトを空文字列から非空プレースホルダーに
+  変更 (Integrator の `_HALT_INTEGRATOR_EMPTY_PATCH` ガードに偶然 hit しないため)。
+- `pyproject.toml` / `ccd/__init__.py` / `tests/test_smoke.py` ──
+  `0.22.0` → `0.23.0` (minor bump — 新 PatchApplier seam / 新 Integrator
+  関数 / auto モードのコードパス変更)。
+
 ## [0.22.0] — 2026-06-10
 
 ### Added
