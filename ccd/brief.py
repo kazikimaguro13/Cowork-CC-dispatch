@@ -169,6 +169,13 @@ def run_brief(
     auto_fix: AutoFixOutcome | None = None,
     auto_fix_extras: Sequence[AutoFixOutcome] = (),
     channel_outcomes: Sequence[ChannelOutcome] | None = None,
+    # spec_041 — WorkerPool telemetry. P > 1 turns on the 夜サマリ line
+    # under §B that surfaces 候補 K / 並列 P / 達成同時実行数 / merge数
+    # / drop 数（理由別）. Default values keep the v2 / spec_023〜040
+    # 外形 bit-for-bit identical.
+    parallelism: int = 1,
+    achieved_max_concurrency: int = 1,
+    drop_reasons: Sequence[str] = (),
 ) -> BriefResult:
     """Render one morning report from already-completed discovery JSON.
 
@@ -222,6 +229,9 @@ def run_brief(
             auto_fix_extras=tuple(auto_fix_extras or ()),
             repo=repo,
             channel_outcomes=channel_outcomes,
+            parallelism=parallelism,
+            achieved_max_concurrency=achieved_max_concurrency,
+            drop_reasons=tuple(drop_reasons or ()),
         ),
         encoding="utf-8",
     )
@@ -376,6 +386,9 @@ def _render_md(
     auto_fix_extras: tuple[AutoFixOutcome, ...] = (),
     repo: Path | None = None,
     channel_outcomes: Sequence[ChannelOutcome] | None = None,
+    parallelism: int = 1,
+    achieved_max_concurrency: int = 1,
+    drop_reasons: tuple[str, ...] = (),
 ) -> str:
     by_channel = {c.channel: c for c in channels}
     # spec_038 — collect all outcomes for multi-candidate brief sections.
@@ -472,6 +485,9 @@ def _render_md(
                 outcomes=all_outcomes,
                 by_channel=by_channel,
                 repo=repo,
+                parallelism=parallelism,
+                achieved_max_concurrency=achieved_max_concurrency,
+                drop_reasons=drop_reasons,
             )
         )
     elif phase2_merge_active:
@@ -1049,6 +1065,9 @@ def _render_section_b_multi(
     outcomes: tuple[AutoFixOutcome, ...],
     by_channel: dict[str, ChannelReport],
     repo: Path | None,
+    parallelism: int = 1,
+    achieved_max_concurrency: int = 1,
+    drop_reasons: tuple[str, ...] = (),
 ) -> list[str]:
     """spec_038 §2-4 — render §B as per-candidate subsections when the
     profile raised ``safety.max_candidates_per_night`` above 1.
@@ -1060,6 +1079,10 @@ def _render_section_b_multi(
     ``git apply`` for proposed). After the per-candidate enumeration
     the Phase 1 mechanical-channel §B is appended so the underlying
     findings remain visible alongside the loop's actions.
+
+    spec_041 — when ``parallelism > 1`` the section opens with a
+    one-line 夜サマリ listing K / P / 達成同時実行数 / merge数 / drop数
+    so the operator sees the parallel telemetry at a glance.
     """
 
     mode = (
@@ -1070,13 +1093,38 @@ def _render_section_b_multi(
         if mode == "propose"
         else "## B. 昨夜の自律修正 (複数候補 — `spec_038`)"
     )
+    # spec_041 — when parallelism > 1, switch the lede to say "並列処理"
+    # instead of "直列処理"; either way the per-candidate enumeration
+    # below carries the actual ordering (= integration完了順).
+    process_word = "並列処理" if parallelism > 1 else "直列処理"
     lines: list[str] = [
         heading,
         "",
-        f"本夜は **{len(outcomes)} 件の候補を直列処理**しました "
+        f"本夜は **{len(outcomes)} 件の候補を{process_word}**しました "
         f"(`safety.max_candidates_per_night`)。候補ごとの結果は以下のとおり。",
         "",
     ]
+    if parallelism > 1:
+        # spec_041 §2-5 — 夜サマリ。"候補 K / 並列 P / 達成同時実行数 /
+        # merge 数 / drop 数（理由別）".
+        merged_n = sum(
+            1 for o in outcomes if not o.skipped and o.merged
+        )
+        dropped_n = sum(
+            1 for o in outcomes if o.skipped or (not o.merged and not getattr(o, "proposed", False))
+        )
+        bits = [
+            f"候補 K={len(outcomes)}",
+            f"並列 P={parallelism}",
+            f"達成同時実行数={achieved_max_concurrency}",
+            f"merge={merged_n}",
+            f"drop={dropped_n}",
+        ]
+        lines.append("**夜サマリ (spec_041)**: " + " / ".join(bits) + "。")
+        if drop_reasons:
+            reasons_text = "; ".join(drop_reasons)
+            lines.append(f"drop 理由: {reasons_text}。")
+        lines.append("")
 
     n = len(outcomes)
     for i, outcome in enumerate(outcomes, start=1):
@@ -1161,8 +1209,22 @@ def _render_one_candidate_subsection(
             else ""
         ),
         f"- branch: `{outcome.branch or '(不明)'}`",
-        "",
     ]
+    # spec_041 — surface worker_id + start/finish timestamps when
+    # populated (auto-mode WorkerPool path). Empty strings keep the
+    # subsection identical to spec_038〜040 for outcomes that didn't
+    # flow through a worker (skipped before dispatch, propose mode).
+    worker_id = getattr(outcome, "worker_id", "")
+    started_at = getattr(outcome, "worker_started_at", "")
+    finished_at = getattr(outcome, "worker_finished_at", "")
+    if worker_id:
+        worker_bits = [f"id={worker_id}"]
+        if started_at:
+            worker_bits.append(f"start={started_at}")
+        if finished_at:
+            worker_bits.append(f"finish={finished_at}")
+        lines.append(f"- worker: {', '.join(worker_bits)}")
+    lines.append("")
 
     if template == "A":
         r5_label = "R5 (target mutation killed)"

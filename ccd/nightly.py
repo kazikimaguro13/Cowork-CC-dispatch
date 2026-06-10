@@ -122,6 +122,8 @@ import json
 import os
 import shutil
 import subprocess
+import threading
+import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -430,6 +432,14 @@ class AutoFixOutcome:
     iterations: int = 0
     converged: bool = False
     loop_halt_reason: str = ""
+    # spec_041 — per-worker telemetry. Empty strings keep the v2 /
+    # spec_038〜040 外形 bit-for-bit identical when the new fields are
+    # not populated (skip outcomes, gate off, off mode). Populated only
+    # for outcomes that flowed through a WorkerPool (auto mode + propose
+    # mode when parallelism>1). Timestamps are ISO-8601 with UTC offset.
+    worker_id: str = ""
+    worker_started_at: str = ""
+    worker_finished_at: str = ""
 
 
 @dataclass
@@ -468,6 +478,20 @@ class NightlyResult:
     # When True, ``run_nightly`` returned without invoking any channel,
     # the auto-fix loop, or the brief.
     paused: bool = False
+    # spec_041 — parallelism telemetry surfaced for the morning brief
+    # 夜サマリ + spec_042's convergence dashboard. ``parallelism`` is the
+    # P that was used (clamped to the profile's bounded value);
+    # ``achieved_max_concurrency`` is how many workers were *actually*
+    # in-flight at the same time during the run (≤ P; equal to ``1``
+    # at the default P=1 or whenever K < P). Both default to ``1`` so
+    # the spec_023〜040 外形 stays bit-for-bit identical for default
+    # profiles. ``drop_reasons`` collects the gate trip reasons (PAUSE,
+    # backlog cap, max_merges cap, wall-clock window) so the morning
+    # brief can show drop reasons grouped, and tests can assert the
+    # gate that fired by name.
+    parallelism: int = 1
+    achieved_max_concurrency: int = 1
+    drop_reasons: tuple[str, ...] = field(default_factory=tuple)
 
     @property
     def channels_executed(self) -> tuple[str, ...]:
@@ -632,8 +656,22 @@ def run_nightly(
     # spec_039 — per-candidate FixLoop iteration cap. Default 1 keeps
     # the spec_023〜038 single-shot behavior bit-for-bit.
     loop_max_iters = int(effective_profile.safety.loop_max_iterations)
+    # spec_041 — WorkerPool size P + per-night merge cap.
+    p_workers = int(effective_profile.safety.parallelism)
+    max_merges_n = int(effective_profile.safety.max_merges_per_night)
+    # spec_041 — surfaced into NightlyResult so the brief / spec_042
+    # aggregator can read "P / 達成同時実行数 / drop reasons" without
+    # introspecting individual outcomes.
+    achieved_concurrency = 1
+    night_drop_reasons: tuple[str, ...] = ()
     if fix_mode == "auto":
-        auto_fix, auto_fix_extras = _run_auto_fix_loop(
+        (
+            auto_fix,
+            auto_fix_extras,
+            p_workers,
+            achieved_concurrency,
+            night_drop_reasons,
+        ) = _run_auto_fix_loop(
             repo=repo,
             channels=channel_outcomes,
             fix_templates=tuple(effective_profile.safety.fix_templates),
@@ -661,6 +699,9 @@ def run_nightly(
             apply_patch=apply_patch,
             max_candidates=max_k,
             loop_max_iterations=loop_max_iters,
+            parallelism=p_workers,
+            max_merges_per_night=max_merges_n,
+            proposal_dir=proposal_dir,
         )
     elif fix_mode == "propose":
         auto_fix, auto_fix_extras = _run_propose_loop(
@@ -701,6 +742,11 @@ def run_nightly(
         brief_dir=brief_dir,
         discover_dir=discover_dir,
         channel_outcomes=tuple(channel_outcomes),
+        parallelism=p_workers if fix_mode == "auto" else 1,
+        achieved_max_concurrency=(
+            achieved_concurrency if fix_mode == "auto" else 1
+        ),
+        drop_reasons=night_drop_reasons if fix_mode == "auto" else (),
     )
     brief_md = brief_result.report_path if brief_result.success else None
 
@@ -720,6 +766,13 @@ def run_nightly(
         halt_reason=brief_result.halt_reason if not brief_result.success else "",
         auto_fix=auto_fix,
         auto_fix_extras=auto_fix_extras,
+        parallelism=p_workers if fix_mode == "auto" else 1,
+        achieved_max_concurrency=(
+            achieved_concurrency if fix_mode == "auto" else 1
+        ),
+        drop_reasons=(
+            night_drop_reasons if fix_mode == "auto" else ()
+        ),
     )
 
 
@@ -902,6 +955,19 @@ _HALT_UNPUSHED_BACKLOG_PREFIX = (
 # pin this substring.
 _HALT_REMAINING_SKIPPED_PREFIX = "remaining candidate(s) skipped"
 
+# spec_041 — gate anchors for the Integration queue. Each fires when the
+# named gate re-evaluates positive immediately before the next pending
+# integration; the remaining verified patches are退避 to proposals/ as a
+# rollup skip with one of these prefixes in `skip_reason`.
+_HALT_MAX_MERGES_REACHED_PREFIX = "max merges per night cap reached"
+_HALT_NIGHT_WALL_CLOCK_PREFIX = "night wall-clock budget exhausted"
+# spec_041 — anchor for the AutoFixOutcome a worker emits when its
+# spawn / dispatch raised an unhandled exception inside the
+# ThreadPoolExecutor. Captures the original exception so the morning
+# brief can name "which worker" + "which error" without the parent
+# loop having to introspect Future internals.
+_HALT_WORKER_CRASHED_PREFIX = "worker crashed"
+
 # spec_025 §2-1 — cost / halt thresholds.
 #
 # These live as module constants (not profile fields) on purpose:
@@ -960,27 +1026,48 @@ def _run_auto_fix_loop(
     dispatch_timeout_s: float,
     max_candidates: int = 1,
     loop_max_iterations: int = 1,
-) -> tuple[AutoFixOutcome, tuple[AutoFixOutcome, ...]]:
+    parallelism: int = 1,
+    max_merges_per_night: int = 3,
+    night_wall_clock_budget_s: float | None = None,
+    proposal_dir: Path | None = None,
+) -> tuple[
+    AutoFixOutcome,
+    tuple[AutoFixOutcome, ...],
+    int,
+    int,
+    tuple[str, ...],
+]:
     """Drive the autonomous-fix loop for up to ``max_candidates``
-    candidates in series (spec_023 §2-1〜§2-4 + spec_024 + spec_025
-    cost/halt boundaries + spec_038 top-K extension).
+    candidates (spec_023 §2-1〜§2-4 + spec_024 + spec_025 cost/halt
+    boundaries + spec_038 top-K + spec_041 WorkerPool).
 
-    Returns ``(primary_outcome, extras)`` — at ``max_candidates=1`` the
-    extras tuple is always empty, keeping the v2外形 (NightlyResult /
-    AutoFixOutcome shape, dispatch count, restore behaviour)
-    bit-for-bit identical for default profiles (spec_038 §3-1).
+    Returns ``(primary, extras, parallelism, achieved_max_concurrency,
+    drop_reasons)``. The trailing three fields surface the spec_041
+    parallelism telemetry that ``run_nightly`` records on
+    :class:`NightlyResult`; the AutoFixOutcome shape is unchanged.
 
-    Per-candidate processing (each in turn): translate → branch →
-    dispatch (40-min wall-clock cap) → R5 → R4 → guard → merge-or-halt
-    → restore. A single candidate's halt does NOT stop the loop — the
-    remaining candidates still get their own attempt (spec_038 §2-3).
+    Per-candidate work is split into two phases (spec_040):
 
-    Between candidates (i ≥ 1) the loop re-evaluates two operator
-    brakes: the PAUSE file (`_ai_workspace/PAUSE`) and the un-pushed
-    backlog cap. Either tripping causes the remaining candidates to be
-    skipped with a synthetic rollup outcome surfacing the reason
-    (spec_038 §2-3). Per-night the un-pushed counter is consulted
-    BEFORE any candidate is selected (spec_025 §2-1(b)).
+    - **Worker phase (clone)** — translate → enter disposable clone →
+      ``run_fix_loop`` (dispatch + R5/R4/guard) → produce a verified
+      diff. K workers run concurrently inside a ``ThreadPoolExecutor``
+      of size ``parallelism`` (spec_041 §2-2). Workers do NOT write to
+      the live working tree; each worker's clone is rmtree-d on context
+      exit.
+    - **Integrator phase (live)** — completed verified diffs are
+      drained **serially in completion order** through
+      :func:`_integrate_one_candidate` (spec_041 §2-3). Before each
+      integration (after the first) the loop re-evaluates four gates:
+      PAUSE, un-pushed backlog cap, ``max_merges_per_night`` cap, and
+      the optional night wall-clock budget. Any tripped gate causes
+      the remaining verified patches to be退避 to ``proposals/`` and
+      a single rollup skip outcome is appended (spec_041 §2-3).
+
+    Default profile (P=1, K=1) yields ``parallelism=1`` /
+    ``achieved_max_concurrency=1`` / ``drop_reasons=()``, with
+    submission order = integration order = source-JSON order, keeping
+    the spec_023〜040 外形 (dispatch count, brief layout, recorded
+    outcome shape) bit-for-bit identical (spec_041 §3-1).
     """
 
     # spec_025 §2-1(b) — un-pushed backlog cap.
@@ -1008,10 +1095,14 @@ def _run_auto_fix_loop(
             )
         return ""
 
+    p_clamped = max(1, min(4, int(parallelism or 1)))
     initial_skip = _backlog_skip_reason()
     if initial_skip:
         return (
             AutoFixOutcome(skipped=True, skip_reason=initial_skip),
+            (),
+            p_clamped,
+            1,
             (),
         )
 
@@ -1031,6 +1122,9 @@ def _run_auto_fix_loop(
                 skipped=True,
                 skip_reason=_compose_no_candidate_reason(fix_templates),
             ),
+            (),
+            p_clamped,
+            1,
             (),
         )
 
@@ -1070,65 +1164,812 @@ def _run_auto_fix_loop(
         apply_patch if apply_patch is not None else _default_patch_applier
     )
 
-    outcomes: list[AutoFixOutcome] = []
-    for i, (template, finding, source_report, candidate_count) in enumerate(
+    # spec_041 §2-2 — pre-translate ALL candidates serially BEFORE
+    # workers are spawned. spec_auto IDs come from a monotonic counter
+    # (:func:`ccd.translate._next_spec_auto_seq`) that is process-local
+    # but not thread-safe; running translate serially in the main
+    # thread guarantees each worker sees a distinct spec_auto.md.
+    pre_translated: list[
+        tuple[str, Finding, Path | None, int, Any, str, str]
+    ] = []
+    for idx, (template, finding, source_report, candidate_count) in enumerate(
         candidates
     ):
-        # spec_038 §2-3 — between candidates re-evaluate PAUSE + backlog
-        # cap so multi-candidate nights respect operator brakes mid-run.
-        # The initial entries are gated by ``run_nightly`` (PAUSE) and the
-        # pre-loop backlog check above, so this only fires for i ≥ 1.
-        if i > 0:
-            remaining = len(candidates) - i
-            if _pause_file_present(repo):
-                outcomes.append(
-                    AutoFixOutcome(
-                        skipped=True,
-                        skip_reason=(
-                            f"{_HALT_REMAINING_SKIPPED_PREFIX}: "
-                            f"{remaining} 件 (PAUSE: "
-                            f"`_ai_workspace/PAUSE` が現れた)"
-                        ),
-                    )
-                )
-                break
-            backlog_skip = _backlog_skip_reason()
-            if backlog_skip:
-                outcomes.append(
-                    AutoFixOutcome(
-                        skipped=True,
-                        skip_reason=(
-                            f"{_HALT_REMAINING_SKIPPED_PREFIX}: "
-                            f"{remaining} 件 ({backlog_skip})"
-                        ),
-                    )
-                )
-                break
-
-        outcomes.append(
-            _process_one_auto_fix_candidate(
-                template=template,
-                finding=finding,
-                source_report=source_report,
-                candidate_count=candidate_count,
-                repo=repo,
-                today=today,
-                gops=gops,
-                dispatcher=dispatcher,
-                run_suite=run_suite,
-                recheck_mutation=recheck_mutation,
-                recheck_adversarial=recheck_adversarial,
-                inspect=inspect,
-                workspace_factory=workspace_factory,
-                apply_patch=applier,
-                dispatch_timeout_s=dispatch_timeout_s,
-                loop_max_iterations=loop_max_iterations,
+        tr = translate_finding(
+            finding,
+            repo=repo,
+            source_report=str(source_report) if source_report else "",
+            today=today,
+        )
+        worker_id = f"w{idx + 1}"
+        if not tr.success:
+            translated_branch = ""
+        elif tr.spec_auto_id:
+            translated_branch = f"auto/{tr.spec_auto_id}"
+        else:
+            translated_branch = ""
+        pre_translated.append(
+            (
+                template,
+                finding,
+                source_report,
+                candidate_count,
+                tr,
+                worker_id,
+                translated_branch,
             )
+        )
+
+    return _drain_worker_pool(
+        pre_translated=pre_translated,
+        repo=repo,
+        today=today,
+        gops=gops,
+        dispatcher=dispatcher,
+        run_suite=run_suite,
+        recheck_mutation=recheck_mutation,
+        recheck_adversarial=recheck_adversarial,
+        inspect=inspect,
+        workspace_factory=workspace_factory,
+        applier=applier,
+        dispatch_timeout_s=dispatch_timeout_s,
+        loop_max_iterations=loop_max_iterations,
+        parallelism=p_clamped,
+        max_merges_per_night=max(1, int(max_merges_per_night or 1)),
+        night_wall_clock_budget_s=night_wall_clock_budget_s,
+        proposal_dir=proposal_dir,
+        backlog_skip_reason=_backlog_skip_reason,
+    )
+
+
+@dataclass(frozen=True)
+class _WorkerPhaseResult:
+    """spec_041 — what :func:`_run_worker_phase` hands the integration queue.
+
+    Either:
+
+    - the worker phase converged and produced a verified patch, in
+      which case ``verified_diff`` / ``worker_verification`` / ``fl``
+      are populated and ``halt_outcome`` is None — the Integrator will
+      run; OR
+    - the worker phase halted (translate failed, dispatch crashed,
+      didn't converge, etc.), in which case ``halt_outcome`` carries
+      the final :class:`AutoFixOutcome` and the patch fields are None
+      — no Integrator runs.
+
+    Always populated: ``worker_id``, ``template``, ``finding``,
+    ``source_report``, ``candidate_count``, ``spec_auto_id``,
+    ``spec_auto_path``, ``branch``, ``allowed_files``,
+    ``started_at``, ``finished_at``. The timestamps are ISO-8601
+    strings with UTC offset captured around the worker body so the
+    morning brief can render duration + parallel efficiency without
+    introducing a clock seam in the test layer.
+    """
+
+    worker_id: str
+    template: str
+    finding: Finding
+    source_report: Path | None
+    candidate_count: int
+    spec_auto_id: str
+    spec_auto_path: Path | None
+    branch: str
+    allowed_files: tuple[str, ...]
+    started_at: str
+    finished_at: str
+    verified_diff: str | None
+    worker_verification: IterationVerification | None
+    fl: FixLoopOutcome | None
+    halt_outcome: AutoFixOutcome | None
+
+
+def _now_iso_utc() -> str:
+    """spec_041 — ISO-8601 wall-clock now with UTC offset.
+
+    Centralised so the per-worker timestamps recorded on
+    :class:`AutoFixOutcome` are uniformly formatted (the morning brief
+    and spec_042's parallel-efficiency aggregation read these as
+    strings, never as comparable times — wall-clock is for human
+    inspection and audit, not for arithmetic).
+    """
+
+    return datetime.now(UTC).isoformat()
+
+
+def _stamp_worker(
+    outcome: AutoFixOutcome,
+    *,
+    worker_id: str,
+    started_at: str,
+    finished_at: str,
+) -> AutoFixOutcome:
+    """spec_041 — attach worker telemetry to an :class:`AutoFixOutcome`.
+
+    :class:`AutoFixOutcome` is a frozen dataclass; the helper
+    rebuilds via :func:`dataclasses.replace` so every halt / merge /
+    skip outcome can carry ``worker_id`` + start/finish timestamps in
+    a single place.
+    """
+
+    from dataclasses import replace
+
+    return replace(
+        outcome,
+        worker_id=worker_id,
+        worker_started_at=started_at,
+        worker_finished_at=finished_at,
+    )
+
+
+def _run_worker_phase(
+    *,
+    worker_id: str,
+    template: str,
+    finding: Finding,
+    source_report: Path | None,
+    candidate_count: int,
+    tr: Any,
+    repo: Path,
+    gops: GitOps,
+    dispatcher: FixDispatcher,
+    run_suite: SuiteRunner,
+    recheck_mutation: MutationRechecker,
+    recheck_adversarial: AdversarialRechecker,
+    inspect: GuardInspector,
+    workspace_factory: IsolatedWorkspace,
+    dispatch_timeout_s: float,
+    loop_max_iterations: int,
+) -> _WorkerPhaseResult:
+    """spec_041 §2-2 — execute one candidate's worker phase inside a
+    disposable clone.
+
+    The worker phase mirrors what spec_040 carved out of the old
+    inline flow: enter the clone, copy spec_auto.md, create the feat
+    branch, run :func:`ccd.loop.run_fix_loop`, snapshot the verified
+    diff. **No live writes happen** here — the structural invariant
+    pinned by spec_040 §2-2 carries over verbatim.
+
+    Per spec_041 §2-4, exceptions inside the worker body never escape;
+    they become a :class:`AutoFixOutcome` HALT with
+    ``_HALT_WORKER_CRASHED_PREFIX`` so a single thread crashing does
+    not poison its sibling workers' results in the parent
+    ``ThreadPoolExecutor``.
+    """
+
+    started_at = _now_iso_utc()
+
+    def _finish() -> str:
+        return _now_iso_utc()
+
+    if not tr.success:
+        finished_at = _finish()
+        halt = _stamp_worker(
+            AutoFixOutcome(
+                skipped=True,
+                skip_reason=tr.halt_reason,
+                finding_signature=finding.signature,
+                candidate_count=candidate_count,
+            ),
+            worker_id=worker_id,
+            started_at=started_at,
+            finished_at=finished_at,
+        )
+        return _WorkerPhaseResult(
+            worker_id=worker_id,
+            template=template,
+            finding=finding,
+            source_report=source_report,
+            candidate_count=candidate_count,
+            spec_auto_id=tr.spec_auto_id or "",
+            spec_auto_path=tr.spec_auto_path,
+            branch="",
+            allowed_files=(),
+            started_at=started_at,
+            finished_at=finished_at,
+            verified_diff=None,
+            worker_verification=None,
+            fl=None,
+            halt_outcome=halt,
+        )
+
+    assert tr.spec_auto_path is not None  # success ⇒ path exists
+
+    if template == "A":
+        allowed_files = list(_AUTO_FIX_ALLOWED_FILES_A)
+    else:  # "B"
+        allowed_files = [finding.file, "tests/"]
+
+    branch = f"auto/{tr.spec_auto_id}"
+
+    def _wrap_halt(
+        outcome: AutoFixOutcome,
+    ) -> _WorkerPhaseResult:
+        finished_at = _finish()
+        return _WorkerPhaseResult(
+            worker_id=worker_id,
+            template=template,
+            finding=finding,
+            source_report=source_report,
+            candidate_count=candidate_count,
+            spec_auto_id=tr.spec_auto_id,
+            spec_auto_path=tr.spec_auto_path,
+            branch=branch,
+            allowed_files=tuple(allowed_files),
+            started_at=started_at,
+            finished_at=finished_at,
+            verified_diff=None,
+            worker_verification=None,
+            fl=None,
+            halt_outcome=_stamp_worker(
+                outcome,
+                worker_id=worker_id,
+                started_at=started_at,
+                finished_at=finished_at,
+            ),
+        )
+
+    try:
+        with workspace_factory(repo) as clone:
+            clone_path = Path(clone)
+            spec_auto_in_clone = _copy_spec_auto_into_clone(
+                spec_auto_live=tr.spec_auto_path,
+                live_repo=repo,
+                clone=clone_path,
+            )
+
+            try:
+                gops.create_and_checkout_branch(
+                    repo=clone_path, branch=branch
+                )
+            except Exception as exc:
+                return _wrap_halt(
+                    AutoFixOutcome(
+                        skipped=False,
+                        spec_auto_id=tr.spec_auto_id,
+                        spec_auto_path=tr.spec_auto_path,
+                        finding_signature=finding.signature,
+                        candidate_count=candidate_count,
+                        template=template,
+                        branch=branch,
+                        halt_reason=(
+                            "worker: branch creation failed in clone: "
+                            f"{type(exc).__name__}: {exc}"
+                        ),
+                    )
+                )
+
+            def _verifier(
+                *, repo: Path, branch: str
+            ) -> IterationVerification:
+                return _verify_iteration_auto(
+                    template=template,
+                    finding=finding,
+                    allowed_files=allowed_files,
+                    repo=repo,
+                    branch=branch,
+                    gops=gops,
+                    run_suite=run_suite,
+                    recheck_mutation=recheck_mutation,
+                    recheck_adversarial=recheck_adversarial,
+                    inspect=inspect,
+                )
+
+            try:
+                fl: FixLoopOutcome = run_fix_loop(
+                    spec_path=spec_auto_in_clone,
+                    repo=clone_path,
+                    branch=branch,
+                    dispatcher=dispatcher,
+                    verifier=_verifier,
+                    max_iterations=loop_max_iterations,
+                    wall_clock_budget_s=dispatch_timeout_s,
+                    feedback_dir=clone_path / "_ai_workspace" / "logs",
+                    spec_id=tr.spec_auto_id,
+                )
+            except Exception as exc:
+                return _wrap_halt(
+                    AutoFixOutcome(
+                        skipped=False,
+                        spec_auto_id=tr.spec_auto_id,
+                        spec_auto_path=tr.spec_auto_path,
+                        finding_signature=finding.signature,
+                        candidate_count=candidate_count,
+                        template=template,
+                        branch=branch,
+                        dispatched=False,
+                        halt_reason=(
+                            f"{_HALT_DISPATCH_FAILED}: "
+                            f"{type(exc).__name__}: {exc}".strip()
+                        ),
+                        iterations=0,
+                        converged=False,
+                        loop_halt_reason=LOOP_HALT_IMMEDIATE,
+                    )
+                )
+
+            verif = fl.final_verification
+
+            # Worker HALT A: dispatch never produced a verifiable state.
+            if verif is None:
+                dispatch_status = fl.final_dispatch_status or "failed"
+                reason = (
+                    fl.final_dispatch_halt_reason
+                    or fl.halt_reason
+                    or _HALT_DISPATCH_FAILED
+                )
+                return _wrap_halt(
+                    AutoFixOutcome(
+                        skipped=False,
+                        spec_auto_id=tr.spec_auto_id,
+                        spec_auto_path=tr.spec_auto_path,
+                        finding_signature=finding.signature,
+                        candidate_count=candidate_count,
+                        template=template,
+                        branch=branch,
+                        dispatched=fl.final_dispatched,
+                        dispatch_status=dispatch_status,
+                        halt_reason=f"{_HALT_DISPATCH_FAILED}: {reason}",
+                        iterations=fl.iterations,
+                        converged=False,
+                        loop_halt_reason=fl.halt_reason,
+                    )
+                )
+
+            # Worker HALT B: ran out of iterations without converging.
+            if not fl.converged:
+                halt_reason = _compose_halt_reason(
+                    template=template,
+                    r5_killed=verif.r5_passed,
+                    r5_status=verif.r5_status,
+                    r4_passed=verif.r4_passed,
+                    guard_passed=verif.guard_passed,
+                    guard_reasons=verif.guard_reasons,
+                )
+                if (
+                    fl.halt_reason
+                    and fl.halt_reason != LOOP_HALT_MAX_ITERATIONS
+                    and loop_max_iterations > 1
+                ):
+                    halt_reason = f"{halt_reason} [{fl.halt_reason}]"
+                elif (
+                    fl.halt_reason
+                    and fl.halt_reason == LOOP_HALT_MAX_ITERATIONS
+                    and loop_max_iterations > 1
+                ):
+                    halt_reason = (
+                        f"{halt_reason} [fix-loop exhausted "
+                        f"{loop_max_iterations} iterations]"
+                    )
+                return _wrap_halt(
+                    AutoFixOutcome(
+                        skipped=False,
+                        spec_auto_id=tr.spec_auto_id,
+                        spec_auto_path=tr.spec_auto_path,
+                        finding_signature=finding.signature,
+                        candidate_count=candidate_count,
+                        template=template,
+                        branch=branch,
+                        dispatched=True,
+                        dispatch_status=fl.final_dispatch_status,
+                        r5_killed=verif.r5_passed,
+                        r4_suite_passed=verif.r4_passed,
+                        guard_passed=verif.guard_passed,
+                        guard_halt_reasons=verif.guard_reasons,
+                        merged=False,
+                        halt_reason=halt_reason,
+                        iterations=fl.iterations,
+                        converged=False,
+                        loop_halt_reason=fl.halt_reason,
+                    )
+                )
+
+            # Worker phase converged: snapshot the verified state.
+            verified_diff = verif.diff
+            verified_verification = verif
+            verified_fl = fl
+    except Exception as exc:
+        return _wrap_halt(
+            AutoFixOutcome(
+                skipped=False,
+                spec_auto_id=tr.spec_auto_id,
+                spec_auto_path=tr.spec_auto_path,
+                finding_signature=finding.signature,
+                candidate_count=candidate_count,
+                template=template,
+                branch=branch,
+                halt_reason=(
+                    "worker: workspace setup failed: "
+                    f"{type(exc).__name__}: {exc}"
+                ),
+            )
+        )
+
+    finished_at = _finish()
+    return _WorkerPhaseResult(
+        worker_id=worker_id,
+        template=template,
+        finding=finding,
+        source_report=source_report,
+        candidate_count=candidate_count,
+        spec_auto_id=tr.spec_auto_id,
+        spec_auto_path=tr.spec_auto_path,
+        branch=branch,
+        allowed_files=tuple(allowed_files),
+        started_at=started_at,
+        finished_at=finished_at,
+        verified_diff=verified_diff,
+        worker_verification=verified_verification,
+        fl=verified_fl,
+        halt_outcome=None,
+    )
+
+
+def _drain_worker_pool(
+    *,
+    pre_translated: list[
+        tuple[str, Finding, Path | None, int, Any, str, str]
+    ],
+    repo: Path,
+    today: date | None,
+    gops: GitOps,
+    dispatcher: FixDispatcher,
+    run_suite: SuiteRunner,
+    recheck_mutation: MutationRechecker,
+    recheck_adversarial: AdversarialRechecker,
+    inspect: GuardInspector,
+    workspace_factory: IsolatedWorkspace,
+    applier: PatchApplier,
+    dispatch_timeout_s: float,
+    loop_max_iterations: int,
+    parallelism: int,
+    max_merges_per_night: int,
+    night_wall_clock_budget_s: float | None,
+    proposal_dir: Path | None,
+    backlog_skip_reason: Callable[[], str],
+) -> tuple[
+    AutoFixOutcome,
+    tuple[AutoFixOutcome, ...],
+    int,
+    int,
+    tuple[str, ...],
+]:
+    """spec_041 §2-2/§2-3 — dispatch K candidates through a worker pool
+    of size P, then drain completed verified patches serially through
+    the Integrator.
+
+    Workers are submitted **dynamically** (initial fill up to P, then
+    one more after each completion) rather than all-at-once, so that
+    gate-triggered drop cleanly suppresses dispatches for unprocessed
+    candidates — preserving the spec_038 "no useless dispatch after
+    backlog cap trips" semantic at P=1 (bit-for-bit) and extending it
+    naturally to P > 1.
+
+    Returns ``(primary, extras, parallelism, achieved_max_concurrency,
+    drop_reasons)``. ``achieved_max_concurrency`` is the max number of
+    workers actually in-flight at the same time (≤ P, equal to 1 at
+    the default P=1).
+    """
+
+    total_K = len(pre_translated)
+    queue = list(pre_translated)
+    in_flight: dict[concurrent.futures.Future, str] = {}
+    achieved_max_concurrency = 1
+    night_start = time.monotonic()
+
+    # Per the spec_041 §2-3 gate model, the integration queue is
+    # serialised — only the main thread invokes the Integrator. The
+    # lock object below is documented for future reference (worker
+    # threads never integrate), keeping the design self-documenting
+    # even though in current code only the main thread integrates.
+    integration_lock = threading.Lock()
+    del integration_lock  # not yet exercised by tests; future-proofing only
+
+    def _evaluate_gates(*, merges_done: int) -> str:
+        """spec_041 §2-3 — return non-empty reason iff a gate trips."""
+        if _pause_file_present(repo):
+            return "PAUSE: `_ai_workspace/PAUSE` が現れた"
+        bsr = backlog_skip_reason()
+        if bsr:
+            return bsr
+        if merges_done >= max_merges_per_night:
+            return (
+                f"{_HALT_MAX_MERGES_REACHED_PREFIX} "
+                f"({merges_done} merges, limit {max_merges_per_night})"
+            )
+        if (
+            night_wall_clock_budget_s is not None
+            and night_wall_clock_budget_s > 0
+        ):
+            elapsed = time.monotonic() - night_start
+            if elapsed >= night_wall_clock_budget_s:
+                return (
+                    f"{_HALT_NIGHT_WALL_CLOCK_PREFIX} "
+                    f"({elapsed:.0f}s elapsed, "
+                    f"budget {night_wall_clock_budget_s:.0f}s)"
+                )
+        return ""
+
+    outcomes: list[AutoFixOutcome] = []
+    drop_reasons: list[str] = []
+    processed_count = 0  # workers whose result we routed (merge / halt / etc.)
+    merges_done = 0
+    gate_tripped = ""
+
+    executor = concurrent.futures.ThreadPoolExecutor(
+        max_workers=parallelism, thread_name_prefix="ccd-worker"
+    )
+
+    def _submit_next() -> None:
+        if not queue:
+            return
+        record = queue.pop(0)
+        (
+            template,
+            finding,
+            source_report,
+            candidate_count,
+            tr,
+            worker_id,
+            _branch_hint,
+        ) = record
+        fut = executor.submit(
+            _run_worker_phase,
+            worker_id=worker_id,
+            template=template,
+            finding=finding,
+            source_report=source_report,
+            candidate_count=candidate_count,
+            tr=tr,
+            repo=repo,
+            gops=gops,
+            dispatcher=dispatcher,
+            run_suite=run_suite,
+            recheck_mutation=recheck_mutation,
+            recheck_adversarial=recheck_adversarial,
+            inspect=inspect,
+            workspace_factory=workspace_factory,
+            dispatch_timeout_s=dispatch_timeout_s,
+            loop_max_iterations=loop_max_iterations,
+        )
+        in_flight[fut] = worker_id
+
+    def _maybe_save_dropped(wpr: _WorkerPhaseResult) -> None:
+        """spec_041 §2-3 — 退避 a verified-but-dropped patch."""
+        if wpr.verified_diff:
+            _save_dropped_patch(
+                live_repo=repo,
+                spec_auto_id=wpr.spec_auto_id
+                or f"dropped_{wpr.worker_id}",
+                diff_text=wpr.verified_diff,
+                today=today,
+                proposal_dir=proposal_dir,
+            )
+
+    def _gate_check(*, processed_already: int) -> bool:
+        """spec_041 §2-3 — set ``gate_tripped`` iff any gate fires.
+
+        Called BOTH before each integration (after the first) AND before
+        each new submission (after the first ``parallelism`` initial
+        fills). Two-point checking preserves the spec_038 "no useless
+        dispatch after backlog cap trips" semantic at P=1 — the
+        integration drain alone cannot prevent the next worker's
+        ``claude`` subprocess from spawning, so the spec_041 gate also
+        gates submission.
+        """
+        nonlocal gate_tripped
+        if gate_tripped:
+            return True
+        if processed_already <= 0:
+            return False  # pre-loop check already ran
+        reason = _evaluate_gates(merges_done=merges_done)
+        if reason:
+            gate_tripped = reason
+            return True
+        return False
+
+    try:
+        # Initial fill up to P workers (no per-submission gate check —
+        # the pre-loop check in ``_run_auto_fix_loop`` already ran).
+        for _ in range(parallelism):
+            if not queue:
+                break
+            _submit_next()
+            if len(in_flight) > achieved_max_concurrency:
+                achieved_max_concurrency = len(in_flight)
+
+        while in_flight:
+            if len(in_flight) > achieved_max_concurrency:
+                achieved_max_concurrency = len(in_flight)
+            done_set, _pending = concurrent.futures.wait(
+                in_flight.keys(),
+                return_when=concurrent.futures.FIRST_COMPLETED,
+            )
+            for fut in done_set:
+                worker_id = in_flight.pop(fut)
+                try:
+                    wpr = fut.result()
+                except BaseException as exc:  # noqa: BLE001 — record + continue
+                    # spec_041 §2-4 — record the crash and keep going.
+                    wpr = _build_crash_worker_result(
+                        worker_id=worker_id, exc=exc
+                    )
+
+                # spec_041 §2-3 gate-before-integration (after first).
+                if _gate_check(processed_already=processed_count):
+                    _maybe_save_dropped(wpr)
+                    continue
+
+                # No gate tripped — route this worker's result.
+                if wpr.halt_outcome is not None:
+                    outcomes.append(wpr.halt_outcome)
+                else:
+                    integrated = _integrate_one_candidate(
+                        spec_auto_id=wpr.spec_auto_id,
+                        spec_auto_path=wpr.spec_auto_path,
+                        finding=wpr.finding,
+                        template=wpr.template,
+                        allowed_files=list(wpr.allowed_files),
+                        candidate_count=wpr.candidate_count,
+                        branch=wpr.branch,
+                        diff_text=wpr.verified_diff or "",
+                        worker_verification=wpr.worker_verification,
+                        fl=wpr.fl,
+                        loop_max_iterations=loop_max_iterations,
+                        live_repo=repo,
+                        gops=gops,
+                        run_suite=run_suite,
+                        inspect=inspect,
+                        apply_patch=applier,
+                    )
+                    integrated = _stamp_worker(
+                        integrated,
+                        worker_id=worker_id,
+                        started_at=wpr.started_at,
+                        finished_at=wpr.finished_at,
+                    )
+                    outcomes.append(integrated)
+                    if integrated.merged:
+                        merges_done += 1
+                processed_count += 1
+
+                # spec_041 §2-3 gate-before-submission. Re-evaluating
+                # gates here keeps the spec_038 dispatch-count
+                # semantic (the next worker's ``claude`` subprocess
+                # does NOT spawn after backlog / PAUSE / max_merges
+                # trips) — at P=1 this is bit-for-bit identical to
+                # the pre-spec_041 sequential loop's behavior.
+                if queue and not _gate_check(
+                    processed_already=processed_count
+                ):
+                    _submit_next()
+                    if len(in_flight) > achieved_max_concurrency:
+                        achieved_max_concurrency = len(in_flight)
+    finally:
+        executor.shutdown(wait=True, cancel_futures=False)
+
+    if gate_tripped:
+        remaining = total_K - processed_count
+        if remaining > 0:
+            outcomes.append(
+                AutoFixOutcome(
+                    skipped=True,
+                    skip_reason=(
+                        f"{_HALT_REMAINING_SKIPPED_PREFIX}: "
+                        f"{remaining} 件 ({gate_tripped})"
+                    ),
+                )
+            )
+        drop_reasons.append(gate_tripped)
+
+    if not outcomes:
+        # All K workers consumed silently (only possible if total_K==0,
+        # already handled by the caller — defence in depth so the
+        # caller never has to special-case the empty tuple).
+        return (
+            AutoFixOutcome(
+                skipped=True,
+                skip_reason="auto loop produced no outcomes",
+            ),
+            (),
+            parallelism,
+            achieved_max_concurrency,
+            tuple(drop_reasons),
         )
 
     primary = outcomes[0]
     extras = tuple(outcomes[1:])
-    return primary, extras
+    return (
+        primary,
+        extras,
+        parallelism,
+        achieved_max_concurrency,
+        tuple(drop_reasons),
+    )
+
+
+def _build_crash_worker_result(
+    *,
+    worker_id: str,
+    exc: BaseException,
+) -> _WorkerPhaseResult:
+    """spec_041 §2-4 — wrap a ``ThreadPoolExecutor``-level exception.
+
+    The worker body itself catches everything (see :func:`_run_worker_phase`),
+    so reaching here means the executor itself raised — extremely rare,
+    e.g. the worker thread was killed by a signal. We still record the
+    candidate as a HALT so the morning brief surfaces ``worker crashed``
+    rather than silently dropping the entry.
+    """
+
+    stamp = _now_iso_utc()
+    return _WorkerPhaseResult(
+        worker_id=worker_id,
+        template="",
+        # Build a placeholder Finding so the brief / record JSON has
+        # the same shape — we have no candidate context once the executor
+        # fails (futures map only stores worker_id).
+        finding=Finding(
+            channel="",
+            file="",
+            line=0,
+            mutation="",
+            signature=f"crashed-{worker_id}",
+            status="",
+            source_report="",
+        ),
+        source_report=None,
+        candidate_count=0,
+        spec_auto_id="",
+        spec_auto_path=None,
+        branch="",
+        allowed_files=(),
+        started_at=stamp,
+        finished_at=stamp,
+        verified_diff=None,
+        worker_verification=None,
+        fl=None,
+        halt_outcome=_stamp_worker(
+            AutoFixOutcome(
+                skipped=False,
+                halt_reason=(
+                    f"{_HALT_WORKER_CRASHED_PREFIX}: "
+                    f"{type(exc).__name__}: {exc}".strip()
+                ),
+            ),
+            worker_id=worker_id,
+            started_at=stamp,
+            finished_at=stamp,
+        ),
+    )
+
+
+def _save_dropped_patch(
+    *,
+    live_repo: Path,
+    spec_auto_id: str,
+    diff_text: str,
+    today: date | None,
+    proposal_dir: Path | None,
+) -> Path:
+    """spec_041 §2-3 — stash a verified-but-dropped patch under
+    ``_ai_workspace/nightly/proposals/`` with a ``dropped_`` filename
+    prefix so the morning brief can surface it alongside propose-mode
+    artifacts (same shape, different reason).
+    """
+
+    today_d = today if today is not None else _utc_today()
+    proposals_dir = (
+        Path(proposal_dir).resolve()
+        if proposal_dir is not None
+        else live_repo / _PROPOSAL_DIR_REL
+    )
+    proposals_dir.mkdir(parents=True, exist_ok=True)
+    patch_path = proposals_dir / (
+        f"dropped_{today_d.isoformat()}_{spec_auto_id}.patch"
+    )
+    body = diff_text if diff_text.endswith("\n") else diff_text + "\n"
+    patch_path.write_text(body, encoding="utf-8")
+    return patch_path
 
 
 def _process_one_auto_fix_candidate(

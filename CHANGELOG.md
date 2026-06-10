@@ -2,6 +2,86 @@
 
 本プロジェクトの注目すべき変更を記録する。フォーマットは [Keep a Changelog](https://keepachangelog.com/) に準ずる。
 
+## [0.24.0] — 2026-06-10
+
+### Added
+
+- spec_041: **WorkerPool ── 複数 CC dispatch の並列化と直列 Integration queue**。
+  spec_038 の K 候補と spec_039 の FixLoop と spec_040 の隔離 Integrator を
+  並列実行できる形にまとめる。並列度 P (1..4) のワーカープールが候補を並列
+  処理し、完了した検証済み patch を **直列の Integration queue** に投入。
+  Integrator は完了順に 1 件ずつ live へ apply + 再検証 + merge する。各
+  integration の前に **PAUSE / 未push バックログ cap / `max_merges_per_night`
+  / 夜間窓 wall-clock** を再評価するゲートが入り、いずれかが trip すると
+  残りの patch は退避 (`_ai_workspace/nightly/proposals/dropped_*.patch`) +
+  朝レポートでの 1 行で surface される。既定 (P=1) で v2 / spec_038〜040 と
+  外形完全一致 (テスト固定)。
+- `ccd/profile.py` ── `SafetyConfig.parallelism: int = 1` (1..4 バリデータ
+  付き) + `SafetyConfig.max_merges_per_night: int = 3` (1..10 バリデータ付き)。
+- `ccd/nightly.py` ── 新ヘルパ `_run_worker_phase()` (worker (クローン) 内
+  の dispatch + R5/R4/guard 回しを 1 関数に切り出し) + 新ヘルパ
+  `_drain_worker_pool()` (ThreadPoolExecutor で K 候補を P 並列に dispatch
+  → as_completed 順に直列 Integrator)。worker は **`_WorkerPhaseResult`**
+  という新 dataclass を返し、verified diff + worker_verification + fl +
+  start/finish ISO timestamps を carry。失敗 (translate fail / 例外 / 未収束)
+  は `halt_outcome` フィールドに包む。
+- `ccd/nightly.py` ── 新 halt anchor 定数: `_HALT_MAX_MERGES_REACHED_PREFIX`,
+  `_HALT_NIGHT_WALL_CLOCK_PREFIX`, `_HALT_WORKER_CRASHED_PREFIX`。
+- `ccd/nightly.py` `AutoFixOutcome` に新フィールド `worker_id: str = ""`,
+  `worker_started_at: str = ""`, `worker_finished_at: str = ""`。spec_042
+  が **実測** で並列効率を集計できるようにする。既定値は空文字列で v2 外形
+  互換。
+- `ccd/nightly.py` `NightlyResult` に新フィールド `parallelism: int = 1`,
+  `achieved_max_concurrency: int = 1`, `drop_reasons: tuple[str, ...] = ()`。
+  既定値は spec_023〜040 と bit-for-bit 一致。
+- `ccd/nightly.py` ── 新ヘルパ `_save_dropped_patch()` ── gate trip で
+  退避された verified patch を `_ai_workspace/nightly/proposals/dropped_*.patch`
+  に保存。propose-mode artifact と同じ shape で朝レポート §B が surface
+  しやすい。
+- `ccd/brief.py` ── §B 複数候補レンダラ (`_render_section_b_multi`) に
+  **夜サマリ 1 行** を追加: P>1 のときに「候補 K / 並列 P / 達成同時実行数
+  / merge 数 / drop 数 (理由別)」を表示。P=1 では出力されないので v2 layout
+  と bit-for-bit 一致。
+- `ccd/brief.py` ── §B 候補小節 (`_render_one_candidate_subsection`) に
+  worker_id + start/finish timestamp を追加。outcome の `worker_id` が
+  空文字列のときは小節に何も足さないので spec_038〜040 と bit-for-bit 一致。
+- 新規 pytest 11 件 (test_nightly.py) ──
+  - `test_default_p1_run_outcomes_identical_to_spec040` (P=1 外形互換)
+  - `test_p2_three_candidates_parallel_workers_serial_integration` (P=2 で
+    workers が実際に並列に走り、Integration は直列)
+  - `test_max_merges_per_night_drops_remaining_with_patch_save` (cap 到達 → drop)
+  - `test_worker_exception_isolated_does_not_stop_sibling` (例外隔離)
+  - `test_per_worker_timestamps_recorded_on_outcomes` (per-worker timestamp)
+  - `test_p2_brief_renders_night_summary_line` (夜サマリ render)
+  - `test_p1_brief_does_not_mention_parallel_summary` (P=1 layout 不変)
+  - `test_parallelism_clamped_to_safety_bounds` (1..4)
+  - `test_max_merges_clamped_to_safety_bounds` (1..10)
+  - `test_clones_cleaned_up_after_night` (clone cleanup)
+  - `test_rate_limit_dispatch_failure_is_transient_for_fixloop`
+    (spec_041 §2-6 — rate-limit は既存 transient 分類で FixLoop が拾う)
+
+### Changed
+
+- `ccd/nightly.py` ── `_run_auto_fix_loop()` の戻り値を 5-tuple に拡張:
+  `(primary, extras, parallelism, achieved_max_concurrency, drop_reasons)`。
+  `run_nightly()` は後ろ 3 つを `NightlyResult` に詰める。Public 互換性は
+  保たれる (新フィールドはデフォルト値が v2 外形と一致)。
+- `ccd/nightly.py` ── `_run_auto_fix_loop()` の本体を WorkerPool model に
+  rewrite。候補選択 → **全候補を main thread で直列 translate** (spec_auto
+  ID の monotonic 採番が thread-safe でないため) → `_drain_worker_pool()`
+  で並列 dispatch + 直列 integrate。spec_038 の K 直列ループは内部実装が
+  変わったが外形は同一。
+- `ccd/nightly.py` ── 既存の `_process_one_auto_fix_candidate()` は
+  そのまま残してあるが (内部の synchronous convenience として)、
+  `_run_auto_fix_loop()` からの呼び出しは削除した。後方互換性のためだけ
+  に残置。
+- `ccd/brief.py` `run_brief()` / `_render_md()` / `_render_section_b_multi()`
+  に `parallelism` / `achieved_max_concurrency` / `drop_reasons` を追加。
+  既定値は v2 と一致 (P=1, conc=1, reasons=())。
+- `pyproject.toml` / `ccd/__init__.py` / `tests/test_smoke.py` ──
+  `0.23.0` → `0.24.0` (minor bump — 新 SafetyConfig フィールド +
+  WorkerPool model 導入)。
+
 ## [0.23.0] — 2026-06-10
 
 ### Added

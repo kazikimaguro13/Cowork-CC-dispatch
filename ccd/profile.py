@@ -575,6 +575,27 @@ class SafetyConfig(BaseModel):
     agent four feedback-augmented retries before halting, which is
     enough to cover transient agent slips without burning the 40-min
     budget on a stuck candidate.
+
+    ``parallelism`` (spec_041) sets the worker-pool size P used by the
+    nightly auto / propose loops. Workers run the dispatcher + verify
+    cycle in parallel inside disposable clones; completed patches are
+    drained serially through the Integrator. Default ``1`` keeps the
+    v2 / spec_038〜040 外形 (dispatch count, brief layout, recorded
+    outcome shape) bit-for-bit identical. Allowed range is ``1..4`` —
+    above 4 the rate-limit分担 against the single Claude account starts
+    to dominate dispatch latency before parallel speedup pays for it
+    (the spec deliberately stops at 4 until the field数据 says
+    otherwise).
+
+    ``max_merges_per_night`` (spec_041) caps how many auto-mode merges
+    can land on local ``main`` in one nightly run. Default ``3`` matches
+    the un-pushed-backlog limit so the operator review queue stays
+    bounded even when parallelism produces more verified patches than
+    the cap. The Integrator re-evaluates this gate before each merge;
+    once the cap is hit, the remaining verified patches are退避 to
+    ``_ai_workspace/nightly/proposals/`` (same shape as propose-mode
+    artifacts) and surfaced in the morning brief. Allowed range
+    is ``1..10``.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -583,6 +604,8 @@ class SafetyConfig(BaseModel):
     fix_templates: list[str] = Field(default_factory=lambda: ["A"])
     max_candidates_per_night: int = 1
     loop_max_iterations: int = 1
+    parallelism: int = 1
+    max_merges_per_night: int = 3
 
     @field_validator("fix_mode")
     @classmethod
@@ -624,6 +647,40 @@ class SafetyConfig(BaseModel):
         if v < 1 or v > 5:
             raise ValueError(
                 f"loop_max_iterations must be in 1..5; got {v}"
+            )
+        return v
+
+    @field_validator("parallelism")
+    @classmethod
+    def _parallelism_in_range(cls, v: int) -> int:
+        # spec_041 — bound to 1..4. Below 1 makes no sense (a "0 worker"
+        # pool never dispatches); above 4 the rate-limit分担 against
+        # the single Claude account dominates dispatch latency before
+        # parallel speedup pays for it.
+        if not isinstance(v, int) or isinstance(v, bool):
+            raise ValueError(
+                f"parallelism must be an int; got {type(v).__name__}"
+            )
+        if v < 1 or v > 4:
+            raise ValueError(
+                f"parallelism must be in 1..4; got {v}"
+            )
+        return v
+
+    @field_validator("max_merges_per_night")
+    @classmethod
+    def _max_merges_in_range(cls, v: int) -> int:
+        # spec_041 — bound to 1..10. Below 1 makes no sense (a "0 merge"
+        # cap never lands anything); above 10 is well beyond the
+        # un-pushed review queue an operator can keep up with in one
+        # morning.
+        if not isinstance(v, int) or isinstance(v, bool):
+            raise ValueError(
+                f"max_merges_per_night must be an int; got {type(v).__name__}"
+            )
+        if v < 1 or v > 10:
+            raise ValueError(
+                f"max_merges_per_night must be in 1..10; got {v}"
             )
         return v
 
@@ -951,6 +1008,10 @@ def render_profile(result: ProfileLoadResult) -> str:
     )
     lines.append(
         f"loop_max_iterations = {p.safety.loop_max_iterations}"
+    )
+    lines.append(f"parallelism = {p.safety.parallelism}")
+    lines.append(
+        f"max_merges_per_night = {p.safety.max_merges_per_night}"
     )
     return "\n".join(lines)
 

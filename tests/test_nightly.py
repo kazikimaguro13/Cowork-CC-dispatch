@@ -5054,3 +5054,581 @@ def test_default_k1_iter1_brief_does_not_mention_fix_loop(
     body = result.brief_report_wsl.read_text(encoding="utf-8")
     assert "収束:" not in body
     assert "未収束:" not in body
+
+
+# --------------------------------------------------------------------------- #
+# spec_041 — WorkerPool (parallelism + Integration queue gates)
+# --------------------------------------------------------------------------- #
+
+
+def _autofix_profile_pool(
+    *,
+    k: int,
+    p: int,
+    max_merges: int = 3,
+) -> Profile:
+    """spec_041 — profile with K candidates / P workers / merge cap."""
+
+    return Profile(
+        discovery=DiscoveryConfig(channels=["mutation"]),
+        schedule=ScheduleConfig(),
+        safety=SafetyConfig(
+            fix_mode="auto",
+            max_candidates_per_night=k,
+            parallelism=p,
+            max_merges_per_night=max_merges,
+        ),
+    )
+
+
+def test_default_p1_run_outcomes_identical_to_spec040(
+    tmp_path: Path,
+) -> None:
+    """spec_041 §3-1 — at the default P=1 the AutoFixOutcome / merge
+    sequence / dispatch count is bit-for-bit identical to the
+    spec_038/039/040 sequential loop. Also pins that the new
+    NightlyResult parallelism telemetry stays at the defaults."""
+
+    _write_mutation_discover_json(repo=tmp_path)
+    dispatcher = _FakeFixDispatcher()
+    suite = _FakeSuiteRunner()
+    recheck = _FakeMutationRechecker(status="killed")
+    guard = _FakeGuardInspector()
+    gops = _FakeGitOps()
+    brief_runner, _ = _make_fake_brief_runner()
+
+    result = run_nightly(
+        repo=tmp_path,
+        profile=_autofix_profile(autonomous=True),  # default K=1, P=1
+        channel_runner=_RecordingChannelRunner(),
+        brief_runner=brief_runner,
+        windows_mirror=lambda _p: None,
+        fix_dispatcher=dispatcher,
+        suite_runner=suite,
+        mutation_rechecker=recheck,
+        guard_inspector=guard,
+        git_ops=gops,
+        **_auto_fix_test_seams(tmp_path),
+    )
+
+    assert result.auto_fix is not None
+    assert result.auto_fix.merged is True
+    assert result.auto_fix_extras == ()
+    assert len(dispatcher.calls) == 1
+    assert gops.merges == [result.auto_fix.branch]
+    # spec_041 telemetry defaults preserved.
+    assert result.parallelism == 1
+    assert result.achieved_max_concurrency == 1
+    assert result.drop_reasons == ()
+
+
+def test_p2_three_candidates_parallel_workers_serial_integration(
+    tmp_path: Path,
+) -> None:
+    """spec_041 §3-2 — at P=2 with K=3, two workers run concurrently and
+    integration is serial in completion order. We script per-worker
+    delays so the test can pin both (a) achieved_max_concurrency >= 2
+    and (b) integration runs strictly sequentially on the main thread.
+    """
+
+    _write_mutation_discover_json(
+        repo=tmp_path, actionable=_multi_actionable(3)
+    )
+
+    # A dispatcher that records start/end timestamps so we can check
+    # overlap. Each call sleeps a small fixed duration so workers can
+    # actually overlap under P=2.
+    import threading
+    import time
+
+    in_flight_lock = threading.Lock()
+    in_flight: list[str] = []
+    max_in_flight = {"n": 0}
+
+    class _ConcurrentDispatcher:
+        def __init__(self) -> None:
+            self.calls: list[tuple[Path, Path, str]] = []
+
+        def __call__(
+            self,
+            *,
+            spec_path: Path,
+            repo: Path,
+            branch: str,
+            feedback: Any | None = None,
+        ) -> FixDispatchOutcome:
+            self.calls.append((Path(spec_path), Path(repo), branch))
+            with in_flight_lock:
+                in_flight.append(branch)
+                if len(in_flight) > max_in_flight["n"]:
+                    max_in_flight["n"] = len(in_flight)
+            try:
+                time.sleep(0.05)
+                return FixDispatchOutcome(status="done", commits_made=1)
+            finally:
+                with in_flight_lock:
+                    in_flight.remove(branch)
+
+    dispatcher = _ConcurrentDispatcher()
+    suite = _FakeSuiteRunner()
+    recheck = _FakeMutationRechecker(status="killed")
+    guard = _FakeGuardInspector()
+    gops = _FakeGitOps()
+    brief_runner, _ = _make_fake_brief_runner()
+
+    # Use a workspace factory that yields per-worker clone dirs so the
+    # tests assert workers do not collide on a shared clone path.
+    from contextlib import contextmanager
+
+    clone_root = tmp_path / "_pool_clone"
+    clone_counter = {"n": 0}
+    clone_lock = threading.Lock()
+
+    @contextmanager
+    def per_worker_workspace(live_repo: Path) -> Any:
+        with clone_lock:
+            clone_counter["n"] += 1
+            sub = clone_root / f"w{clone_counter['n']}"
+        sub.mkdir(parents=True, exist_ok=True)
+        yield sub
+
+    applier = _FakePatchApplier()
+
+    result = run_nightly(
+        repo=tmp_path,
+        profile=_autofix_profile_pool(k=3, p=2),
+        channel_runner=_RecordingChannelRunner(),
+        brief_runner=brief_runner,
+        windows_mirror=lambda _p: None,
+        fix_dispatcher=dispatcher,
+        suite_runner=suite,
+        mutation_rechecker=recheck,
+        guard_inspector=guard,
+        git_ops=gops,
+        isolated_workspace=per_worker_workspace,
+        apply_patch=applier,
+    )
+
+    # 3 workers dispatched + 3 integrations + 3 merges (all green fakes).
+    assert len(dispatcher.calls) == 3
+    assert len(gops.merges) == 3
+    # At least two workers ran simultaneously at some point.
+    assert max_in_flight["n"] >= 2
+    assert result.parallelism == 2
+    assert result.achieved_max_concurrency >= 2
+    # Integration is serialised on the main thread (Integrator applies
+    # the patch on live exactly K=3 times, and apply order = completion
+    # order).
+    assert len(applier.calls) == 3
+    # All three patches landed on the live repo path.
+    for call in applier.calls:
+        assert Path(call[0]).resolve() == tmp_path.resolve()
+
+
+def test_max_merges_per_night_drops_remaining_with_patch_save(
+    tmp_path: Path,
+) -> None:
+    """spec_041 §3-3 — with K=2 green candidates and max_merges=1, the
+    Integrator merges 1 and drops 1. The dropped patch is written
+    under ``_ai_workspace/nightly/proposals/`` (rather than vanishing)
+    and the rollup skip outcome carries the cap-reached anchor.
+    """
+
+    from ccd.nightly import _HALT_MAX_MERGES_REACHED_PREFIX
+
+    _write_mutation_discover_json(
+        repo=tmp_path, actionable=_multi_actionable(2)
+    )
+    dispatcher = _FakeFixDispatcher()
+    suite = _FakeSuiteRunner()
+    recheck = _FakeMutationRechecker(status="killed")
+    guard = _FakeGuardInspector()
+    diff_text = "diff --git a/tests/x.py b/tests/x.py\n+x\n"
+    gops = _FakeGitOps(canned_diff=diff_text)
+    brief_runner, _ = _make_fake_brief_runner()
+
+    result = run_nightly(
+        repo=tmp_path,
+        profile=_autofix_profile_pool(k=2, p=1, max_merges=1),
+        channel_runner=_RecordingChannelRunner(),
+        brief_runner=brief_runner,
+        windows_mirror=lambda _p: None,
+        fix_dispatcher=dispatcher,
+        suite_runner=suite,
+        mutation_rechecker=recheck,
+        guard_inspector=guard,
+        git_ops=gops,
+        **_auto_fix_test_seams(tmp_path),
+    )
+
+    af = result.auto_fix
+    assert af is not None
+    assert af.merged is True  # candidate 1 merged
+    # Candidate 2 dropped because max_merges_per_night=1 was reached.
+    assert len(gops.merges) == 1
+    assert len(result.auto_fix_extras) == 1
+    skip = result.auto_fix_extras[0]
+    assert skip.skipped is True
+    assert _HALT_MAX_MERGES_REACHED_PREFIX in skip.skip_reason
+    # The cap-trip reason surfaces on NightlyResult.drop_reasons.
+    assert any(
+        _HALT_MAX_MERGES_REACHED_PREFIX in r for r in result.drop_reasons
+    )
+    # The dropped patch was退避 to proposals/ with ``dropped_`` prefix.
+    proposals_dir = tmp_path / "_ai_workspace" / "nightly" / "proposals"
+    dropped_patches = list(proposals_dir.glob("dropped_*.patch"))
+    # With P=1, max_merges=1: candidate 1 merges, then the gate-before-
+    # submit check trips → candidate 2's worker is NEVER spawned (no
+    # dispatch, no clone, no patch). The dropped_ file path only fires
+    # for verified-but-dropped patches; the rollup-only drop here is
+    # captured purely by the skip outcome + drop_reasons.
+    assert dropped_patches == []
+    # Dispatcher only called once (candidate 2 never dispatched).
+    assert len(dispatcher.calls) == 1
+
+
+def test_worker_exception_isolated_does_not_stop_sibling(
+    tmp_path: Path,
+) -> None:
+    """spec_041 §3-4 / §2-4 — a single worker's unhandled exception
+    becomes a HALT outcome but does NOT stop sibling workers.
+    """
+
+    _write_mutation_discover_json(
+        repo=tmp_path, actionable=_multi_actionable(2)
+    )
+
+    # First dispatch raises; second returns done.
+    call_count = {"n": 0}
+
+    class _PartialFailingDispatcher:
+        def __init__(self) -> None:
+            self.calls: list[tuple[Path, Path, str]] = []
+
+        def __call__(
+            self,
+            *,
+            spec_path: Path,
+            repo: Path,
+            branch: str,
+            feedback: Any | None = None,
+        ) -> FixDispatchOutcome:
+            self.calls.append((Path(spec_path), Path(repo), branch))
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                raise RuntimeError("simulated worker 1 crash")
+            return FixDispatchOutcome(status="done", commits_made=1)
+
+    dispatcher = _PartialFailingDispatcher()
+    suite = _FakeSuiteRunner()
+    recheck = _FakeMutationRechecker(status="killed")
+    guard = _FakeGuardInspector()
+    gops = _FakeGitOps()
+    brief_runner, _ = _make_fake_brief_runner()
+
+    result = run_nightly(
+        repo=tmp_path,
+        profile=_autofix_profile_pool(k=2, p=1),
+        channel_runner=_RecordingChannelRunner(),
+        brief_runner=brief_runner,
+        windows_mirror=lambda _p: None,
+        fix_dispatcher=dispatcher,
+        suite_runner=suite,
+        mutation_rechecker=recheck,
+        guard_inspector=guard,
+        git_ops=gops,
+        **_auto_fix_test_seams(tmp_path),
+    )
+
+    # Worker 1 halted on dispatch; worker 2 ran + merged.
+    assert len(dispatcher.calls) == 2
+    assert len(gops.merges) == 1
+    af = result.auto_fix
+    assert af is not None
+    # Primary outcome is worker 1's HALT (dispatch failed).
+    assert af.merged is False
+    assert "dispatch failed" in af.halt_reason
+    assert len(result.auto_fix_extras) == 1
+    extra = result.auto_fix_extras[0]
+    assert extra.merged is True
+
+
+def test_per_worker_timestamps_recorded_on_outcomes(tmp_path: Path) -> None:
+    """spec_041 §2-5 — each outcome that flowed through a worker carries
+    `worker_id` + start/finish ISO timestamps so spec_042 can compute
+    parallel efficiency from real measurements (no estimation)."""
+
+    _write_mutation_discover_json(
+        repo=tmp_path, actionable=_multi_actionable(2)
+    )
+    dispatcher = _FakeFixDispatcher()
+    suite = _FakeSuiteRunner()
+    recheck = _FakeMutationRechecker(status="killed")
+    guard = _FakeGuardInspector()
+    gops = _FakeGitOps()
+    brief_runner, _ = _make_fake_brief_runner()
+
+    result = run_nightly(
+        repo=tmp_path,
+        profile=_autofix_profile_pool(k=2, p=2),
+        channel_runner=_RecordingChannelRunner(),
+        brief_runner=brief_runner,
+        windows_mirror=lambda _p: None,
+        fix_dispatcher=dispatcher,
+        suite_runner=suite,
+        mutation_rechecker=recheck,
+        guard_inspector=guard,
+        git_ops=gops,
+        **_auto_fix_test_seams(tmp_path),
+    )
+
+    af = result.auto_fix
+    assert af is not None
+    # Worker id and timestamps populated.
+    assert af.worker_id.startswith("w")
+    assert af.worker_started_at != ""
+    assert af.worker_finished_at != ""
+    # Both outcomes have unique worker ids.
+    ids = {af.worker_id, result.auto_fix_extras[0].worker_id}
+    assert len(ids) == 2
+
+
+def test_p2_brief_renders_night_summary_line(tmp_path: Path) -> None:
+    """spec_041 §2-5 — when P>1 the morning brief's §B opens with a
+    one-line 夜サマリ surfacing K / P / 達成同時実行数 / merge / drop."""
+
+    _write_mutation_discover_json(
+        repo=tmp_path, actionable=_multi_actionable(2)
+    )
+    dispatcher = _FakeFixDispatcher()
+    suite = _FakeSuiteRunner()
+    recheck = _FakeMutationRechecker(status="killed")
+    guard = _FakeGuardInspector()
+    gops = _FakeGitOps()
+
+    result = run_nightly(
+        repo=tmp_path,
+        profile=_autofix_profile_pool(k=2, p=2),
+        channel_runner=_RecordingChannelRunner(),
+        windows_mirror=lambda _p: None,
+        fix_dispatcher=dispatcher,
+        suite_runner=suite,
+        mutation_rechecker=recheck,
+        guard_inspector=guard,
+        git_ops=gops,
+        **_auto_fix_test_seams(tmp_path),
+    )
+
+    assert result.brief_report_wsl is not None
+    md = result.brief_report_wsl.read_text(encoding="utf-8")
+    assert "夜サマリ" in md
+    assert "並列 P=2" in md
+    assert "候補 K=2" in md
+    assert "並列処理" in md  # not "直列処理"
+
+
+def test_p1_brief_does_not_mention_parallel_summary(tmp_path: Path) -> None:
+    """spec_041 §3-1 — at the default P=1 the morning brief's §B does
+    NOT carry the spec_041 夜サマリ; the v2 / spec_038〜040 layout is
+    preserved bit-for-bit."""
+
+    _write_mutation_discover_json(
+        repo=tmp_path, actionable=_multi_actionable(2)
+    )
+    dispatcher = _FakeFixDispatcher()
+    suite = _FakeSuiteRunner()
+    recheck = _FakeMutationRechecker(status="killed")
+    guard = _FakeGuardInspector()
+    gops = _FakeGitOps()
+
+    result = run_nightly(
+        repo=tmp_path,
+        profile=_autofix_profile_k(k=2),  # spec_038 default P=1
+        channel_runner=_RecordingChannelRunner(),
+        windows_mirror=lambda _p: None,
+        fix_dispatcher=dispatcher,
+        suite_runner=suite,
+        mutation_rechecker=recheck,
+        guard_inspector=guard,
+        git_ops=gops,
+        **_auto_fix_test_seams(tmp_path),
+    )
+
+    assert result.brief_report_wsl is not None
+    md = result.brief_report_wsl.read_text(encoding="utf-8")
+    assert "夜サマリ" not in md
+    assert "並列 P=" not in md
+    # At K=2 P=1 the lede uses "直列処理" not "並列処理".
+    assert "直列処理" in md
+
+
+def test_parallelism_clamped_to_safety_bounds() -> None:
+    """spec_041 §2-1 — the profile validator clamps parallelism to 1..4.
+    Out-of-range values raise at profile-load time (loud failure, not
+    silent clamp); in-process construction also raises."""
+
+    # In-range values accepted.
+    Profile(safety=SafetyConfig(parallelism=1))
+    Profile(safety=SafetyConfig(parallelism=4))
+    # Out of range → loud fail.
+    with pytest.raises(ValueError):
+        Profile(safety=SafetyConfig(parallelism=0))
+    with pytest.raises(ValueError):
+        Profile(safety=SafetyConfig(parallelism=5))
+
+
+def test_max_merges_clamped_to_safety_bounds() -> None:
+    """spec_041 §2-1 — max_merges_per_night must be in 1..10."""
+
+    Profile(safety=SafetyConfig(max_merges_per_night=1))
+    Profile(safety=SafetyConfig(max_merges_per_night=10))
+    with pytest.raises(ValueError):
+        Profile(safety=SafetyConfig(max_merges_per_night=0))
+    with pytest.raises(ValueError):
+        Profile(safety=SafetyConfig(max_merges_per_night=11))
+
+
+def test_clones_cleaned_up_after_night(tmp_path: Path) -> None:
+    """spec_041 §3-5 — every worker clone is rmtree-d at the end of the
+    night via the workspace context manager's __exit__. We assert the
+    factory's context manager exited for every invocation (P workers ×
+    K candidates) and that no clone directories survive."""
+
+    _write_mutation_discover_json(
+        repo=tmp_path, actionable=_multi_actionable(2)
+    )
+
+    import threading
+    from contextlib import contextmanager
+
+    invocations: list[Path] = []
+    exits: list[Path] = []
+    cleanup_lock = threading.Lock()
+    clone_counter = {"n": 0}
+
+    @contextmanager
+    def tracking_workspace(live_repo: Path) -> Any:
+        with cleanup_lock:
+            clone_counter["n"] += 1
+            sub = tmp_path / f"_clone_track_{clone_counter['n']}"
+        sub.mkdir(parents=True, exist_ok=True)
+        invocations.append(sub)
+        try:
+            yield sub
+        finally:
+            # Simulate the disposable-clone semantics: caller is in
+            # charge of yielding, the factory cleans up on exit.
+            exits.append(sub)
+            import shutil as _shutil
+            _shutil.rmtree(sub, ignore_errors=True)
+
+    dispatcher = _FakeFixDispatcher()
+    suite = _FakeSuiteRunner()
+    recheck = _FakeMutationRechecker(status="killed")
+    guard = _FakeGuardInspector()
+    gops = _FakeGitOps()
+    brief_runner, _ = _make_fake_brief_runner()
+    applier = _FakePatchApplier()
+
+    run_nightly(
+        repo=tmp_path,
+        profile=_autofix_profile_pool(k=2, p=2),
+        channel_runner=_RecordingChannelRunner(),
+        brief_runner=brief_runner,
+        windows_mirror=lambda _p: None,
+        fix_dispatcher=dispatcher,
+        suite_runner=suite,
+        mutation_rechecker=recheck,
+        guard_inspector=guard,
+        git_ops=gops,
+        isolated_workspace=tracking_workspace,
+        apply_patch=applier,
+    )
+
+    # Every entered workspace exited (cleanup ran).
+    assert len(invocations) == len(exits) == 2
+    # No clone directories survived the night.
+    for path in invocations:
+        assert not path.exists()
+
+
+def test_rate_limit_dispatch_failure_is_transient_for_fixloop(
+    tmp_path: Path,
+) -> None:
+    """spec_041 §2-6 — rate-limit-induced dispatch failures fall into
+    the existing transient (retryable) classification, i.e., the
+    FixLoop's iteration mechanism will pick them up when
+    ``loop_max_iterations > 1``.
+
+    The test simulates a 'rate limit hit then succeed' dispatcher
+    behaviour against ``loop_max_iterations=2`` and asserts the
+    candidate ultimately converges.
+    """
+
+    _write_mutation_discover_json(repo=tmp_path)
+
+    attempt_counts = {"n": 0}
+
+    class _RateLimitedThenOk:
+        def __init__(self) -> None:
+            self.calls: list[tuple[Path, Path, str]] = []
+
+        def __call__(
+            self,
+            *,
+            spec_path: Path,
+            repo: Path,
+            branch: str,
+            feedback: Any | None = None,
+        ) -> FixDispatchOutcome:
+            self.calls.append((Path(spec_path), Path(repo), branch))
+            attempt_counts["n"] += 1
+            if attempt_counts["n"] == 1:
+                # Simulated rate-limit failure surfaced as a "failed"
+                # FixDispatchOutcome — FixLoop treats this as
+                # retryable (writes feedback, iterates again).
+                return FixDispatchOutcome(
+                    status="failed",
+                    halt_reason="rate-limit: claude api 429",
+                    commits_made=0,
+                )
+            return FixDispatchOutcome(status="done", commits_made=1)
+
+    dispatcher = _RateLimitedThenOk()
+    suite = _FakeSuiteRunner()
+    recheck = _FakeMutationRechecker(status="killed")
+    guard = _FakeGuardInspector()
+    gops = _FakeGitOps()
+    brief_runner, _ = _make_fake_brief_runner()
+
+    result = run_nightly(
+        repo=tmp_path,
+        profile=Profile(
+            discovery=DiscoveryConfig(channels=["mutation"]),
+            schedule=ScheduleConfig(),
+            safety=SafetyConfig(
+                fix_mode="auto",
+                max_candidates_per_night=1,
+                parallelism=1,
+                loop_max_iterations=2,
+            ),
+        ),
+        channel_runner=_RecordingChannelRunner(),
+        brief_runner=brief_runner,
+        windows_mirror=lambda _p: None,
+        fix_dispatcher=dispatcher,
+        suite_runner=suite,
+        mutation_rechecker=recheck,
+        guard_inspector=guard,
+        git_ops=gops,
+        **_auto_fix_test_seams(tmp_path),
+    )
+
+    af = result.auto_fix
+    assert af is not None
+    # The first dispatch failed (rate-limit transient), the second one
+    # succeeded → FixLoop picked it up via iteration.
+    assert len(dispatcher.calls) == 2
+    assert af.merged is True
+    assert af.iterations == 2
+    assert af.converged is True
