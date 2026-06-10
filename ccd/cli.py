@@ -522,7 +522,11 @@ def main(
     unpushed_backlog_limit: int | None = None,
     dispatch_timeout_s: float | None = None,
     # spec_028 — propose-mode workspace seam (forwarded to ``ccd nightly``).
+    # spec_040 reuses the same seam for auto mode.
     isolated_workspace: Any | None = None,
+    # spec_040 — Integrator patch applier seam (forwarded to
+    # ``ccd nightly`` / ``ccd nightly-all``).
+    apply_patch: Any | None = None,
     # spec_029 — sweep seam (forwarded to ``ccd nightly-all``). Tests
     # inject a fake nightly runner that records its calls and returns
     # canned ``NightlyResult`` shapes so failure isolation can be
@@ -566,6 +570,7 @@ def main(
             unpushed_backlog_limit=unpushed_backlog_limit,
             dispatch_timeout_s=dispatch_timeout_s,
             isolated_workspace=isolated_workspace,
+            apply_patch=apply_patch,
         )
     if args.command == "nightly-all":
         return _cmd_nightly_all(
@@ -585,6 +590,7 @@ def main(
             unpushed_backlog_limit=unpushed_backlog_limit,
             dispatch_timeout_s=dispatch_timeout_s,
             isolated_workspace=isolated_workspace,
+            apply_patch=apply_patch,
             nightly_runner=nightly_runner,
         )
     if args.command == "guard":
@@ -860,6 +866,7 @@ def _cmd_nightly(
     unpushed_backlog_limit: int | None = None,
     dispatch_timeout_s: float | None = None,
     isolated_workspace: Any | None = None,
+    apply_patch: Any | None = None,
 ) -> int:
     repo = _resolve_repo(args.repo)
     profile_path = getattr(args, "profile_path", None)
@@ -882,6 +889,7 @@ def _cmd_nightly(
         unpushed_backlog_limit=unpushed_backlog_limit,
         dispatch_timeout_s=dispatch_timeout_s,
         isolated_workspace=isolated_workspace,
+        apply_patch=apply_patch,
     )
 
     # spec_025 §2-1(c) — PAUSE short-circuit. Surface the pause and
@@ -959,6 +967,7 @@ def _cmd_nightly_all(
     unpushed_backlog_limit: int | None = None,
     dispatch_timeout_s: float | None = None,
     isolated_workspace: Any | None = None,
+    apply_patch: Any | None = None,
     nightly_runner: Any | None = None,
 ) -> int:
     """Run the multi-policy sweep (spec_029 §2-2).
@@ -995,6 +1004,7 @@ def _cmd_nightly_all(
         "unpushed_backlog_limit": unpushed_backlog_limit,
         "dispatch_timeout_s": dispatch_timeout_s,
         "isolated_workspace": isolated_workspace,
+        "apply_patch": apply_patch,
     }
     # Drop None values so ``run_nightly`` sees its own defaults rather
     # than ``None`` for every unused seam.

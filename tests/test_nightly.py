@@ -777,7 +777,12 @@ class _FakeGitOps:
     diffs_requested: list[tuple[str, str]] = field(default_factory=list)
     discards: list[Path] = field(default_factory=list)
     deletes: list[str] = field(default_factory=list)
-    canned_diff: str = ""
+    # spec_040 — default to a non-empty placeholder so the Integrator's
+    # empty-patch defense (``_HALT_INTEGRATOR_EMPTY_PATCH``) doesn't
+    # accidentally fire in tests that didn't set ``canned_diff`` but
+    # expect the worker→integrator path to merge. Tests that exercise
+    # the empty-diff branch explicitly set ``canned_diff=""``.
+    canned_diff: str = "diff --git a/tests/x.py b/tests/x.py\n+placeholder\n"
     create_should_raise: Exception | None = None
     merge_should_raise: Exception | None = None
 
@@ -877,6 +882,70 @@ class _FakeGuardInspector:
     ) -> GuardResult:
         self.calls.append((diff, tuple(allowed_files), template))
         return self.result
+
+
+@dataclass
+class _FakePatchApplier:
+    """spec_040 — records every Integrator patch apply attempt.
+
+    Tests use ``calls`` to pin "Integrator received the worker's diff
+    on the LIVE repo path" and ``should_raise`` to simulate a drift /
+    conflict that drops the candidate.
+    """
+
+    calls: list[tuple[Path, str, str]] = field(default_factory=list)
+    should_raise: Exception | None = None
+
+    def __call__(
+        self,
+        *,
+        repo: Path,
+        patch_text: str,
+        spec_auto_id: str,
+    ) -> None:
+        self.calls.append((Path(repo), patch_text, spec_auto_id))
+        if self.should_raise is not None:
+            raise self.should_raise
+
+
+def _auto_fix_test_seams(
+    tmp_path: Path,
+) -> dict[str, Any]:
+    """spec_040 — convenience helper that injects the clone + patch-applier
+    seams an auto-mode test needs to exercise the new worker+Integrator
+    flow without shelling out.
+
+    Yields a dict suitable for ``**kwargs`` spreading into
+    :func:`ccd.nightly.run_nightly`:
+
+    - ``isolated_workspace`` — yields a separate ``<tmp_path>/_auto_clone``
+      directory so worker writes (recorded on ``gops`` with
+      ``repo=<clone_path>``) are distinguishable from Integrator writes
+      (recorded with ``repo=<tmp_path>``).
+    - ``apply_patch`` — a no-op recording :class:`_FakePatchApplier` so
+      the Integrator does not shell out to a real ``git apply``.
+    """
+
+    from contextlib import contextmanager
+
+    clone_root = tmp_path / "_auto_clone"
+    invocations: list[Path] = []
+
+    @contextmanager
+    def workspace(live_repo: Path) -> Any:
+        invocations.append(Path(live_repo))
+        clone_root.mkdir(parents=True, exist_ok=True)
+        yield clone_root
+
+    workspace.invocations = invocations  # type: ignore[attr-defined]
+    workspace.clone_root = clone_root  # type: ignore[attr-defined]
+
+    applier = _FakePatchApplier()
+
+    return {
+        "isolated_workspace": workspace,
+        "apply_patch": applier,
+    }
 
 
 def _write_mutation_discover_json(
@@ -1052,6 +1121,7 @@ def test_autonomous_fix_happy_path_merges_locally(tmp_path: Path) -> None:
         guard_inspector=guard,
         git_ops=gops,
         today=date(2026, 5, 25),
+        **_auto_fix_test_seams(tmp_path),
     )
 
     af = result.auto_fix
@@ -1071,19 +1141,25 @@ def test_autonomous_fix_happy_path_merges_locally(tmp_path: Path) -> None:
     assert af.merged is True
     assert af.halt_reason == ""
 
-    # All four loop side-effects fired exactly once.
-    assert dispatcher.calls and dispatcher.calls[0][0] == af.spec_auto_path
-    assert suite.calls == [tmp_path.resolve()]
+    # spec_040: the dispatcher runs inside the clone; its first arg is
+    # the clone-side spec_auto path. Filename equality is the meaningful
+    # check (the spec_auto.md is copied into the clone preserving name).
+    assert dispatcher.calls
+    assert dispatcher.calls[0][0].name == af.spec_auto_path.name
+    # Worker (clone) suite + Integrator (live) suite both run.
+    assert len(suite.calls) == 2
+    assert suite.calls[-1] == tmp_path.resolve()
     assert recheck.calls == [
         ("ccd/protocol.py", 46, af.finding_signature),
     ]
-    assert guard.calls == [
-        (gops.canned_diff, ("tests/",), "A"),
-    ]
-    # Branch was created and (after merging) the loop did NOT call
-    # checkout("main") again — only merge_branch_into_main, which the
-    # subprocess impl handles internally. Fakes don't auto-checkout.
-    assert gops.branches_created == [af.branch]
+    # Guard runs once in the worker (against the clone diff) AND once
+    # in the Integrator (against the live diff after apply). Same diff
+    # text because the canned_diff is constant.
+    assert len(guard.calls) == 2
+    assert guard.calls[0] == (gops.canned_diff, ("tests/",), "A")
+    # Branch was created in the clone (worker) AND on live (Integrator)
+    # — both use the same branch name ``auto/<spec_auto_id>``.
+    assert gops.branches_created == [af.branch, af.branch]
     assert gops.merges == [af.branch]
 
 
@@ -1114,6 +1190,7 @@ def test_autonomous_fix_does_not_push(tmp_path: Path) -> None:
         mutation_rechecker=recheck,
         guard_inspector=guard,
         git_ops=gops,
+        **_auto_fix_test_seams(tmp_path),
     )
 
     # Loop only ever used: create_and_checkout_branch, diff,
@@ -1150,6 +1227,7 @@ def test_autonomous_fix_skipped_when_no_candidate(tmp_path: Path) -> None:
         mutation_rechecker=recheck,
         guard_inspector=guard,
         git_ops=gops,
+        **_auto_fix_test_seams(tmp_path),
     )
 
     af = result.auto_fix
@@ -1189,6 +1267,7 @@ def test_autonomous_fix_halts_when_guard_halts(tmp_path: Path) -> None:
         mutation_rechecker=recheck,
         guard_inspector=guard,
         git_ops=gops,
+        **_auto_fix_test_seams(tmp_path),
     )
 
     af = result.auto_fix
@@ -1226,6 +1305,7 @@ def test_autonomous_fix_halts_when_r5_fails(tmp_path: Path) -> None:
         mutation_rechecker=recheck,
         guard_inspector=guard,
         git_ops=gops,
+        **_auto_fix_test_seams(tmp_path),
     )
 
     af = result.auto_fix
@@ -1258,6 +1338,7 @@ def test_autonomous_fix_halts_when_r4_fails(tmp_path: Path) -> None:
         mutation_rechecker=recheck,
         guard_inspector=guard,
         git_ops=gops,
+        **_auto_fix_test_seams(tmp_path),
     )
 
     af = result.auto_fix
@@ -1295,6 +1376,7 @@ def test_autonomous_fix_halts_when_dispatch_fails(tmp_path: Path) -> None:
         mutation_rechecker=recheck,
         guard_inspector=guard,
         git_ops=gops,
+        **_auto_fix_test_seams(tmp_path),
     )
 
     af = result.auto_fix
@@ -1364,6 +1446,7 @@ def test_autonomous_fix_processes_exactly_one_candidate(tmp_path: Path) -> None:
         mutation_rechecker=recheck,
         guard_inspector=guard,
         git_ops=gops,
+        **_auto_fix_test_seams(tmp_path),
     )
 
     af = result.auto_fix
@@ -1372,8 +1455,10 @@ def test_autonomous_fix_processes_exactly_one_candidate(tmp_path: Path) -> None:
     assert len(dispatcher.calls) == 1
     assert af.finding_signature == "ccd/foo.py:10:a → b"
     assert af.candidate_count == 3
-    # And only one branch + one merge fired.
-    assert len(gops.branches_created) == 1
+    # spec_040: the worker creates the branch in the clone AND the
+    # Integrator creates the same-named branch on live — 2 entries.
+    # Only ONE merge happens (Integrator-side, on live).
+    assert len(gops.branches_created) == 2
     assert len(gops.merges) == 1
 
 
@@ -1451,6 +1536,7 @@ def test_autonomous_fix_reads_from_channel_outcome_when_available(
         mutation_rechecker=recheck,
         guard_inspector=guard,
         git_ops=gops,
+        **_auto_fix_test_seams(tmp_path),
     )
 
     af = result.auto_fix
@@ -1495,6 +1581,7 @@ def test_autonomous_fix_downgrade_when_translate_rejects(
         mutation_rechecker=recheck,
         guard_inspector=guard,
         git_ops=gops,
+        **_auto_fix_test_seams(tmp_path),
     )
 
     af = result.auto_fix
@@ -1530,6 +1617,7 @@ def test_cli_nightly_prints_auto_fix_merged_line(
     guard = _FakeGuardInspector()
     gops = _FakeGitOps()
     brief_runner, _ = _make_fake_brief_runner()
+    seams = _auto_fix_test_seams(tmp_path)
 
     rc = cli.main(
         [
@@ -1547,6 +1635,8 @@ def test_cli_nightly_prints_auto_fix_merged_line(
         mutation_rechecker=recheck,
         guard_inspector=guard,
         git_ops=gops,
+        isolated_workspace=seams["isolated_workspace"],
+        apply_patch=seams["apply_patch"],
     )
 
     assert rc == 0
@@ -1775,6 +1865,7 @@ def test_template_b_finding_ignored_when_only_a_enabled(tmp_path: Path) -> None:
         adversarial_rechecker=adv_recheck,
         guard_inspector=guard,
         git_ops=gops,
+        **_auto_fix_test_seams(tmp_path),
     )
 
     af = result.auto_fix
@@ -1827,6 +1918,7 @@ def test_template_b_happy_path_merges_locally(tmp_path: Path) -> None:
         guard_inspector=guard,
         git_ops=gops,
         today=date(2026, 5, 25),
+        **_auto_fix_test_seams(tmp_path),
     )
 
     af = result.auto_fix
@@ -1854,11 +1946,13 @@ def test_template_b_happy_path_merges_locally(tmp_path: Path) -> None:
     ]
     # The mutation rechecker was NOT called — template B uses adv path only.
     assert recheck.calls == []
-    # Guard received template B + the named production file + tests/.
-    assert guard.calls == [
-        (gops.canned_diff, ("ccd/protocol.py", "tests/"), "B"),
-    ]
-    assert gops.branches_created == [af.branch]
+    # spec_040: guard runs in worker (clone) AND Integrator (live).
+    assert len(guard.calls) == 2
+    assert guard.calls[0] == (
+        gops.canned_diff, ("ccd/protocol.py", "tests/"), "B"
+    )
+    # spec_040: branch created in clone + live (same name); merge once.
+    assert gops.branches_created == [af.branch, af.branch]
     assert gops.merges == [af.branch]
 
 
@@ -1891,6 +1985,7 @@ def test_template_b_halts_when_parser_silently_accepts(tmp_path: Path) -> None:
         adversarial_rechecker=adv_recheck,
         guard_inspector=guard,
         git_ops=gops,
+        **_auto_fix_test_seams(tmp_path),
     )
 
     af = result.auto_fix
@@ -1927,6 +2022,7 @@ def test_template_b_halts_when_parser_still_ungraceful(tmp_path: Path) -> None:
         adversarial_rechecker=adv_recheck,
         guard_inspector=guard,
         git_ops=gops,
+        **_auto_fix_test_seams(tmp_path),
     )
 
     af = result.auto_fix
@@ -1975,6 +2071,7 @@ def test_template_b_guard_halt_via_r3_diff_size(tmp_path: Path) -> None:
         adversarial_rechecker=adv_recheck,
         guard_inspector=guard,
         git_ops=gops,
+        **_auto_fix_test_seams(tmp_path),
     )
 
     af = result.auto_fix
@@ -2028,6 +2125,7 @@ def test_template_b_guard_blocks_production_file_outside_allowed(
         adversarial_rechecker=adv_recheck,
         guard_inspector=guard,
         git_ops=gops,
+        **_auto_fix_test_seams(tmp_path),
     )
 
     af = result.auto_fix
@@ -2065,6 +2163,7 @@ def test_template_a_priority_over_b_when_both_present(tmp_path: Path) -> None:
         adversarial_rechecker=adv_recheck,
         guard_inspector=guard,
         git_ops=gops,
+        **_auto_fix_test_seams(tmp_path),
     )
 
     af = result.auto_fix
@@ -2109,6 +2208,7 @@ def test_template_b_falls_through_when_a_has_no_candidate(
         adversarial_rechecker=adv_recheck,
         guard_inspector=guard,
         git_ops=gops,
+        **_auto_fix_test_seams(tmp_path),
     )
 
     af = result.auto_fix
@@ -2246,6 +2346,7 @@ def test_disk_fallback_distinguishes_mutation_vs_adversarial_json(
         adversarial_rechecker=adv_recheck,
         guard_inspector=guard,
         git_ops=gops,
+        **_auto_fix_test_seams(tmp_path),
     )
 
     af = result.auto_fix
@@ -2305,6 +2406,7 @@ def test_template_b_one_candidate_per_night(tmp_path: Path) -> None:
         adversarial_rechecker=adv_recheck,
         guard_inspector=guard,
         git_ops=gops,
+        **_auto_fix_test_seams(tmp_path),
     )
 
     af = result.auto_fix
@@ -2316,7 +2418,9 @@ def test_template_b_one_candidate_per_night(tmp_path: Path) -> None:
     assert af.finding_signature == (
         "ccd.protocol.parse_spec:05_invalid_utf8_bytes:UnicodeDecodeError"
     )
-    assert len(gops.branches_created) == 1
+    # spec_040: worker creates the branch in clone + Integrator on live
+    # (same name) — 2 entries; only 1 merge.
+    assert len(gops.branches_created) == 2
     assert len(gops.merges) == 1
 
 
@@ -2353,6 +2457,7 @@ def test_pause_file_short_circuits_entire_nightly(tmp_path: Path) -> None:
         windows_mirror=mirror,
         fix_dispatcher=dispatcher,
         git_ops=gops,
+        **_auto_fix_test_seams(tmp_path),
     )
 
     assert result.paused is True
@@ -2439,6 +2544,7 @@ def test_unpushed_backlog_at_limit_blocks_new_dispatch(tmp_path: Path) -> None:
         guard_inspector=guard,
         git_ops=gops,
         unpushed_counter=_counter,
+        **_auto_fix_test_seams(tmp_path),
     )
 
     af = result.auto_fix
@@ -2480,6 +2586,7 @@ def test_unpushed_backlog_below_limit_does_not_block(tmp_path: Path) -> None:
         guard_inspector=guard,
         git_ops=gops,
         unpushed_counter=_counter,
+        **_auto_fix_test_seams(tmp_path),
     )
 
     af = result.auto_fix
@@ -2505,6 +2612,7 @@ def test_unpushed_backlog_custom_limit_is_honored(tmp_path: Path) -> None:
         fix_dispatcher=dispatcher,
         unpushed_counter=lambda _repo: 1,
         unpushed_backlog_limit=1,  # 1 un-pushed already trips it
+        **_auto_fix_test_seams(tmp_path),
     )
 
     af = result.auto_fix
@@ -2541,6 +2649,7 @@ def test_unpushed_counter_exception_does_not_block(tmp_path: Path) -> None:
         guard_inspector=guard,
         git_ops=gops,
         unpushed_counter=_boom,
+        **_auto_fix_test_seams(tmp_path),
     )
 
     af = result.auto_fix
@@ -2586,6 +2695,7 @@ def test_dispatch_timeout_marks_candidate_failed(tmp_path: Path) -> None:
         guard_inspector=guard,
         git_ops=gops,
         dispatch_timeout_s=0.2,
+        **_auto_fix_test_seams(tmp_path),
     )
 
     af = result.auto_fix
@@ -2638,6 +2748,7 @@ def test_zero_findings_normal_exit_is_success(tmp_path: Path) -> None:
         brief_runner=brief_runner,
         windows_mirror=mirror,
         fix_dispatcher=dispatcher,
+        **_auto_fix_test_seams(tmp_path),
     )
 
     assert result.success is True
@@ -2678,6 +2789,7 @@ def test_merge_diff_captured_on_successful_fix(tmp_path: Path) -> None:
         mutation_rechecker=recheck,
         guard_inspector=guard,
         git_ops=gops,
+        **_auto_fix_test_seams(tmp_path),
     )
 
     af = result.auto_fix
@@ -2709,6 +2821,7 @@ def test_merge_diff_empty_when_not_merged(tmp_path: Path) -> None:
         mutation_rechecker=recheck,
         guard_inspector=guard,
         git_ops=gops,
+        **_auto_fix_test_seams(tmp_path),
     )
 
     af = result.auto_fix
@@ -2748,6 +2861,7 @@ def test_brief_phase2_section_b_when_loop_merged(tmp_path: Path) -> None:
         guard_inspector=guard,
         git_ops=gops,
         today=date(2026, 5, 25),
+        **_auto_fix_test_seams(tmp_path),
     )
 
     assert result.success is True
@@ -2796,6 +2910,7 @@ def test_brief_phase1_section_b_when_loop_did_not_merge(
         guard_inspector=guard,
         git_ops=gops,
         today=date(2026, 5, 25),
+        **_auto_fix_test_seams(tmp_path),
     )
 
     assert result.brief_report_wsl is not None
@@ -2829,35 +2944,50 @@ def test_brief_phase1_section_b_when_no_autofix_at_all(tmp_path: Path) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# spec_026 §2-2 — HALT-path working-tree restoration
+# spec_026 §2-2 / spec_040 §2-2 — live working-tree cleanliness on HALT
 # --------------------------------------------------------------------------- #
 #
-# spec_026 documented the bug: every HALT exit of ``_run_auto_fix_loop``
-# left the auto/spec_auto_NNN branch AND uncommitted edits on the
-# working tree, so the next night's pre-flight saw a dirty repo. The
-# fix is a ``_restore_repo_after_halt`` helper that runs on every HALT
-# path: discard uncommitted edits → checkout main → delete auto branch.
-# These tests pin each HALT path independently and assert the three
-# operations fired on the injected fake GitOps.
+# spec_026 documented the original bug: every HALT exit of
+# ``_run_auto_fix_loop`` (auto mode) left the auto/spec_auto_NNN branch
+# AND uncommitted edits on the LIVE working tree, so the next night's
+# pre-flight saw a dirty repo. spec_026 fixed it with
+# ``_restore_repo_after_halt`` that ran on every HALT path on the live
+# repo.
+#
+# spec_040 §2-2 STRENGTHENS this invariant: worker writes now happen
+# inside a disposable clone, so a worker HALT (R5 / R4 / guard /
+# dispatch failure inside the clone) restores NOTHING on live — there is
+# nothing to restore because nothing was written to live in the first
+# place. The clone is rmtree-d by the workspace context manager.
+#
+# Only Integrator HALTs (live patch apply / re-verify failure) restore
+# the live working tree; those are covered by the spec_040-specific
+# tests further down (``test_integrator_*``). The tests below confirm
+# the WORKER-side HALT invariant: live is untouched, no restore
+# primitives fire on the live repo.
 
 
-def _assert_halt_restore_fired(
-    *, gops: _FakeGitOps, repo: Path, branch: str
+def _assert_live_repo_untouched_on_worker_halt(
+    *, gops: _FakeGitOps, live_repo: Path
 ) -> None:
-    """Shared assertion: spec_026 §2-2 restoration ran on a fake GitOps.
+    """spec_040 invariant — when the worker halts inside the clone,
+    NO write-bearing GitOps call lands on the live repo.
 
-    The HALT path must have invoked all three restore primitives in
-    order — discard_local_changes, checkout("main"), delete_branch.
+    The clone is a separate tmpdir (yielded by the test's
+    ``isolated_workspace`` factory); any gops write recorded by the
+    fake must have ``repo=<clone>`` (or be a worker-side clone-only op).
+    We assert directly: ``merges`` is empty (Integrator never merged),
+    AND no ``discards`` / ``deletes`` happened on the live repo path
+    (the worker discards nothing because the clone is just rmtree-d).
     """
 
-    assert gops.discards, "discard_local_changes was not called on HALT"
-    assert Path(repo).resolve() in [p.resolve() for p in gops.discards] or (
-        gops.discards[0] == Path(repo)
-    ), "discard_local_changes received an unexpected repo path"
-    assert "main" in gops.checkouts, "checkout('main') was not called on HALT"
-    assert branch in gops.deletes, (
-        f"delete_branch was not called for {branch!r} on HALT"
+    assert gops.merges == [], (
+        "live merge happened on a worker HALT path — spec_040 violation"
     )
+    live_resolved = Path(live_repo).resolve()
+    assert all(
+        Path(p).resolve() != live_resolved for p in gops.discards
+    ), "discard_local_changes was called on the LIVE repo during a worker HALT"
 
 
 def test_halt_restore_fires_on_dispatch_failure(tmp_path: Path) -> None:
@@ -2887,13 +3017,14 @@ def test_halt_restore_fires_on_dispatch_failure(tmp_path: Path) -> None:
         mutation_rechecker=recheck,
         guard_inspector=guard,
         git_ops=gops,
+        **_auto_fix_test_seams(tmp_path),
     )
 
     af = result.auto_fix
     assert af is not None
     assert af.merged is False
     assert "dispatch failed" in af.halt_reason
-    _assert_halt_restore_fired(gops=gops, repo=tmp_path, branch=af.branch)
+    _assert_live_repo_untouched_on_worker_halt(gops=gops, live_repo=tmp_path)
     # Sanity: the loop must NOT have merged when restoration fires.
     assert gops.merges == []
 
@@ -2925,6 +3056,7 @@ def test_halt_restore_fires_on_dispatch_exception(tmp_path: Path) -> None:
         mutation_rechecker=recheck,
         guard_inspector=guard,
         git_ops=gops,
+        **_auto_fix_test_seams(tmp_path),
     )
 
     af = result.auto_fix
@@ -2932,7 +3064,7 @@ def test_halt_restore_fires_on_dispatch_exception(tmp_path: Path) -> None:
     assert af.merged is False
     assert af.dispatched is False
     assert "RuntimeError" in af.halt_reason
-    _assert_halt_restore_fired(gops=gops, repo=tmp_path, branch=af.branch)
+    _assert_live_repo_untouched_on_worker_halt(gops=gops, live_repo=tmp_path)
 
 
 def test_halt_restore_fires_on_r5_failure(tmp_path: Path) -> None:
@@ -2957,13 +3089,14 @@ def test_halt_restore_fires_on_r5_failure(tmp_path: Path) -> None:
         mutation_rechecker=recheck,
         guard_inspector=guard,
         git_ops=gops,
+        **_auto_fix_test_seams(tmp_path),
     )
 
     af = result.auto_fix
     assert af is not None
     assert af.merged is False
     assert "R5 failed" in af.halt_reason
-    _assert_halt_restore_fired(gops=gops, repo=tmp_path, branch=af.branch)
+    _assert_live_repo_untouched_on_worker_halt(gops=gops, live_repo=tmp_path)
 
 
 def test_halt_restore_fires_on_r4_failure(tmp_path: Path) -> None:
@@ -2988,13 +3121,14 @@ def test_halt_restore_fires_on_r4_failure(tmp_path: Path) -> None:
         mutation_rechecker=recheck,
         guard_inspector=guard,
         git_ops=gops,
+        **_auto_fix_test_seams(tmp_path),
     )
 
     af = result.auto_fix
     assert af is not None
     assert af.merged is False
     assert "R4 failed" in af.halt_reason
-    _assert_halt_restore_fired(gops=gops, repo=tmp_path, branch=af.branch)
+    _assert_live_repo_untouched_on_worker_halt(gops=gops, live_repo=tmp_path)
 
 
 def test_halt_restore_fires_on_guard_halt(tmp_path: Path) -> None:
@@ -3026,20 +3160,25 @@ def test_halt_restore_fires_on_guard_halt(tmp_path: Path) -> None:
         mutation_rechecker=recheck,
         guard_inspector=guard,
         git_ops=gops,
+        **_auto_fix_test_seams(tmp_path),
     )
 
     af = result.auto_fix
     assert af is not None
     assert af.merged is False
     assert "guard halted the fix" in af.halt_reason
-    _assert_halt_restore_fired(gops=gops, repo=tmp_path, branch=af.branch)
+    _assert_live_repo_untouched_on_worker_halt(gops=gops, live_repo=tmp_path)
 
 
 def test_halt_restore_fires_on_branch_creation_failure(tmp_path: Path) -> None:
-    """spec_026 §2-2 — branch creation failure also calls the restore.
+    """spec_040 §2-2 — branch creation in the CLONE failing drops the
+    candidate cleanly without touching the live repo.
 
-    Even though no work happened, the partial branch state must be
-    swept up so the next pre-flight starts clean.
+    spec_026's original assertion was "restore primitives fire on the
+    live repo when branch creation fails"; under spec_040 the branch
+    is created in the disposable clone, so a creation failure aborts
+    the worker phase and the clone is rmtree-d by the context manager.
+    Live is never written. No restore primitives fire on live.
     """
 
     _write_mutation_discover_json(repo=tmp_path)
@@ -3061,18 +3200,15 @@ def test_halt_restore_fires_on_branch_creation_failure(tmp_path: Path) -> None:
         mutation_rechecker=recheck,
         guard_inspector=guard,
         git_ops=gops,
+        **_auto_fix_test_seams(tmp_path),
     )
 
     af = result.auto_fix
     assert af is not None
     assert af.merged is False
     assert "branch creation failed" in af.halt_reason
-    # The fake records discard / checkout / delete_branch calls even
-    # when create_and_checkout_branch raised — that is the entire point
-    # of the restore-on-HALT contract (spec_026 §2-2).
-    assert gops.discards, "discard_local_changes was not called"
-    assert "main" in gops.checkouts
-    assert af.branch in gops.deletes
+    # spec_040 invariant: worker HALT means live is untouched.
+    _assert_live_repo_untouched_on_worker_halt(gops=gops, live_repo=tmp_path)
 
 
 def test_success_merge_deletes_feature_branch_but_keeps_main(
@@ -3110,6 +3246,7 @@ def test_success_merge_deletes_feature_branch_but_keeps_main(
         mutation_rechecker=recheck,
         guard_inspector=guard,
         git_ops=gops,
+        **_auto_fix_test_seams(tmp_path),
     )
 
     af = result.auto_fix
@@ -3129,16 +3266,23 @@ def test_success_merge_deletes_feature_branch_but_keeps_main(
 
 
 def test_halt_restore_swallows_exceptions_per_step(tmp_path: Path) -> None:
-    """spec_026 §2-2 — restoration is best-effort. If any single step
-    raises (e.g. ``git checkout main`` fails because main was just
-    deleted), the remaining steps still run. The morning brief still
-    renders with the original halt_reason."""
+    """spec_026 §2-2 / spec_040 §2-2 — Integrator-side restore is
+    best-effort. If any single step raises (e.g. ``git checkout main``
+    fails because main was just deleted), the remaining steps still run
+    and ``run_nightly`` does NOT propagate the cleanup exception.
+
+    spec_040: this scenario now applies to the Integrator HALT path —
+    where live writes actually happened (patch applied) and the apply
+    + re-verify gate dropped the candidate. We force the apply step to
+    succeed and the live R4 re-check to fail, then verify the restore
+    primitives run even if each raises in turn.
+    """
 
     _write_mutation_discover_json(repo=tmp_path)
 
     @dataclass
     class _PartiallyFailingGitOps(_FakeGitOps):
-        # All three restore primitives raise to prove the loop's
+        # All three restore primitives raise to prove the Integrator's
         # try/except wrapping catches each independently.
         def discard_local_changes(self, *, repo: Path) -> None:
             self.discards.append(Path(repo))
@@ -3152,12 +3296,32 @@ def test_halt_restore_swallows_exceptions_per_step(tmp_path: Path) -> None:
             self.deletes.append(branch)
             raise RuntimeError("git branch -D failed")
 
-    dispatcher = _FakeFixDispatcher()
-    suite = _FakeSuiteRunner()
-    recheck = _FakeMutationRechecker(status="survived")  # forces HALT
-    guard = _FakeGuardInspector()
+    # Worker side: dispatch + R5 + R4 + guard all pass (so Integrator runs).
+    # Integrator side: apply succeeds; live R4 re-check fails → HALT →
+    # restore (which is what we're testing).
+    worker_suite_passes = SuiteOutcome(passed=True, output="worker ok")
+    integrator_suite_fails = SuiteOutcome(passed=False, output="live red")
+
+    call_count = {"n": 0}
+
+    def _two_phase_suite(*, repo: Path) -> SuiteOutcome:
+        call_count["n"] += 1
+        # First call → worker phase (in clone) → pass.
+        # Second call → Integrator phase (on live) → fail.
+        return worker_suite_passes if call_count["n"] == 1 else integrator_suite_fails
+
+    dispatcher = _FakeFixDispatcher(
+        outcome=FixDispatchOutcome(status="done", commits_made=1)
+    )
+    recheck = _FakeMutationRechecker(status="killed")
+    guard = _FakeGuardInspector(
+        result=GuardResult(
+            passed=True, halt_reasons=(), files_touched=("tests/x.py",), template="A"
+        )
+    )
     gops = _PartiallyFailingGitOps()
     brief_runner, _ = _make_fake_brief_runner()
+    seams = _auto_fix_test_seams(tmp_path)
 
     # The whole run must not raise — every restore step is wrapped in
     # try/except, and the brief renders the halt_reason from the
@@ -3169,17 +3333,20 @@ def test_halt_restore_swallows_exceptions_per_step(tmp_path: Path) -> None:
         brief_runner=brief_runner,
         windows_mirror=lambda _p: None,
         fix_dispatcher=dispatcher,
-        suite_runner=suite,
+        suite_runner=_two_phase_suite,
         mutation_rechecker=recheck,
         guard_inspector=guard,
         git_ops=gops,
+        isolated_workspace=seams["isolated_workspace"],
+        apply_patch=seams["apply_patch"],
     )
 
     af = result.auto_fix
     assert af is not None
     assert af.merged is False
-    assert "R5 failed" in af.halt_reason
-    # All three primitives fired (each appended before raising).
+    assert "live suite re-check failed" in af.halt_reason
+    # All three primitives fired (each appended before raising) on the
+    # Integrator's restore path.
     assert gops.discards
     assert "main" in gops.checkouts
     assert af.branch in gops.deletes
@@ -3201,6 +3368,377 @@ def test_gitops_protocol_has_spec_026_methods() -> None:
     impl = SubprocessGitOps()
     assert callable(impl.discard_local_changes)
     assert callable(impl.delete_branch)
+
+
+# --------------------------------------------------------------------------- #
+# spec_040 — Integrator, clone-and-patch unification for auto mode
+# --------------------------------------------------------------------------- #
+
+
+def test_auto_mode_worker_phase_does_not_write_to_live(tmp_path: Path) -> None:
+    """spec_040 §2-2 structural invariant — the WORKER phase runs entirely
+    in the disposable clone and never writes to the live working tree
+    or .git. Only the Integrator (post-worker) is allowed to touch live.
+
+    We capture this with a recording GitOps that bins every write call
+    by ``repo=`` path. During the worker phase the live repo path must
+    NOT appear in the bin. Once the Integrator phase begins, the live
+    path WILL appear (create branch, merge, delete branch).
+    """
+
+    _write_mutation_discover_json(repo=tmp_path)
+
+    # Recording gops that flags each write with its target repo path.
+    @dataclass
+    class _BinningGitOps(_FakeGitOps):
+        write_log: list[tuple[str, Path, str]] = field(default_factory=list)
+
+        def create_and_checkout_branch(
+            self, *, repo: Path, branch: str
+        ) -> None:
+            self.write_log.append(("create_branch", Path(repo), branch))
+            super().create_and_checkout_branch(repo=repo, branch=branch)
+
+        def merge_branch_into_main(self, *, repo: Path, branch: str) -> None:
+            self.write_log.append(("merge", Path(repo), branch))
+            super().merge_branch_into_main(repo=repo, branch=branch)
+
+        def discard_local_changes(self, *, repo: Path) -> None:
+            self.write_log.append(("discard", Path(repo), ""))
+            super().discard_local_changes(repo=repo)
+
+        def delete_branch(self, *, repo: Path, branch: str) -> None:
+            self.write_log.append(("delete_branch", Path(repo), branch))
+            super().delete_branch(repo=repo, branch=branch)
+
+        def checkout(self, *, repo: Path, ref: str) -> None:
+            self.write_log.append(("checkout", Path(repo), ref))
+            super().checkout(repo=repo, ref=ref)
+
+    dispatcher = _FakeFixDispatcher(
+        outcome=FixDispatchOutcome(status="done", commits_made=1)
+    )
+    suite = _FakeSuiteRunner(outcome=SuiteOutcome(passed=True))
+    recheck = _FakeMutationRechecker(status="killed")
+    guard = _FakeGuardInspector(
+        result=GuardResult(
+            passed=True, halt_reasons=(), files_touched=("tests/x.py",), template="A"
+        )
+    )
+    gops = _BinningGitOps(
+        canned_diff="diff --git a/tests/x.py b/tests/x.py\n+x\n"
+    )
+    brief_runner, _ = _make_fake_brief_runner()
+    seams = _auto_fix_test_seams(tmp_path)
+    clone_root = seams["isolated_workspace"].clone_root  # type: ignore[attr-defined]
+
+    result = run_nightly(
+        repo=tmp_path,
+        profile=_autofix_profile(autonomous=True),
+        channel_runner=_RecordingChannelRunner(),
+        brief_runner=brief_runner,
+        windows_mirror=lambda _p: None,
+        fix_dispatcher=dispatcher,
+        suite_runner=suite,
+        mutation_rechecker=recheck,
+        guard_inspector=guard,
+        git_ops=gops,
+        isolated_workspace=seams["isolated_workspace"],
+        apply_patch=seams["apply_patch"],
+    )
+
+    assert result.auto_fix is not None
+    assert result.auto_fix.merged is True
+
+    # Partition the write_log into worker (clone path) and integrator
+    # (live path) buckets by ``repo=`` arg.
+    live = tmp_path.resolve()
+    clone = clone_root.resolve()
+    worker_writes = [
+        e for e in gops.write_log
+        if Path(e[1]).resolve() == clone
+    ]
+    integrator_writes = [
+        e for e in gops.write_log
+        if Path(e[1]).resolve() == live
+    ]
+
+    # Worker side: created the feat branch in the clone. No merges,
+    # no discards, no deletes on the clone (the clone is rmtree-d by
+    # the context manager so no restore primitive is needed).
+    assert any(op == "create_branch" for op, _, _ in worker_writes)
+    assert all(op != "merge" for op, _, _ in worker_writes)
+
+    # Integrator side: created branch on live + merged + deleted branch.
+    integrator_ops = [op for op, _, _ in integrator_writes]
+    assert "create_branch" in integrator_ops
+    assert "merge" in integrator_ops
+    assert "delete_branch" in integrator_ops
+
+    # CRITICAL: every write log entry is either on the clone OR on the
+    # live repo — nothing else. (A bug that mis-routed a write would
+    # show up here as a third repo path.)
+    every_repo = {Path(e[1]).resolve() for e in gops.write_log}
+    assert every_repo <= {clone, live}
+
+
+def test_auto_mode_integrator_drops_when_apply_fails(tmp_path: Path) -> None:
+    """spec_040 §2-2 — when the worker's verified patch fails to apply
+    on live (conflict / drift), the Integrator drops the candidate
+    cleanly: no merge, restore-on-live primitives fire, halt reason
+    carries the canonical ``_HALT_INTEGRATOR_APPLY_FAILED`` anchor.
+    """
+
+    from ccd.nightly import _HALT_INTEGRATOR_APPLY_FAILED
+
+    _write_mutation_discover_json(repo=tmp_path)
+    dispatcher = _FakeFixDispatcher(
+        outcome=FixDispatchOutcome(status="done", commits_made=1)
+    )
+    suite = _FakeSuiteRunner(outcome=SuiteOutcome(passed=True))
+    recheck = _FakeMutationRechecker(status="killed")
+    guard = _FakeGuardInspector()
+    gops = _FakeGitOps(canned_diff="diff --git a/tests/x.py b/tests/x.py\n")
+    brief_runner, _ = _make_fake_brief_runner()
+
+    # Build seams with an apply_patch that raises (simulated apply conflict).
+    from contextlib import contextmanager
+
+    clone_root = tmp_path / "_auto_clone"
+
+    @contextmanager
+    def workspace(live_repo: Path) -> Any:
+        clone_root.mkdir(parents=True, exist_ok=True)
+        yield clone_root
+
+    raising_applier = _FakePatchApplier(
+        should_raise=RuntimeError("simulated conflict: hunk 1 failed")
+    )
+
+    result = run_nightly(
+        repo=tmp_path,
+        profile=_autofix_profile(autonomous=True),
+        channel_runner=_RecordingChannelRunner(),
+        brief_runner=brief_runner,
+        windows_mirror=lambda _p: None,
+        fix_dispatcher=dispatcher,
+        suite_runner=suite,
+        mutation_rechecker=recheck,
+        guard_inspector=guard,
+        git_ops=gops,
+        isolated_workspace=workspace,
+        apply_patch=raising_applier,
+    )
+
+    af = result.auto_fix
+    assert af is not None
+    assert af.merged is False
+    assert _HALT_INTEGRATOR_APPLY_FAILED in af.halt_reason
+    assert "simulated conflict" in af.halt_reason
+    # Apply was attempted on the LIVE repo, not the clone.
+    assert raising_applier.calls
+    assert raising_applier.calls[0][0].resolve() == tmp_path.resolve()
+    # Live restore fired on the Integrator's HALT path.
+    assert gops.discards
+    assert "main" in gops.checkouts
+    assert af.branch in gops.deletes
+    # No merge happened.
+    assert gops.merges == []
+
+
+def test_auto_mode_integrator_drops_when_live_r4_fails(
+    tmp_path: Path,
+) -> None:
+    """spec_040 §2-2 — when the worker's R4 was green in the clone but
+    re-checking R4 on live fails (drift between clone snapshot and
+    live since the worker started), the Integrator drops: no merge,
+    halt reason names the live R4 re-check.
+    """
+
+    from ccd.nightly import _HALT_INTEGRATOR_R4_FAILED
+
+    _write_mutation_discover_json(repo=tmp_path)
+
+    # Suite passes in clone (worker), fails on live (Integrator).
+    call_count = {"n": 0}
+
+    def _two_phase_suite(*, repo: Path) -> SuiteOutcome:
+        call_count["n"] += 1
+        return SuiteOutcome(
+            passed=call_count["n"] == 1,
+            output="ok" if call_count["n"] == 1 else "live regression",
+        )
+
+    dispatcher = _FakeFixDispatcher(
+        outcome=FixDispatchOutcome(status="done", commits_made=1)
+    )
+    recheck = _FakeMutationRechecker(status="killed")
+    guard = _FakeGuardInspector(
+        result=GuardResult(
+            passed=True, halt_reasons=(), files_touched=("tests/x.py",), template="A"
+        )
+    )
+    gops = _FakeGitOps(canned_diff="diff --git a/tests/x.py b/tests/x.py\n")
+    brief_runner, _ = _make_fake_brief_runner()
+    seams = _auto_fix_test_seams(tmp_path)
+
+    result = run_nightly(
+        repo=tmp_path,
+        profile=_autofix_profile(autonomous=True),
+        channel_runner=_RecordingChannelRunner(),
+        brief_runner=brief_runner,
+        windows_mirror=lambda _p: None,
+        fix_dispatcher=dispatcher,
+        suite_runner=_two_phase_suite,
+        mutation_rechecker=recheck,
+        guard_inspector=guard,
+        git_ops=gops,
+        isolated_workspace=seams["isolated_workspace"],
+        apply_patch=seams["apply_patch"],
+    )
+
+    af = result.auto_fix
+    assert af is not None
+    assert af.merged is False
+    assert _HALT_INTEGRATOR_R4_FAILED in af.halt_reason
+    assert gops.merges == []
+    # Live restore fired.
+    assert gops.discards
+    assert af.branch in gops.deletes
+
+
+def test_auto_mode_integrator_drops_when_live_guard_fails(
+    tmp_path: Path,
+) -> None:
+    """spec_040 §2-2 — when the worker's guard passed in the clone but
+    re-checking guard on live fails (e.g. drift produced disallowed
+    files in the live diff), the Integrator drops the candidate.
+    """
+
+    from ccd.nightly import _HALT_INTEGRATOR_GUARD_FAILED
+
+    _write_mutation_discover_json(repo=tmp_path)
+
+    # Guard passes in worker, fails in Integrator.
+    call_count = {"n": 0}
+
+    def _two_phase_guard(
+        *, diff: str, allowed_files: list[str], template: str
+    ) -> GuardResult:
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return GuardResult(
+                passed=True, halt_reasons=(),
+                files_touched=("tests/x.py",), template=template,
+            )
+        return GuardResult(
+            passed=False,
+            halt_reasons=("R3: production diff too large on live",),
+            files_touched=("ccd/sneaky.py",),
+            template=template,
+        )
+
+    dispatcher = _FakeFixDispatcher(
+        outcome=FixDispatchOutcome(status="done", commits_made=1)
+    )
+    suite = _FakeSuiteRunner(outcome=SuiteOutcome(passed=True))
+    recheck = _FakeMutationRechecker(status="killed")
+    gops = _FakeGitOps(canned_diff="diff --git a/tests/x.py b/tests/x.py\n")
+    brief_runner, _ = _make_fake_brief_runner()
+    seams = _auto_fix_test_seams(tmp_path)
+
+    result = run_nightly(
+        repo=tmp_path,
+        profile=_autofix_profile(autonomous=True),
+        channel_runner=_RecordingChannelRunner(),
+        brief_runner=brief_runner,
+        windows_mirror=lambda _p: None,
+        fix_dispatcher=dispatcher,
+        suite_runner=suite,
+        mutation_rechecker=recheck,
+        guard_inspector=_two_phase_guard,
+        git_ops=gops,
+        isolated_workspace=seams["isolated_workspace"],
+        apply_patch=seams["apply_patch"],
+    )
+
+    af = result.auto_fix
+    assert af is not None
+    assert af.merged is False
+    assert _HALT_INTEGRATOR_GUARD_FAILED in af.halt_reason
+    assert "R3: production diff too large" in af.halt_reason
+    # No merge happened, live restored.
+    assert gops.merges == []
+    assert af.branch in gops.deletes
+
+
+def test_auto_mode_e2e_v2_external_state_preserved(tmp_path: Path) -> None:
+    """spec_040 §2-3 — the EXTERNAL state observed after a successful
+    auto-mode run (merge commit on main + brief Phase 2 §B + recorded
+    auto_fix outcome) is bit-for-bit identical to the v2 single-phase
+    flow. The only internal change is "via Integrator now".
+
+    Pins the surfaced AutoFixOutcome shape that the morning brief reads.
+    """
+
+    _write_mutation_discover_json(repo=tmp_path)
+    diff_text = (
+        "diff --git a/tests/test_protocol.py b/tests/test_protocol.py\n"
+        "+++ reproducer added\n"
+    )
+    dispatcher = _FakeFixDispatcher(
+        outcome=FixDispatchOutcome(status="done", commits_made=1)
+    )
+    suite = _FakeSuiteRunner(outcome=SuiteOutcome(passed=True))
+    recheck = _FakeMutationRechecker(status="killed")
+    guard = _FakeGuardInspector(
+        result=GuardResult(
+            passed=True, halt_reasons=(), files_touched=("tests/x.py",), template="A"
+        )
+    )
+    gops = _FakeGitOps(canned_diff=diff_text)
+    brief_runner, _ = _make_fake_brief_runner()
+    seams = _auto_fix_test_seams(tmp_path)
+    applier = seams["apply_patch"]
+
+    result = run_nightly(
+        repo=tmp_path,
+        profile=_autofix_profile(autonomous=True),
+        channel_runner=_RecordingChannelRunner(),
+        brief_runner=brief_runner,
+        windows_mirror=lambda _p: None,
+        fix_dispatcher=dispatcher,
+        suite_runner=suite,
+        mutation_rechecker=recheck,
+        guard_inspector=guard,
+        git_ops=gops,
+        isolated_workspace=seams["isolated_workspace"],
+        apply_patch=applier,
+    )
+
+    af = result.auto_fix
+    assert af is not None
+    # External-state contract (spec_023〜038 shape preserved).
+    assert af.skipped is False
+    assert af.merged is True
+    assert af.dispatched is True
+    assert af.dispatch_status == "done"
+    assert af.r5_killed is True
+    assert af.r4_suite_passed is True
+    assert af.guard_passed is True
+    assert af.halt_reason == ""
+    assert af.mode == "auto"
+    assert af.branch == f"auto/{af.spec_auto_id}"
+    assert af.merge_diff == diff_text  # surfaced for §B
+    assert af.iterations == 1  # spec_039 default
+    assert af.converged is True
+    # Integrator's apply received the LIVE repo + worker's verified diff.
+    assert len(applier.calls) == 1
+    assert applier.calls[0][0].resolve() == tmp_path.resolve()
+    assert applier.calls[0][1] == diff_text
+    assert applier.calls[0][2] == af.spec_auto_id
+    # Merge happened on live exactly once with the right branch name.
+    assert gops.merges == [af.branch]
 
 
 # --------------------------------------------------------------------------- #
@@ -3875,6 +4413,7 @@ def test_default_k1_dispatch_count_unchanged_vs_v2(tmp_path: Path) -> None:
         mutation_rechecker=recheck,
         guard_inspector=guard,
         git_ops=gops,
+        **_auto_fix_test_seams(tmp_path),
     )
 
     assert len(dispatcher.calls) == 1
@@ -3909,6 +4448,7 @@ def test_k3_with_four_candidates_processes_only_top_three(
         mutation_rechecker=recheck,
         guard_inspector=guard,
         git_ops=gops,
+        **_auto_fix_test_seams(tmp_path),
     )
 
     # 3 dispatches, 3 merges (all R5/R4/guard pass in this fake setup).
@@ -3961,6 +4501,7 @@ def test_k3_backlog_cap_between_candidates_skips_remainder(
         guard_inspector=guard,
         git_ops=gops,
         unpushed_counter=_counter,
+        **_auto_fix_test_seams(tmp_path),
     )
 
     # Only candidate 1 dispatched + merged; remainder bailed.
@@ -4019,6 +4560,7 @@ def test_k3_first_candidate_halt_does_not_stop_second(
         mutation_rechecker=_stateful_recheck,
         guard_inspector=guard,
         git_ops=gops,
+        **_auto_fix_test_seams(tmp_path),
     )
 
     # 2 dispatches (1 halt + 1 merge).
@@ -4057,6 +4599,7 @@ def test_k1_default_brief_layout_identical(tmp_path: Path) -> None:
         mutation_rechecker=recheck,
         guard_inspector=guard,
         git_ops=gops,
+        **_auto_fix_test_seams(tmp_path),
     )
 
     assert result.success
@@ -4091,6 +4634,7 @@ def test_k3_brief_renders_multi_candidate_section_b(tmp_path: Path) -> None:
         mutation_rechecker=recheck,
         guard_inspector=guard,
         git_ops=gops,
+        **_auto_fix_test_seams(tmp_path),
     )
 
     assert result.success
@@ -4285,6 +4829,7 @@ def test_default_loop_max_iterations_is_one(tmp_path: Path) -> None:
         mutation_rechecker=recheck,
         guard_inspector=guard,
         git_ops=gops,
+        **_auto_fix_test_seams(tmp_path),
     )
 
     af = result.auto_fix
@@ -4331,6 +4876,7 @@ def test_loop_converges_at_iteration_2_when_recheck_flips(
         mutation_rechecker=recheck,
         guard_inspector=guard,
         git_ops=gops,
+        **_auto_fix_test_seams(tmp_path),
     )
 
     af = result.auto_fix
@@ -4375,6 +4921,7 @@ def test_loop_no_progress_halts_before_iteration_3(
         mutation_rechecker=recheck,
         guard_inspector=guard,
         git_ops=gops,
+        **_auto_fix_test_seams(tmp_path),
     )
 
     af = result.auto_fix
@@ -4423,6 +4970,7 @@ def test_loop_immediate_halt_on_blocked_status_does_not_iterate(
         mutation_rechecker=recheck,
         guard_inspector=guard,
         git_ops=gops,
+        **_auto_fix_test_seams(tmp_path),
     )
 
     af = result.auto_fix
@@ -4465,6 +5013,7 @@ def test_brief_renders_fix_loop_summary_line(tmp_path: Path) -> None:
         guard_inspector=guard,
         git_ops=gops,
         today=date(2026, 5, 25),
+        **_auto_fix_test_seams(tmp_path),
     )
 
     assert result.brief_report_wsl is not None
@@ -4498,6 +5047,7 @@ def test_default_k1_iter1_brief_does_not_mention_fix_loop(
         guard_inspector=guard,
         git_ops=gops,
         today=date(2026, 5, 25),
+        **_auto_fix_test_seams(tmp_path),
     )
 
     assert result.brief_report_wsl is not None

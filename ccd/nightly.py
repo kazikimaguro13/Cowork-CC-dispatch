@@ -267,6 +267,22 @@ canned GuardResult so they can pin guard-pass vs guard-HALT branches
 independently of the parser."""
 
 
+PatchApplier = Callable[..., None]
+"""``(repo, patch_text, spec_auto_id) → None`` — spec_040 Integrator seam.
+
+Applies the worker's verified patch to ``repo`` as a single new commit
+on the currently-checked-out branch, raising on any failure (the
+Integrator catches the exception and HALTs cleanly with
+``_HALT_INTEGRATOR_APPLY_FAILED``). The default
+:func:`_default_patch_applier` shells out to ``git apply --index`` +
+``git commit -m``; tests inject a fake that records calls and is
+configurable to raise.
+
+The Integrator is the ONLY caller of this seam — workers never apply
+patches (they only produce them). spec_040 §2-2 last bullet: live
+writes belong exclusively to the Integrator."""
+
+
 IsolatedWorkspace = Callable[[Path], Any]
 """``(live_repo) → ContextManager[Path]`` — spec_028 propose-mode seam.
 
@@ -487,8 +503,13 @@ def run_nightly(
     unpushed_counter: UnpushedCounter | None = None,
     unpushed_backlog_limit: int | None = None,
     dispatch_timeout_s: float | None = None,
-    # spec_028 — propose-mode workspace seam
+    # spec_028 — propose-mode workspace seam (spec_040 reuses the same
+    # seam for auto mode — both modes now run their write-bearing steps
+    # inside a fresh disposable clone).
     isolated_workspace: IsolatedWorkspace | None = None,
+    # spec_040 — Integrator's patch applier seam. Default shells out to
+    # ``git apply --index`` + ``git commit``; tests inject a fake.
+    apply_patch: PatchApplier | None = None,
     # spec_029 — per-policy output redirection. The sweep entry point
     # (``ccd nightly-all``) passes CCD-side per-policy directories so the
     # target repo never sees a write (the propose/off invariant) and
@@ -636,6 +657,8 @@ def run_nightly(
                 if dispatch_timeout_s is not None
                 else _AUTO_FIX_DISPATCH_TIMEOUT_S
             ),
+            isolated_workspace=isolated_workspace,
+            apply_patch=apply_patch,
             max_candidates=max_k,
             loop_max_iterations=loop_max_iters,
         )
@@ -850,6 +873,21 @@ _HALT_DISPATCH_FAILED = "dispatch failed"
 # spec_025 anchors.
 _HALT_PAUSED = "paused: _ai_workspace/PAUSE present"
 _HALT_DISPATCH_TIMEOUT = "dispatch timed out"
+# spec_040 Integrator anchors (auto mode only — the Integrator runs on
+# live AFTER the worker phase finishes inside a disposable clone). These
+# distinguish "worker said the patch was verified-good but live disagrees"
+# (apply / re-verify failure) from worker-side halts. Phrased so the
+# morning brief's §D one-liner can name which integrator gate dropped
+# the candidate.
+_HALT_INTEGRATOR_PREFIX = "integrator"
+_HALT_INTEGRATOR_BRANCH_FAILED = (
+    "integrator: live feat branch creation failed"
+)
+_HALT_INTEGRATOR_APPLY_FAILED = "integrator: live patch apply failed"
+_HALT_INTEGRATOR_GUARD_FAILED = "integrator: live guard re-check failed"
+_HALT_INTEGRATOR_R4_FAILED = "integrator: live suite re-check failed"
+_HALT_INTEGRATOR_MERGE_FAILED = "integrator: local merge failed"
+_HALT_INTEGRATOR_EMPTY_PATCH = "integrator: verified patch was empty"
 # Phrasing the morning brief surfaces verbatim when the un-pushed backlog
 # hits the cap. The test for (b) pins this substring so a rename here
 # also re-acknowledges the operator-facing wording.
@@ -917,6 +955,8 @@ def _run_auto_fix_loop(
     git_ops: GitOps | None,
     unpushed_counter: UnpushedCounter | None,
     unpushed_backlog_limit: int,
+    isolated_workspace: IsolatedWorkspace | None,
+    apply_patch: PatchApplier | None,
     dispatch_timeout_s: float,
     max_candidates: int = 1,
     loop_max_iterations: int = 1,
@@ -1021,6 +1061,14 @@ def _run_auto_fix_loop(
         if guard_inspector is not None
         else _default_guard_inspector
     )
+    workspace_factory = (
+        isolated_workspace
+        if isolated_workspace is not None
+        else _default_isolated_workspace
+    )
+    applier = (
+        apply_patch if apply_patch is not None else _default_patch_applier
+    )
 
     outcomes: list[AutoFixOutcome] = []
     for i, (template, finding, source_report, candidate_count) in enumerate(
@@ -1071,6 +1119,8 @@ def _run_auto_fix_loop(
                 recheck_mutation=recheck_mutation,
                 recheck_adversarial=recheck_adversarial,
                 inspect=inspect,
+                workspace_factory=workspace_factory,
+                apply_patch=applier,
                 dispatch_timeout_s=dispatch_timeout_s,
                 loop_max_iterations=loop_max_iterations,
             )
@@ -1095,22 +1145,48 @@ def _process_one_auto_fix_candidate(
     recheck_mutation: MutationRechecker,
     recheck_adversarial: AdversarialRechecker,
     inspect: GuardInspector,
+    workspace_factory: IsolatedWorkspace,
+    apply_patch: PatchApplier,
     dispatch_timeout_s: float,
     loop_max_iterations: int = 1,
 ) -> AutoFixOutcome:
-    """spec_038 §2-3 — per-candidate body, extended by spec_039 §2-3
-    to drive the convergence loop instead of a single dispatch+verify.
+    """spec_040 §2-1〜§2-2 — per-candidate body, unified clone-and-patch.
 
-    The 8-step flow (translate → branch → run-fix-loop[ dispatch → R5 →
-    R4 → guard, repeat until green or halt] → decide → restore) is the
-    same skeleton as spec_023〜026 with the middle replaced by
-    :func:`ccd.loop.run_fix_loop`. At the default
-    ``loop_max_iterations=1`` the FixLoop runs exactly one iteration so
-    dispatch count / brief layout / record外形 stay bit-for-bit
-    identical to spec_023〜038.
+    Auto mode no longer mutates the live working tree during the worker
+    phase. The two-phase flow is:
+
+    Worker phase (in a disposable clone):
+
+    1. Translate the finding to ``spec_auto.md`` against the LIVE repo
+       (audit artifact; lives under ``_ai_workspace/bridge/inbox/`` so
+       the operator can always inspect what the agent was asked to do).
+    2. Enter a fresh ``isolated_workspace`` clone (spec_014's
+       ``_isolated_clone`` strips all git remotes — clone cannot push).
+    3. Copy ``spec_auto.md`` into the clone (``_ai_workspace`` is
+       excluded from clone copy, so we re-introduce just the spec).
+    4. Create a feat branch ``auto/<spec_auto_id>`` in the clone.
+    5. Run :func:`ccd.loop.run_fix_loop` — dispatch + R5 + R4 + guard,
+       iterated up to ``loop_max_iterations`` until verification is
+       green (spec_039). All writes go to the clone; if every iteration
+       fails the candidate is dropped without touching live.
+
+    Integrator phase (on live — the ONLY writer to live):
+
+    6. Hand the verified diff to :func:`_integrate_one_candidate` which
+       creates the same feat branch on live, applies the patch as a
+       single commit, re-runs guard + R4 against live, and (if both
+       pass) merges into ``main``. Any failure → drop + live restore
+       (no rebase, no re-dispatch — spec_040 §2-2).
+
+    Spec_040 §2-2 invariant: every live-side write the Integrator does
+    goes through ``gops``, every worker-side write goes through the
+    same ``gops`` but with ``repo=<clone_path>``. The structural test
+    :func:`test_worker_phase_does_not_write_to_live` pins this.
     """
 
-    # 1. Translate
+    # 1. Translate against LIVE (the spec_auto.md is the shared audit
+    # artifact — both modes route their translator through the live
+    # bridge dir).
     tr = translate_finding(
         finding,
         repo=repo,
@@ -1127,24 +1203,171 @@ def _process_one_auto_fix_candidate(
 
     assert tr.spec_auto_path is not None  # success ⇒ path exists
 
-    # Per-template guard config
+    # Per-template guard config — used in both worker and Integrator
+    # phases (Integrator re-runs guard against live).
     if template == "A":
         allowed_files = list(_AUTO_FIX_ALLOWED_FILES_A)
     else:  # "B"
-        # Allow the named production file + tests/ — and only those. The
-        # guard's R3 (production-diff bound) is in effect for template B
-        # so a sprawling diff inside the named file still halts.
         allowed_files = [finding.file, "tests/"]
 
-    # 2. Branch
     branch = f"auto/{tr.spec_auto_id}"
+
+    # 2. Worker phase — runs entirely inside a fresh disposable clone.
+    # The clone is rmtree-d on context exit, so even mid-flight crashes
+    # cannot leave debris on live.
     try:
-        gops.create_and_checkout_branch(repo=repo, branch=branch)
+        with workspace_factory(repo) as clone:
+            clone_path = Path(clone)
+            spec_auto_in_clone = _copy_spec_auto_into_clone(
+                spec_auto_live=tr.spec_auto_path,
+                live_repo=repo,
+                clone=clone_path,
+            )
+
+            try:
+                gops.create_and_checkout_branch(
+                    repo=clone_path, branch=branch
+                )
+            except Exception as exc:
+                return AutoFixOutcome(
+                    skipped=False,
+                    spec_auto_id=tr.spec_auto_id,
+                    spec_auto_path=tr.spec_auto_path,
+                    finding_signature=finding.signature,
+                    candidate_count=candidate_count,
+                    template=template,
+                    branch=branch,
+                    halt_reason=(
+                        "worker: branch creation failed in clone: "
+                        f"{type(exc).__name__}: {exc}"
+                    ),
+                )
+
+            def _verifier(
+                *, repo: Path, branch: str
+            ) -> IterationVerification:
+                return _verify_iteration_auto(
+                    template=template,
+                    finding=finding,
+                    allowed_files=allowed_files,
+                    repo=repo,
+                    branch=branch,
+                    gops=gops,
+                    run_suite=run_suite,
+                    recheck_mutation=recheck_mutation,
+                    recheck_adversarial=recheck_adversarial,
+                    inspect=inspect,
+                )
+
+            try:
+                fl: FixLoopOutcome = run_fix_loop(
+                    spec_path=spec_auto_in_clone,
+                    repo=clone_path,
+                    branch=branch,
+                    dispatcher=dispatcher,
+                    verifier=_verifier,
+                    max_iterations=loop_max_iterations,
+                    wall_clock_budget_s=dispatch_timeout_s,
+                    feedback_dir=clone_path / "_ai_workspace" / "logs",
+                    spec_id=tr.spec_auto_id,
+                )
+            except Exception as exc:
+                return AutoFixOutcome(
+                    skipped=False,
+                    spec_auto_id=tr.spec_auto_id,
+                    spec_auto_path=tr.spec_auto_path,
+                    finding_signature=finding.signature,
+                    candidate_count=candidate_count,
+                    template=template,
+                    branch=branch,
+                    dispatched=False,
+                    halt_reason=(
+                        f"{_HALT_DISPATCH_FAILED}: "
+                        f"{type(exc).__name__}: {exc}".strip()
+                    ),
+                    iterations=0,
+                    converged=False,
+                    loop_halt_reason=LOOP_HALT_IMMEDIATE,
+                )
+
+            verif = fl.final_verification
+
+            # Worker HALT A: dispatch never produced a verifiable state.
+            if verif is None:
+                dispatch_status = fl.final_dispatch_status or "failed"
+                reason = (
+                    fl.final_dispatch_halt_reason
+                    or fl.halt_reason
+                    or _HALT_DISPATCH_FAILED
+                )
+                return AutoFixOutcome(
+                    skipped=False,
+                    spec_auto_id=tr.spec_auto_id,
+                    spec_auto_path=tr.spec_auto_path,
+                    finding_signature=finding.signature,
+                    candidate_count=candidate_count,
+                    template=template,
+                    branch=branch,
+                    dispatched=fl.final_dispatched,
+                    dispatch_status=dispatch_status,
+                    halt_reason=f"{_HALT_DISPATCH_FAILED}: {reason}",
+                    iterations=fl.iterations,
+                    converged=False,
+                    loop_halt_reason=fl.halt_reason,
+                )
+
+            # Worker HALT B: ran out of iterations without converging.
+            if not fl.converged:
+                halt_reason = _compose_halt_reason(
+                    template=template,
+                    r5_killed=verif.r5_passed,
+                    r5_status=verif.r5_status,
+                    r4_passed=verif.r4_passed,
+                    guard_passed=verif.guard_passed,
+                    guard_reasons=verif.guard_reasons,
+                )
+                if (
+                    fl.halt_reason
+                    and fl.halt_reason != LOOP_HALT_MAX_ITERATIONS
+                    and loop_max_iterations > 1
+                ):
+                    halt_reason = f"{halt_reason} [{fl.halt_reason}]"
+                elif (
+                    fl.halt_reason
+                    and fl.halt_reason == LOOP_HALT_MAX_ITERATIONS
+                    and loop_max_iterations > 1
+                ):
+                    halt_reason = (
+                        f"{halt_reason} [fix-loop exhausted "
+                        f"{loop_max_iterations} iterations]"
+                    )
+                return AutoFixOutcome(
+                    skipped=False,
+                    spec_auto_id=tr.spec_auto_id,
+                    spec_auto_path=tr.spec_auto_path,
+                    finding_signature=finding.signature,
+                    candidate_count=candidate_count,
+                    template=template,
+                    branch=branch,
+                    dispatched=True,
+                    dispatch_status=fl.final_dispatch_status,
+                    r5_killed=verif.r5_passed,
+                    r4_suite_passed=verif.r4_passed,
+                    guard_passed=verif.guard_passed,
+                    guard_halt_reasons=verif.guard_reasons,
+                    merged=False,
+                    halt_reason=halt_reason,
+                    iterations=fl.iterations,
+                    converged=False,
+                    loop_halt_reason=fl.halt_reason,
+                )
+
+            # Worker phase converged: snapshot the verified state so it
+            # outlives the clone (which is about to be rmtree-d).
+            verified_diff = verif.diff
+            verified_verification = verif
+            verified_fl = fl
     except Exception as exc:
-        # The branch may have been partially created (e.g. ref written
-        # but checkout failed); run the same HALT restore the other
-        # paths use so the next night's pre-flight starts clean.
-        _restore_repo_after_halt(gops=gops, repo=repo, branch=branch)
         return AutoFixOutcome(
             skipped=False,
             spec_auto_id=tr.spec_auto_id,
@@ -1153,165 +1376,33 @@ def _process_one_auto_fix_candidate(
             candidate_count=candidate_count,
             template=template,
             branch=branch,
-            halt_reason=f"branch creation failed: {type(exc).__name__}: {exc}",
-        )
-
-    # 3. Build the per-iteration verifier — closes over the per-candidate
-    # template / finding / R5+R4+guard seams so FixLoop only deals in
-    # opaque IterationVerification objects.
-    def _verifier(*, repo: Path, branch: str) -> IterationVerification:
-        return _verify_iteration_auto(
-            template=template,
-            finding=finding,
-            allowed_files=allowed_files,
-            repo=repo,
-            branch=branch,
-            gops=gops,
-            run_suite=run_suite,
-            recheck_mutation=recheck_mutation,
-            recheck_adversarial=recheck_adversarial,
-            inspect=inspect,
-        )
-
-    # 4. Run the spec_039 convergence loop.
-    try:
-        fl: FixLoopOutcome = run_fix_loop(
-            spec_path=tr.spec_auto_path,
-            repo=repo,
-            branch=branch,
-            dispatcher=dispatcher,
-            verifier=_verifier,
-            max_iterations=loop_max_iterations,
-            wall_clock_budget_s=dispatch_timeout_s,
-            spec_id=tr.spec_auto_id,
-        )
-    except Exception as exc:
-        _restore_repo_after_halt(gops=gops, repo=repo, branch=branch)
-        return AutoFixOutcome(
-            skipped=False,
-            spec_auto_id=tr.spec_auto_id,
-            spec_auto_path=tr.spec_auto_path,
-            finding_signature=finding.signature,
-            candidate_count=candidate_count,
-            template=template,
-            branch=branch,
-            dispatched=False,
             halt_reason=(
-                f"{_HALT_DISPATCH_FAILED}: "
-                f"{type(exc).__name__}: {exc}".strip()
+                "worker: workspace setup failed: "
+                f"{type(exc).__name__}: {exc}"
             ),
-            iterations=0,
-            converged=False,
-            loop_halt_reason=LOOP_HALT_IMMEDIATE,
         )
 
-    verif = fl.final_verification
+    # Clone has been rmtree-d; only the verified diff + verification
+    # metadata survive into the Integrator phase.
 
-    # 5a. Dispatch failed entirely (verifier never ran) → halt.
-    if verif is None:
-        _restore_repo_after_halt(gops=gops, repo=repo, branch=branch)
-        dispatch_status = fl.final_dispatch_status or "failed"
-        reason = (
-            fl.final_dispatch_halt_reason
-            or fl.halt_reason
-            or _HALT_DISPATCH_FAILED
-        )
-        return AutoFixOutcome(
-            skipped=False,
-            spec_auto_id=tr.spec_auto_id,
-            spec_auto_path=tr.spec_auto_path,
-            finding_signature=finding.signature,
-            candidate_count=candidate_count,
-            template=template,
-            branch=branch,
-            dispatched=fl.final_dispatched,
-            dispatch_status=dispatch_status,
-            halt_reason=f"{_HALT_DISPATCH_FAILED}: {reason}",
-            iterations=fl.iterations,
-            converged=False,
-            loop_halt_reason=fl.halt_reason,
-        )
-
-    # 5b. Decide: merge if converged, else halt with per-gate reason.
-    r5_killed = verif.r5_passed
-    r4_passed = verif.r4_passed
-    guard_passed = verif.guard_passed
-    guard_reasons = verif.guard_reasons
-    diff_text = verif.diff
-
-    merged = False
-    halt_reason = ""
-    if fl.converged:
-        try:
-            gops.merge_branch_into_main(repo=repo, branch=branch)
-            merged = True
-        except Exception as exc:
-            halt_reason = (
-                f"local merge failed: {type(exc).__name__}: {exc}"
-            )
-    else:
-        halt_reason = _compose_halt_reason(
-            template=template,
-            r5_killed=r5_killed,
-            r5_status=verif.r5_status,
-            r4_passed=r4_passed,
-            guard_passed=guard_passed,
-            guard_reasons=guard_reasons,
-        )
-        # Annotate the halt reason with the loop's structural cause when
-        # it isn't the trivial "max iterations of 1 exhausted" — the
-        # latter is implied by loop_max_iterations=1 and would be noise.
-        if (
-            fl.halt_reason
-            and fl.halt_reason != LOOP_HALT_MAX_ITERATIONS
-            and loop_max_iterations > 1
-        ):
-            halt_reason = f"{halt_reason} [{fl.halt_reason}]"
-        elif (
-            fl.halt_reason
-            and fl.halt_reason == LOOP_HALT_MAX_ITERATIONS
-            and loop_max_iterations > 1
-        ):
-            halt_reason = (
-                f"{halt_reason} [fix-loop exhausted "
-                f"{loop_max_iterations} iterations]"
-            )
-
-    # spec_026 §2-2 — every HALT path restores the repo to its pre-run
-    # state (discard uncommitted edits → main → delete auto branch);
-    # the success path keeps the merge commit on ``main`` but still
-    # deletes the now-redundant feature branch.
-    if not merged:
-        _restore_repo_after_halt(gops=gops, repo=repo, branch=branch)
-    else:
-        _delete_feature_branch_after_merge(gops=gops, repo=repo, branch=branch)
-
-    # spec_025: the brief's Phase 2 §B reads ``merge_diff`` so the
-    # operator can review the diff without leaving the report. We
-    # surface it only when the fix actually merged — a halted fix's
-    # in-progress diff isn't a reviewable artifact.
-    surfaced_diff = diff_text if merged else ""
-
-    return AutoFixOutcome(
-        skipped=False,
+    # 3. Integrator phase — the ONLY code path that writes to live.
+    return _integrate_one_candidate(
         spec_auto_id=tr.spec_auto_id,
         spec_auto_path=tr.spec_auto_path,
-        finding_signature=finding.signature,
-        candidate_count=candidate_count,
+        finding=finding,
         template=template,
+        allowed_files=allowed_files,
+        candidate_count=candidate_count,
         branch=branch,
-        dispatched=True,
-        dispatch_status=fl.final_dispatch_status,
-        r5_killed=r5_killed,
-        r4_suite_passed=r4_passed,
-        guard_passed=guard_passed,
-        guard_halt_reasons=guard_reasons,
-        merged=merged,
-        halt_reason=halt_reason,
-        merge_diff=surfaced_diff,
-        iterations=fl.iterations,
-        converged=fl.converged,
-        loop_halt_reason=fl.halt_reason,
+        diff_text=verified_diff,
+        worker_verification=verified_verification,
+        fl=verified_fl,
+        loop_max_iterations=loop_max_iterations,
+        live_repo=repo,
+        gops=gops,
+        run_suite=run_suite,
+        inspect=inspect,
+        apply_patch=apply_patch,
     )
 
 
@@ -1936,6 +2027,20 @@ def _copy_spec_auto_into_clone(
     except ValueError:
         rel = Path("_ai_workspace") / "bridge" / "inbox" / spec_auto_live.name
     target = clone / rel
+    # spec_040 — when the test's isolated_workspace factory yields the
+    # live repo itself as the "clone" (a degenerate test fixture, not
+    # production), the source and destination are literally the same
+    # file. Treat that as a no-op so the test harness does not need to
+    # special-case it. Production always yields a separate tmpdir so
+    # this branch is purely a test-ergonomics convenience.
+    try:
+        same_file = (
+            target.exists() and target.resolve() == spec_auto_live.resolve()
+        )
+    except OSError:
+        same_file = False
+    if same_file:
+        return target
     target.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(spec_auto_live, target)
     return target
@@ -2484,6 +2589,364 @@ def _dispatch_with_timeout(
             )
 
 
+def _default_patch_applier(
+    *, repo: Path, patch_text: str, spec_auto_id: str
+) -> None:
+    """spec_040 — production default for :data:`PatchApplier`.
+
+    Applies the worker's verified diff to ``repo`` as a single new
+    commit on the currently-checked-out branch:
+
+    1. ``git apply --index --whitespace=nowarn -`` (patch via stdin) —
+       stages every hunk in the index. ``--3way`` is intentionally not
+       used: the worker computed the diff from this same baseline (the
+       Integrator just freshly created the live feat branch off ``main``
+       and the worker's clone started from a copy of ``main`` too), so
+       a plain non-3way apply succeeds when the live tree matches the
+       clone's snapshot and FAILS LOUDLY when live has diverged (drift
+       → drop, per spec_040 §2-2: "apply 衝突 (既に live が変わっていて
+       patch が当たらない) で drop").
+    2. ``git commit -m "auto-fix: <spec_auto_id>"`` — a single commit
+       carrying the entire verified diff. The commit subject is stable
+       and operator-greppable; tests pin it.
+
+    Raises :class:`RuntimeError` on either step failing — the Integrator
+    catches and HALTs with the canonical anchor.
+    """
+
+    completed = subprocess.run(
+        ["git", "apply", "--index", "--whitespace=nowarn", "-"],
+        cwd=str(repo),
+        input=patch_text,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout or "").strip()
+        raise RuntimeError(f"git apply failed: {detail[:500]}")
+
+    commit_msg = f"auto-fix: {spec_auto_id}"
+    completed = subprocess.run(
+        ["git", "commit", "-m", commit_msg],
+        cwd=str(repo),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout or "").strip()
+        raise RuntimeError(f"git commit failed: {detail[:500]}")
+
+
+def _integrate_one_candidate(
+    *,
+    spec_auto_id: str,
+    spec_auto_path: Path,
+    finding: Finding,
+    template: str,
+    allowed_files: list[str],
+    candidate_count: int,
+    branch: str,
+    diff_text: str,
+    worker_verification: IterationVerification,
+    fl: FixLoopOutcome,
+    loop_max_iterations: int,
+    live_repo: Path,
+    gops: GitOps,
+    run_suite: SuiteRunner,
+    inspect: GuardInspector,
+    apply_patch: PatchApplier,
+) -> AutoFixOutcome:
+    """spec_040 — apply the worker's verified patch to live + re-verify + merge.
+
+    The Integrator is the ONLY code path allowed to write to the live
+    working tree / ``.git``. It is invoked AFTER the worker phase has
+    produced a verified patch inside its disposable clone. Sequence:
+
+    1. ``gops.create_and_checkout_branch(repo=live, branch=...)`` — fresh
+       feat branch on live, branched off ``main``.
+    2. ``apply_patch(repo=live, patch_text=...)`` — single commit
+       carrying the worker's verified diff.
+    3. ``inspect(...)`` — guard re-check on live (drift detection).
+    4. ``run_suite(repo=live)`` — R4 re-check on live (full suite).
+    5. ``gops.merge_branch_into_main(repo=live, branch=...)`` — local
+       non-ff merge into ``main``. NO push (spec_023 invariant).
+    6. ``gops.delete_branch(repo=live, branch=...)`` — clean up feat
+       branch.
+
+    Any failure between (1) and (5) → drop: restore live via
+    :func:`_restore_repo_after_halt` (best-effort), no rebase, no
+    re-dispatch. Spec_040 §2-2: "rebase も再 dispatch もせず drop".
+    The morning brief surfaces a one-line halt reason in §D with the
+    canonical ``_HALT_INTEGRATOR_*`` anchor.
+
+    R5 is NOT re-run on live — the worker's clone ran R5 against the
+    same baseline content (it copied from live), so re-running on live
+    would just duplicate R5's verdict. Drift is caught by guard + R4
+    re-check, which are the cheap checks; R5 (mutation re-run /
+    adversarial parser) is expensive and adds no signal in the common
+    case where live hasn't shifted since the worker started.
+    """
+
+    if not diff_text.strip():
+        # Defense in depth — the worker should already have caught this.
+        return AutoFixOutcome(
+            skipped=False,
+            spec_auto_id=spec_auto_id,
+            spec_auto_path=spec_auto_path,
+            finding_signature=finding.signature,
+            candidate_count=candidate_count,
+            template=template,
+            branch=branch,
+            dispatched=True,
+            dispatch_status=fl.final_dispatch_status,
+            r5_killed=worker_verification.r5_passed,
+            r4_suite_passed=worker_verification.r4_passed,
+            guard_passed=worker_verification.guard_passed,
+            guard_halt_reasons=worker_verification.guard_reasons,
+            merged=False,
+            halt_reason=_HALT_INTEGRATOR_EMPTY_PATCH,
+            iterations=fl.iterations,
+            converged=fl.converged,
+            loop_halt_reason=fl.halt_reason,
+        )
+
+    # 1. Create live feat branch.
+    try:
+        gops.create_and_checkout_branch(repo=live_repo, branch=branch)
+    except Exception as exc:
+        _restore_repo_after_halt(gops=gops, repo=live_repo, branch=branch)
+        return _integrator_halt_outcome(
+            spec_auto_id=spec_auto_id,
+            spec_auto_path=spec_auto_path,
+            finding=finding,
+            template=template,
+            candidate_count=candidate_count,
+            branch=branch,
+            worker_verification=worker_verification,
+            fl=fl,
+            halt_reason=(
+                f"{_HALT_INTEGRATOR_BRANCH_FAILED}: "
+                f"{type(exc).__name__}: {exc}"
+            ),
+        )
+
+    # 2. Apply the verified patch.
+    try:
+        apply_patch(
+            repo=live_repo,
+            patch_text=diff_text,
+            spec_auto_id=spec_auto_id,
+        )
+    except Exception as exc:
+        _restore_repo_after_halt(gops=gops, repo=live_repo, branch=branch)
+        return _integrator_halt_outcome(
+            spec_auto_id=spec_auto_id,
+            spec_auto_path=spec_auto_path,
+            finding=finding,
+            template=template,
+            candidate_count=candidate_count,
+            branch=branch,
+            worker_verification=worker_verification,
+            fl=fl,
+            halt_reason=(
+                f"{_HALT_INTEGRATOR_APPLY_FAILED}: "
+                f"{type(exc).__name__}: {exc}"
+            ),
+        )
+
+    # 3. Guard re-check on live.
+    live_diff_text = ""
+    try:
+        live_diff_text = gops.diff(
+            repo=live_repo, base="main", head=branch
+        )
+        guard_result = inspect(
+            diff=live_diff_text,
+            allowed_files=allowed_files,
+            template=template,
+        )
+    except Exception as exc:
+        _restore_repo_after_halt(gops=gops, repo=live_repo, branch=branch)
+        return _integrator_halt_outcome(
+            spec_auto_id=spec_auto_id,
+            spec_auto_path=spec_auto_path,
+            finding=finding,
+            template=template,
+            candidate_count=candidate_count,
+            branch=branch,
+            worker_verification=worker_verification,
+            fl=fl,
+            halt_reason=(
+                f"{_HALT_INTEGRATOR_GUARD_FAILED}: "
+                f"{type(exc).__name__}: {exc}"
+            ),
+            guard_passed=False,
+        )
+    if not guard_result.passed:
+        _restore_repo_after_halt(gops=gops, repo=live_repo, branch=branch)
+        suffix = (
+            f": {guard_result.halt_reasons[0]}"
+            if guard_result.halt_reasons
+            else ""
+        )
+        return _integrator_halt_outcome(
+            spec_auto_id=spec_auto_id,
+            spec_auto_path=spec_auto_path,
+            finding=finding,
+            template=template,
+            candidate_count=candidate_count,
+            branch=branch,
+            worker_verification=worker_verification,
+            fl=fl,
+            halt_reason=f"{_HALT_INTEGRATOR_GUARD_FAILED}{suffix}",
+            guard_passed=False,
+            guard_reasons=tuple(guard_result.halt_reasons),
+        )
+
+    # 4. R4 (suite) re-check on live.
+    try:
+        suite_outcome = run_suite(repo=live_repo)
+        r4_passed = bool(suite_outcome.passed)
+    except Exception as exc:
+        _restore_repo_after_halt(gops=gops, repo=live_repo, branch=branch)
+        return _integrator_halt_outcome(
+            spec_auto_id=spec_auto_id,
+            spec_auto_path=spec_auto_path,
+            finding=finding,
+            template=template,
+            candidate_count=candidate_count,
+            branch=branch,
+            worker_verification=worker_verification,
+            fl=fl,
+            halt_reason=(
+                f"{_HALT_INTEGRATOR_R4_FAILED}: "
+                f"{type(exc).__name__}: {exc}"
+            ),
+            r4_passed=False,
+        )
+    if not r4_passed:
+        _restore_repo_after_halt(gops=gops, repo=live_repo, branch=branch)
+        return _integrator_halt_outcome(
+            spec_auto_id=spec_auto_id,
+            spec_auto_path=spec_auto_path,
+            finding=finding,
+            template=template,
+            candidate_count=candidate_count,
+            branch=branch,
+            worker_verification=worker_verification,
+            fl=fl,
+            halt_reason=_HALT_INTEGRATOR_R4_FAILED,
+            r4_passed=False,
+        )
+
+    # 5. Merge into main (local, no push).
+    try:
+        gops.merge_branch_into_main(repo=live_repo, branch=branch)
+    except Exception as exc:
+        _restore_repo_after_halt(gops=gops, repo=live_repo, branch=branch)
+        return _integrator_halt_outcome(
+            spec_auto_id=spec_auto_id,
+            spec_auto_path=spec_auto_path,
+            finding=finding,
+            template=template,
+            candidate_count=candidate_count,
+            branch=branch,
+            worker_verification=worker_verification,
+            fl=fl,
+            halt_reason=(
+                f"{_HALT_INTEGRATOR_MERGE_FAILED}: "
+                f"{type(exc).__name__}: {exc}"
+            ),
+        )
+
+    # 6. Cleanup.
+    _delete_feature_branch_after_merge(
+        gops=gops, repo=live_repo, branch=branch
+    )
+
+    # Success — surface the diff captured AFTER apply on live (it's the
+    # canonical "what landed on main"). When live and clone are at the
+    # same baseline this equals the worker's diff; on rare cases where
+    # whitespace normalisation differs, the live diff is the truthful
+    # representation.
+    surfaced_diff = live_diff_text or diff_text
+
+    return AutoFixOutcome(
+        skipped=False,
+        spec_auto_id=spec_auto_id,
+        spec_auto_path=spec_auto_path,
+        finding_signature=finding.signature,
+        candidate_count=candidate_count,
+        template=template,
+        branch=branch,
+        dispatched=True,
+        dispatch_status=fl.final_dispatch_status,
+        r5_killed=worker_verification.r5_passed,
+        r4_suite_passed=True,
+        guard_passed=True,
+        guard_halt_reasons=(),
+        merged=True,
+        halt_reason="",
+        merge_diff=surfaced_diff,
+        iterations=fl.iterations,
+        converged=True,
+        loop_halt_reason=fl.halt_reason,
+    )
+
+
+def _integrator_halt_outcome(
+    *,
+    spec_auto_id: str,
+    spec_auto_path: Path,
+    finding: Finding,
+    template: str,
+    candidate_count: int,
+    branch: str,
+    worker_verification: IterationVerification,
+    fl: FixLoopOutcome,
+    halt_reason: str,
+    guard_passed: bool = True,
+    guard_reasons: tuple[str, ...] = (),
+    r4_passed: bool = True,
+) -> AutoFixOutcome:
+    """spec_040 — Integrator-side HALT outcome.
+
+    Surfaces the worker's R5/R4/guard verdict (which was green at the
+    end of the worker phase — otherwise the Integrator would not have
+    been invoked) BUT overrides ``r4_suite_passed`` / ``guard_passed``
+    when the Integrator's live re-check is what dropped the candidate.
+    ``halt_reason`` carries the canonical ``_HALT_INTEGRATOR_*`` anchor
+    so the morning brief's §D can render a one-liner with the right
+    cause. ``merged=False`` always — a HALT here means nothing landed
+    on main.
+    """
+
+    return AutoFixOutcome(
+        skipped=False,
+        spec_auto_id=spec_auto_id,
+        spec_auto_path=spec_auto_path,
+        finding_signature=finding.signature,
+        candidate_count=candidate_count,
+        template=template,
+        branch=branch,
+        dispatched=True,
+        dispatch_status=fl.final_dispatch_status,
+        r5_killed=worker_verification.r5_passed,
+        r4_suite_passed=r4_passed and worker_verification.r4_passed,
+        guard_passed=guard_passed and worker_verification.guard_passed,
+        guard_halt_reasons=(
+            guard_reasons if guard_reasons else worker_verification.guard_reasons
+        ),
+        merged=False,
+        halt_reason=halt_reason,
+        iterations=fl.iterations,
+        converged=fl.converged,
+        loop_halt_reason=fl.halt_reason,
+    )
+
+
 def _default_unpushed_counter(repo: Path) -> int:
     """spec_025 §2-1(b) production default for :data:`UnpushedCounter`.
 
@@ -2888,6 +3351,7 @@ __all__ = [
     "IsolatedWorkspace",
     "MutationRechecker",
     "NightlyResult",
+    "PatchApplier",
     "SubprocessGitOps",
     "SuiteOutcome",
     "SuiteRunner",
