@@ -115,6 +115,14 @@ class IterationVerification:
     guard_reasons: tuple[str, ...]
     diff: str
     suite_output: str = ""
+    # spec_043 §2-4 — the R4 count summary ("collected N, passed N,
+    # baseline N") on a pass, or the count-regression / unparseable
+    # reason on a fail. Carried up onto :class:`ccd.nightly.AutoFixOutcome`
+    # so the morning brief's §B verification evidence shows the dynamic
+    # test-count check, not just a bare pass/fail. Empty when counts were
+    # unavailable (fake runner / no baseline) — the brief then renders its
+    # plain pass/fail line unchanged (spec_023〜042 外形保持).
+    r4_detail: str = ""
 
     @property
     def green(self) -> bool:

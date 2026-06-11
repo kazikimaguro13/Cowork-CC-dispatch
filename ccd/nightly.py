@@ -120,6 +120,7 @@ from __future__ import annotations
 import concurrent.futures
 import json
 import os
+import re
 import shutil
 import subprocess
 import threading
@@ -220,10 +221,22 @@ class SuiteOutcome:
     """What :data:`SuiteRunner` returns.
 
     ``output`` is the head + tail of stdout/stderr; the morning brief
-    will surface ~the first 800 chars on a failure."""
+    will surface ~the first 800 chars on a failure.
+
+    spec_043 §2-1 — ``collected`` / ``passed_count`` carry the parsed
+    pytest test counts so R4 can verify the suite did not *shrink* after
+    a fix lands (the RT-1/4/7 defence: skip / deselect / collection-hook /
+    import-alias muting all collapse into the single observable fact
+    "fewer tests ran than before"). Both are ``None`` when the runner
+    could not parse a count — the parser is deliberately lenient
+    (spec_009 流儀): an unreadable summary returns ``None`` and the
+    caller (:func:`_r4_verdict`) decides how to treat "件数不明" safely
+    (偽陽性は許す・偽陰性は許さない)."""
 
     passed: bool
     output: str = ""
+    collected: int | None = None
+    passed_count: int | None = None
 
 
 SuiteRunner = Callable[..., SuiteOutcome]
@@ -404,6 +417,12 @@ class AutoFixOutcome:
     dispatch_status: str = ""
     r5_killed: bool = False
     r4_suite_passed: bool = False
+    # spec_043 §2-4 — the R4 dynamic-count summary ("collected N, passed N,
+    # baseline N") or, on a count-driven R4 fail, the regression reason.
+    # Surfaced verbatim in the morning brief's §B verification evidence.
+    # Empty keeps the spec_023〜042 brief外形 bit-for-bit identical when
+    # counts were unavailable (fake runner / no baseline).
+    r4_detail: str = ""
     guard_passed: bool = False
     guard_halt_reasons: tuple[str, ...] = ()
     merged: bool = False
@@ -1463,6 +1482,20 @@ def _run_worker_phase(
                     )
                 )
 
+            # spec_043 §2-2 — measure the R4 baseline on the *unmodified*
+            # clone, BEFORE the fix is dispatched. The feat branch is at
+            # HEAD-of-main content here, so this is the pre-fix
+            # (collected, passed) count the post-fix verifier compares
+            # against. Measured inside the disposable clone — live is
+            # never touched. A runner that raises (env breakage) yields a
+            # ``None`` baseline, which disengages the count gate for this
+            # candidate (the post-fix exit-0 check still applies); the
+            # cost is one extra pytest run per candidate (spec §2-2 note).
+            try:
+                r4_baseline: SuiteOutcome | None = run_suite(repo=clone_path)
+            except Exception:
+                r4_baseline = None
+
             def _verifier(
                 *, repo: Path, branch: str
             ) -> IterationVerification:
@@ -1473,6 +1506,7 @@ def _run_worker_phase(
                     repo=repo,
                     branch=branch,
                     gops=gops,
+                    baseline=r4_baseline,
                     run_suite=run_suite,
                     recheck_mutation=recheck_mutation,
                     recheck_adversarial=recheck_adversarial,
@@ -1549,6 +1583,7 @@ def _run_worker_phase(
                     r4_passed=verif.r4_passed,
                     guard_passed=verif.guard_passed,
                     guard_reasons=verif.guard_reasons,
+                    r4_detail=verif.r4_detail,
                 )
                 if (
                     fl.halt_reason
@@ -1578,6 +1613,7 @@ def _run_worker_phase(
                         dispatch_status=fl.final_dispatch_status,
                         r5_killed=verif.r5_passed,
                         r4_suite_passed=verif.r4_passed,
+                        r4_detail=verif.r4_detail,
                         guard_passed=verif.guard_passed,
                         guard_halt_reasons=verif.guard_reasons,
                         merged=False,
@@ -2191,6 +2227,7 @@ def _process_one_auto_fix_candidate(
                     r4_passed=verif.r4_passed,
                     guard_passed=verif.guard_passed,
                     guard_reasons=verif.guard_reasons,
+                    r4_detail=verif.r4_detail,
                 )
                 if (
                     fl.halt_reason
@@ -2219,6 +2256,7 @@ def _process_one_auto_fix_candidate(
                     dispatch_status=fl.final_dispatch_status,
                     r5_killed=verif.r5_passed,
                     r4_suite_passed=verif.r4_passed,
+                    r4_detail=verif.r4_detail,
                     guard_passed=verif.guard_passed,
                     guard_halt_reasons=verif.guard_reasons,
                     merged=False,
@@ -2272,6 +2310,103 @@ def _process_one_auto_fix_candidate(
     )
 
 
+# spec_043 §2-4 — anchor the morning brief / tests pin when R4 fails
+# because the post-fix suite ran *fewer* tests than the pre-fix baseline.
+# The dynamic count gate is the主防御 against test-muting (RT-1/4/7); this
+# string names it so §B/§D surface "実行テスト数が baseline を下回った".
+_R4_COUNT_REGRESSION = "executed test count fell below baseline"
+_R4_COUNT_UNAVAILABLE = (
+    "post-fix test counts unparseable while baseline was known "
+    "— conservative R4 fail (件数不明は減少を否定できない)"
+)
+
+
+def _r4_count_summary(
+    after: SuiteOutcome, baseline: SuiteOutcome | None
+) -> str:
+    """Human-readable "collected N, passed N, baseline N" for the brief.
+
+    Only includes the fields that are known; an all-``None`` outcome
+    (fake runner / unparseable) renders the empty string so the brief
+    falls back to its plain ``pass/fail`` line (spec_043 §2-4)."""
+
+    parts: list[str] = []
+    if after.collected is not None:
+        parts.append(f"collected {after.collected}")
+    if after.passed_count is not None:
+        parts.append(f"passed {after.passed_count}")
+    if baseline is not None and baseline.passed_count is not None:
+        parts.append(f"baseline {baseline.passed_count}")
+    return ", ".join(parts)
+
+
+def _r4_verdict(
+    after: SuiteOutcome, baseline: SuiteOutcome | None
+) -> tuple[bool, str]:
+    """spec_043 §2-2 — R4 verdict = "green AND did not shrink".
+
+    Returns ``(passed, detail)``. ``detail`` is the count summary on a
+    pass (surfaced in §B) and the failure reason on a fail (surfaced in
+    the halt reason).
+
+    Layering:
+
+    1. The legacy "pytest exit 0" condition is still必須 — a red suite
+       fails R4 regardless of counts.
+    2. The count non-regression gate engages **only when we have a
+       baseline with known counts**. The baseline is measured on the
+       *unmodified* clone before the fix is dispatched, so an attacker's
+       fix cannot influence it; in production
+       :func:`_default_suite_runner` reliably yields counts (so the gate
+       is always live there). When the baseline itself is unparseable
+       (``None`` counts — only happens with test fakes or a genuinely
+       broken pytest, never from a fix) there is no number to regress
+       below, so the gate is skipped and only the exit-0 condition
+       applies. This keeps the spec_023〜042 R4 tests bit-for-bit green
+       while closing the偽陰性 where it actually matters.
+    3. Once a known baseline exists, a ``None`` *post-fix* count is the
+       realistic muting signal (a fix that breaks collection / parsing)
+       → conservative fail. A drop in either ``passed`` or ``collected``
+       → fail with the count-regression anchor.
+
+    spec_043 §2-2 wording is "いずれかが None なら R4 fail"; we scope the
+    conservative-on-None rule to the post-fix side (the side a fix
+    controls) and treat a missing *baseline* as "gate not engaged"
+    rather than a hard fail, so the loop is not bricked on repos whose
+    pytest output we cannot parse. See result_043 §honest for the
+    rationale.
+    """
+
+    if not after.passed:
+        return False, "full suite not green"
+
+    # Gate engages only with a baseline carrying known counts.
+    if (
+        baseline is None
+        or baseline.collected is None
+        or baseline.passed_count is None
+    ):
+        return True, _r4_count_summary(after, baseline)
+
+    if after.collected is None or after.passed_count is None:
+        return False, _R4_COUNT_UNAVAILABLE
+
+    if after.passed_count < baseline.passed_count:
+        return (
+            False,
+            f"{_R4_COUNT_REGRESSION} "
+            f"(passed {after.passed_count} < baseline {baseline.passed_count})",
+        )
+    if after.collected < baseline.collected:
+        return (
+            False,
+            f"{_R4_COUNT_REGRESSION} "
+            f"(collected {after.collected} < "
+            f"baseline {baseline.collected})",
+        )
+    return True, _r4_count_summary(after, baseline)
+
+
 def _verify_iteration_auto(
     *,
     template: str,
@@ -2284,6 +2419,7 @@ def _verify_iteration_auto(
     recheck_mutation: MutationRechecker,
     recheck_adversarial: AdversarialRechecker,
     inspect: GuardInspector,
+    baseline: SuiteOutcome | None = None,
 ) -> IterationVerification:
     """Run R5 + R4 + guard for a single iteration in auto mode.
 
@@ -2305,9 +2441,10 @@ def _verify_iteration_auto(
         repo=repo,
     )
 
+    r4_detail = ""
     try:
         suite_outcome = run_suite(repo=repo)
-        r4_passed = bool(suite_outcome.passed)
+        r4_passed, r4_detail = _r4_verdict(suite_outcome, baseline)
         suite_output = str(getattr(suite_outcome, "output", "") or "")
     except Exception:
         r4_passed = False
@@ -2337,6 +2474,7 @@ def _verify_iteration_auto(
         guard_reasons=guard_reasons,
         diff=diff_text,
         suite_output=suite_output,
+        r4_detail=r4_detail,
     )
 
 
@@ -2739,6 +2877,7 @@ def _process_one_propose_candidate(
 
             r5_killed = verif.r5_passed
             r4_passed = verif.r4_passed
+            r4_detail = verif.r4_detail
             guard_passed = verif.guard_passed
             guard_reasons = verif.guard_reasons
             diff_text = verif.diff
@@ -2769,6 +2908,7 @@ def _process_one_propose_candidate(
                     dispatch_status=dispatch_status,
                     r5_killed=r5_killed,
                     r4_suite_passed=r4_passed,
+                    r4_detail=r4_detail,
                     guard_passed=guard_passed,
                     guard_halt_reasons=guard_reasons,
                     merged=False,
@@ -2796,6 +2936,7 @@ def _process_one_propose_candidate(
                     dispatch_status=dispatch_status,
                     r5_killed=r5_killed,
                     r4_suite_passed=r4_passed,
+                    r4_detail=r4_detail,
                     guard_passed=guard_passed,
                     guard_halt_reasons=guard_reasons,
                     merged=False,
@@ -2830,6 +2971,7 @@ def _process_one_propose_candidate(
                 dispatch_status=dispatch_status,
                 r5_killed=r5_killed,
                 r4_suite_passed=r4_passed,
+                r4_detail=r4_detail,
                 guard_passed=guard_passed,
                 guard_halt_reasons=guard_reasons,
                 merged=False,
@@ -3321,6 +3463,7 @@ def _compose_halt_reason(
     r4_passed: bool,
     guard_passed: bool,
     guard_reasons: tuple[str, ...],
+    r4_detail: str = "",
 ) -> str:
     """Build the morning-brief-friendly halt reason for a non-merged fix.
 
@@ -3345,7 +3488,16 @@ def _compose_halt_reason(
         else:
             parts.append(_HALT_R5_FAILED)
     if not r4_passed:
-        parts.append(_HALT_R4_FAILED)
+        # spec_043 §2-4 — when the dynamic count gate is what dropped R4
+        # (vs a plain red suite), name the reason so the operator sees
+        # "実行テスト数が baseline を下回った（after < base）" rather than
+        # the generic "full suite not green".
+        if r4_detail and _R4_COUNT_REGRESSION in r4_detail:
+            parts.append(f"{_HALT_R4_FAILED} — {r4_detail}")
+        elif r4_detail and _R4_COUNT_UNAVAILABLE in r4_detail:
+            parts.append(f"{_HALT_R4_FAILED} — {r4_detail}")
+        else:
+            parts.append(_HALT_R4_FAILED)
     return "; ".join(parts) or "auto-fix did not merge"
 
 
@@ -3577,6 +3729,7 @@ def _integrate_one_candidate(
             dispatch_status=fl.final_dispatch_status,
             r5_killed=worker_verification.r5_passed,
             r4_suite_passed=worker_verification.r4_passed,
+            r4_detail=worker_verification.r4_detail,
             guard_passed=worker_verification.guard_passed,
             guard_halt_reasons=worker_verification.guard_reasons,
             merged=False,
@@ -3759,6 +3912,7 @@ def _integrate_one_candidate(
         dispatch_status=fl.final_dispatch_status,
         r5_killed=worker_verification.r5_passed,
         r4_suite_passed=True,
+        r4_detail=worker_verification.r4_detail,
         guard_passed=True,
         guard_halt_reasons=(),
         merged=True,
@@ -3809,6 +3963,7 @@ def _integrator_halt_outcome(
         dispatch_status=fl.final_dispatch_status,
         r5_killed=worker_verification.r5_passed,
         r4_suite_passed=r4_passed and worker_verification.r4_passed,
+        r4_detail=worker_verification.r4_detail,
         guard_passed=guard_passed and worker_verification.guard_passed,
         guard_halt_reasons=(
             guard_reasons if guard_reasons else worker_verification.guard_reasons
@@ -3912,12 +4067,70 @@ def _build_default_fix_dispatcher(
     return _dispatcher
 
 
+# spec_043 §2-1 — lenient pytest count parsers. We read two independent
+# facts out of ``pytest -q`` output:
+#
+# - ``collected N items`` (the collection line pytest prints once it has
+#   gathered the test set — present across pytest 6/7/8). This is the
+#   *collected* count: skip / xfail / deselect all still appear here, so a
+#   drop in this number means tests were physically removed from
+#   collection (collect_ignore, collection-hook deselection-before-collect,
+#   deleted/renamed test files).
+# - ``N passed`` (from the terminal summary line). This is the *executed-
+#   and-passed* count: a test that was skip-marked or deselected is no
+#   longer counted as passed, so muting a previously-passing test drops
+#   this number even when ``collected`` is unchanged.
+#
+# Both regexes are intentionally forgiving — they ``search`` anywhere in
+# the combined stdout/stderr and grab the last match (the summary line is
+# emitted last). When neither matches, the count is ``None`` and the R4
+# verdict treats "件数不明" conservatively. We do NOT try to reconstruct
+# the count from skipped/deselected arithmetic; the two raw numbers above
+# are enough to detect any shrinkage and keeping the parser tiny is what
+# makes it survive pytest-version drift (spec_009 流儀).
+_PYTEST_COLLECTED_RE = re.compile(r"collected\s+(\d+)\s+item")
+_PYTEST_PASSED_RE = re.compile(r"(\d+)\s+passed")
+
+
+def _parse_pytest_counts(output: str) -> tuple[int | None, int | None]:
+    """Parse ``(collected, passed_count)`` out of ``pytest -q`` output.
+
+    Returns ``None`` for either field that cannot be read (no matching
+    line). Lenient by design: a pytest version whose summary wording we
+    do not recognise yields ``None`` rather than a wrong number, and the
+    caller fails R4 conservatively on ``None`` (spec_043 §2-1 second
+    bullet — 偽陽性は許す・偽陰性は許さない)."""
+
+    collected: int | None = None
+    passed: int | None = None
+    col = _PYTEST_COLLECTED_RE.findall(output or "")
+    if col:
+        try:
+            collected = int(col[-1])
+        except ValueError:
+            collected = None
+    pas = _PYTEST_PASSED_RE.findall(output or "")
+    if pas:
+        try:
+            passed = int(pas[-1])
+        except ValueError:
+            passed = None
+    return collected, passed
+
+
 def _default_suite_runner(*, repo: Path) -> SuiteOutcome:
-    """Run ``pytest -q`` in ``repo`` and return pass/fail + tail of output."""
+    """Run ``pytest -q`` in ``repo`` and return pass/fail + counts + tail.
+
+    spec_043 §2-1 — ``-p no:cacheprovider`` is added so the run does not
+    depend on (or write) ``.pytest_cache``; the worker baseline run and
+    the post-fix run then observe the same collection deterministically.
+    The full output is parsed for the collected / passed counts BEFORE
+    truncating ``output`` to its tail, so a long suite whose summary line
+    scrolls past the 2 KB tail window is still counted correctly."""
 
     try:
         completed = subprocess.run(
-            ["pytest", "-q"],
+            ["pytest", "-q", "-p", "no:cacheprovider"],
             cwd=str(repo),
             capture_output=True,
             text=True,
@@ -3925,8 +4138,14 @@ def _default_suite_runner(*, repo: Path) -> SuiteOutcome:
         )
     except FileNotFoundError as exc:
         return SuiteOutcome(passed=False, output=f"pytest not found: {exc}")
-    tail = (completed.stdout or "") + (completed.stderr or "")
-    return SuiteOutcome(passed=completed.returncode == 0, output=tail[-2048:])
+    full = (completed.stdout or "") + (completed.stderr or "")
+    collected, passed_count = _parse_pytest_counts(full)
+    return SuiteOutcome(
+        passed=completed.returncode == 0,
+        output=full[-2048:],
+        collected=collected,
+        passed_count=passed_count,
+    )
 
 
 def _build_default_mutation_rechecker(

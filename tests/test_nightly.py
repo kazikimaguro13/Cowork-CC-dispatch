@@ -1148,8 +1148,9 @@ def test_autonomous_fix_happy_path_merges_locally(tmp_path: Path) -> None:
     # check (the spec_auto.md is copied into the clone preserving name).
     assert dispatcher.calls
     assert dispatcher.calls[0][0].name == af.spec_auto_path.name
-    # Worker (clone) suite + Integrator (live) suite both run.
-    assert len(suite.calls) == 2
+    # spec_043 §2-2: worker baseline (clone) + worker verify (clone) +
+    # Integrator (live) suite all run → 3 invocations. The last is on live.
+    assert len(suite.calls) == 3
     assert suite.calls[-1] == tmp_path.resolve()
     assert recheck.calls == [
         ("ccd/protocol.py", 46, af.finding_signature),
@@ -1387,8 +1388,11 @@ def test_autonomous_fix_halts_when_dispatch_fails(tmp_path: Path) -> None:
     assert af.dispatch_status == "failed"
     assert af.merged is False
     assert "dispatch failed" in af.halt_reason
-    # R4/R5/guard not invoked when dispatch failed.
-    assert suite.calls == []
+    # spec_043 §2-2: the R4 baseline is measured once in the clone BEFORE
+    # dispatch, so it runs even when the dispatch then fails; the *verifier*
+    # R4/R5/guard still never run (recheck/guard untouched, suite == baseline
+    # only).
+    assert len(suite.calls) == 1
     assert recheck.calls == []
     assert guard.calls == []
     assert gops.merges == []
@@ -2708,8 +2712,9 @@ def test_dispatch_timeout_marks_candidate_failed(tmp_path: Path) -> None:
     assert af.merged is False
     assert "timed out" in af.halt_reason
     assert "spec_025 §2-1(a)" in af.halt_reason
-    # R4/R5/guard not invoked when dispatch failed.
-    assert suite.calls == []
+    # spec_043 §2-2: R4 baseline measured once in the clone before dispatch;
+    # the verifier R4/R5/guard still never run.
+    assert len(suite.calls) == 1
     assert recheck.calls == []
     assert guard.calls == []
     assert gops.merges == []
@@ -3304,13 +3309,15 @@ def test_halt_restore_swallows_exceptions_per_step(tmp_path: Path) -> None:
     worker_suite_passes = SuiteOutcome(passed=True, output="worker ok")
     integrator_suite_fails = SuiteOutcome(passed=False, output="live red")
 
-    call_count = {"n": 0}
-
     def _two_phase_suite(*, repo: Path) -> SuiteOutcome:
-        call_count["n"] += 1
-        # First call → worker phase (in clone) → pass.
-        # Second call → Integrator phase (on live) → fail.
-        return worker_suite_passes if call_count["n"] == 1 else integrator_suite_fails
+        # spec_043 §2-2: the worker now calls suite twice (baseline +
+        # post-fix verify), both inside the clone → pass. The Integrator
+        # calls it once on the live repo → fail. Distinguish by path
+        # rather than call count so the extra baseline run doesn't change
+        # which phase "fails".
+        if "_auto_clone" in str(repo):
+            return worker_suite_passes
+        return integrator_suite_fails
 
     dispatcher = _FakeFixDispatcher(
         outcome=FixDispatchOutcome(status="done", commits_made=1)
@@ -3562,14 +3569,13 @@ def test_auto_mode_integrator_drops_when_live_r4_fails(
     _write_mutation_discover_json(repo=tmp_path)
 
     # Suite passes in clone (worker), fails on live (Integrator).
-    call_count = {"n": 0}
-
+    # spec_043 §2-2: the worker calls suite twice (baseline + verify), both
+    # in the clone → pass; the Integrator runs once on live → fail. Key off
+    # the path so the extra baseline run doesn't flip which phase fails.
     def _two_phase_suite(*, repo: Path) -> SuiteOutcome:
-        call_count["n"] += 1
-        return SuiteOutcome(
-            passed=call_count["n"] == 1,
-            output="ok" if call_count["n"] == 1 else "live regression",
-        )
+        if "_auto_clone" in str(repo):
+            return SuiteOutcome(passed=True, output="ok")
+        return SuiteOutcome(passed=False, output="live regression")
 
     dispatcher = _FakeFixDispatcher(
         outcome=FixDispatchOutcome(status="done", commits_made=1)
@@ -4978,9 +4984,11 @@ def test_loop_immediate_halt_on_blocked_status_does_not_iterate(
     af = result.auto_fix
     assert af is not None
     assert len(dispatcher.calls) == 1
-    # Verifier never ran → recheck untouched.
+    # Verifier never ran → recheck untouched. spec_043 §2-2: the R4 baseline
+    # is still measured once in the clone before the (immediately-halting)
+    # dispatch, so suite ran exactly once.
     assert recheck.calls == []
-    assert suite.calls == []
+    assert len(suite.calls) == 1
     assert af.iterations == 1
     assert af.converged is False
     assert "immediate-halt" in af.loop_halt_reason
@@ -5740,3 +5748,207 @@ def test_save_night_snapshot_writes_deterministic_json(tmp_path) -> None:
     assert snap.night_id == "2026-06-10"
     assert snap.merges == 1
     assert snap.fix_loop_starts == 1
+
+
+# --------------------------------------------------------------------------- #
+# spec_043 — R4 dynamic test-count gate (RT-1/4/7 一本化対策)
+# --------------------------------------------------------------------------- #
+
+
+@dataclass
+class _SeqSuiteRunner:
+    """Suite runner that returns a scripted sequence of outcomes.
+
+    spec_043: the worker now calls the suite twice (baseline + post-fix
+    verify), so a count-regression test needs distinct outcomes per call.
+    Calls past the end of the sequence return the last outcome (so the
+    Integrator's live re-check, which only inspects ``passed``, sees the
+    post-fix outcome)."""
+
+    outcomes: list[SuiteOutcome]
+    calls: list[Path] = field(default_factory=list)
+
+    def __call__(self, *, repo: Path) -> SuiteOutcome:
+        idx = min(len(self.calls), len(self.outcomes) - 1)
+        self.calls.append(Path(repo))
+        return self.outcomes[idx]
+
+
+def _run_autofix_with_suite(
+    tmp_path: Path, suite: Any
+) -> AutoFixOutcome:
+    """Drive a template-A auto-fix run with a custom suite runner and
+    everything else passing (R5 killed, guard pass). Returns the primary
+    :class:`AutoFixOutcome`."""
+
+    _write_mutation_discover_json(repo=tmp_path)
+    brief_runner, _ = _make_fake_brief_runner()
+    mirror, _ = _make_recording_mirror()
+    dispatcher = _FakeFixDispatcher(
+        outcome=FixDispatchOutcome(status="done", commits_made=1)
+    )
+    recheck = _FakeMutationRechecker(status="killed")
+    guard = _FakeGuardInspector(
+        result=GuardResult(
+            passed=True,
+            halt_reasons=(),
+            files_touched=("tests/x.py",),
+            template="A",
+        )
+    )
+    gops = _FakeGitOps(canned_diff="diff --git a/tests/x.py b/tests/x.py\n")
+    result = run_nightly(
+        repo=tmp_path,
+        profile=_autofix_profile(autonomous=True),
+        channel_runner=_RecordingChannelRunner(),
+        brief_runner=brief_runner,
+        windows_mirror=mirror,
+        fix_dispatcher=dispatcher,
+        suite_runner=suite,
+        mutation_rechecker=recheck,
+        guard_inspector=guard,
+        git_ops=gops,
+        today=date(2026, 6, 11),
+        **_auto_fix_test_seams(tmp_path),
+    )
+    af = result.auto_fix
+    assert af is not None
+    return af
+
+
+def test_r4_fails_when_passed_count_drops_below_baseline(
+    tmp_path: Path,
+) -> None:
+    """Acceptance §3-1: passed_after < passed_base → R4 fail → not merged.
+
+    The exit code is still 0 (green suite) — only the *count* regressed,
+    which is exactly the test-muting signal RT-1/4/7 produce."""
+
+    suite = _SeqSuiteRunner(
+        outcomes=[
+            SuiteOutcome(passed=True, collected=10, passed_count=10),  # base
+            SuiteOutcome(passed=True, collected=10, passed_count=9),  # after
+        ]
+    )
+    af = _run_autofix_with_suite(tmp_path, suite)
+
+    assert af.r4_suite_passed is False
+    assert af.merged is False
+    assert "baseline" in af.halt_reason
+    assert "9 < baseline 10" in af.halt_reason
+    # Worker R4 failed → Integrator never ran → only the two clone-side
+    # runs (baseline + verify) happened.
+    assert len(suite.calls) == 2
+
+
+def test_r4_passes_when_new_test_added_increments_passed(
+    tmp_path: Path,
+) -> None:
+    """Acceptance §3-2: template-A adds a test → passed_after = base+1 →
+    R4 pass → merges (normal happy path)."""
+
+    suite = _SeqSuiteRunner(
+        outcomes=[
+            SuiteOutcome(passed=True, collected=10, passed_count=10),  # base
+            SuiteOutcome(passed=True, collected=11, passed_count=11),  # after
+        ]
+    )
+    af = _run_autofix_with_suite(tmp_path, suite)
+
+    assert af.r4_suite_passed is True
+    assert af.merged is True
+    assert af.halt_reason == ""
+    # The §B evidence string carries the counts.
+    assert "collected 11" in af.r4_detail
+    assert "passed 11" in af.r4_detail
+    assert "baseline 10" in af.r4_detail
+
+
+def test_r4_fails_when_post_fix_counts_unparseable(
+    tmp_path: Path,
+) -> None:
+    """Acceptance §3-4: baseline known but post-fix counts are None
+    (unparseable) → conservative R4 fail (偽陰性は許さない)."""
+
+    suite = _SeqSuiteRunner(
+        outcomes=[
+            SuiteOutcome(passed=True, collected=10, passed_count=10),  # base
+            SuiteOutcome(passed=True, collected=None, passed_count=None),
+        ]
+    )
+    af = _run_autofix_with_suite(tmp_path, suite)
+
+    assert af.r4_suite_passed is False
+    assert af.merged is False
+    assert "件数不明" in af.halt_reason or "unparseable" in af.halt_reason
+
+
+def test_r4_count_gate_disengaged_when_baseline_unparseable(
+    tmp_path: Path,
+) -> None:
+    """Backward-compat (§3-6): when the baseline itself has no counts
+    (fake runner / unparseable pytest), the count gate disengages and
+    only the legacy exit-0 condition applies, so a green suite still
+    merges. This is what keeps the spec_023〜042 R4 tests green."""
+
+    suite = _SeqSuiteRunner(
+        outcomes=[SuiteOutcome(passed=True)]  # collected/passed both None
+    )
+    af = _run_autofix_with_suite(tmp_path, suite)
+
+    assert af.r4_suite_passed is True
+    assert af.merged is True
+
+
+def test_parse_pytest_counts_reads_real_pytest_output() -> None:
+    """Acceptance §3-5: the lenient parser picks up collected / passed /
+    skipped / deselected pytest summary shapes."""
+
+    from ccd.nightly import _parse_pytest_counts
+
+    # Plain green run.
+    assert _parse_pytest_counts(
+        "collected 42 items\n\n42 passed in 1.23s\n"
+    ) == (42, 42)
+    # passed + skipped + deselected mix (skip / deselect lower `passed`).
+    assert _parse_pytest_counts(
+        "collected 50 items / 3 deselected / 47 selected\n\n"
+        "45 passed, 2 skipped, 3 deselected in 2.0s\n"
+    ) == (50, 45)
+    # Single item wording ("1 item").
+    assert _parse_pytest_counts(
+        "collected 1 item\n\n1 passed in 0.01s\n"
+    ) == (1, 1)
+    # Failure summary still yields a passed count.
+    assert _parse_pytest_counts(
+        "collected 9 items\n\n1 failed, 8 passed in 0.5s\n"
+    ) == (9, 8)
+    # Unparseable → both None.
+    assert _parse_pytest_counts("ERROR: collection blew up\n") == (None, None)
+    assert _parse_pytest_counts("") == (None, None)
+
+
+def test_r4_verdict_catches_pytestmark_skip_via_counts_not_strings() -> None:
+    """Acceptance §3-3: a fix that mutes a test via
+    ``pytestmark = pytest.mark.skip`` drops the *executed* count. Parse
+    the (real-shaped) before/after pytest output and confirm
+    :func:`_r4_verdict` fails it — with NO string/guard involvement, so it
+    holds even when the static skip-marker rules are bypassed."""
+
+    from ccd.nightly import _parse_pytest_counts, _r4_verdict
+
+    # Before the fix: 5 tests, all run and pass.
+    base_out = "collected 5 items\n\n5 passed in 0.10s\n"
+    bc, bp = _parse_pytest_counts(base_out)
+    baseline = SuiteOutcome(passed=True, collected=bc, passed_count=bp)
+
+    # After the fix: a new test file added `pytestmark = pytest.mark.skip`,
+    # muting one previously-passing test. pytest is still green (exit 0)
+    # but only 4 ran. The static guard rules play no part here.
+    after_out = "collected 5 items\n\n4 passed, 1 skipped in 0.10s\n"
+    ac, ap = _parse_pytest_counts(after_out)
+    after = SuiteOutcome(passed=True, collected=ac, passed_count=ap)
+
+    passed, detail = _r4_verdict(after, baseline)
+    assert passed is False
+    assert "passed 4 < baseline 5" in detail
