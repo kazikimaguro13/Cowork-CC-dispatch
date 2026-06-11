@@ -123,6 +123,13 @@ class IterationVerification:
     # unavailable (fake runner / no baseline) — the brief then renders its
     # plain pass/fail line unchanged (spec_023〜042 外形保持).
     r4_detail: str = ""
+    # spec_045 §2-1 — the R5 N-times stability one-liner ("killed (3/3 回
+    # 安定)" on a stable pass, "R5 不安定: killed 3回中 2回のみ" on an
+    # unstable fail). Carried up onto :class:`ccd.nightly.AutoFixOutcome`
+    # so the morning brief's §B / §D surfaces RT-3's determinism check.
+    # Empty at the default ``safety.r5_recheck_times == 1`` keeps the
+    # spec_023〜044 brief 外形 bit-for-bit identical.
+    r5_detail: str = ""
 
     @property
     def green(self) -> bool:

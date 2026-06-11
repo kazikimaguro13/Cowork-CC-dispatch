@@ -118,6 +118,7 @@ spec_023 §6 document the open knobs (timeout / branch naming / etc.).
 from __future__ import annotations
 
 import concurrent.futures
+import hashlib
 import json
 import os
 import re
@@ -423,6 +424,11 @@ class AutoFixOutcome:
     # Empty keeps the spec_023〜042 brief外形 bit-for-bit identical when
     # counts were unavailable (fake runner / no baseline).
     r4_detail: str = ""
+    # spec_045 §2-1 — the R5 N-times stability one-liner (RT-3). Empty at
+    # the default ``safety.r5_recheck_times == 1`` keeps the spec_023〜044
+    # §B layout bit-for-bit identical; non-empty when N>=2 so the morning
+    # brief shows "killed (N/N 回安定)" on a stable pass.
+    r5_detail: str = ""
     guard_passed: bool = False
     guard_halt_reasons: tuple[str, ...] = ()
     merged: bool = False
@@ -683,6 +689,9 @@ def run_nightly(
     # spec_041 — WorkerPool size P + per-night merge cap.
     p_workers = int(effective_profile.safety.parallelism)
     max_merges_n = int(effective_profile.safety.max_merges_per_night)
+    # spec_045 — per-candidate R5 N-times determinism (RT-3). Default 1
+    # keeps the spec_023〜044 single-recheck behavior bit-for-bit.
+    r5_recheck_n = int(effective_profile.safety.r5_recheck_times)
     # spec_041 — surfaced into NightlyResult so the brief / spec_042
     # aggregator can read "P / 達成同時実行数 / drop reasons" without
     # introspecting individual outcomes.
@@ -726,6 +735,7 @@ def run_nightly(
             loop_max_iterations=loop_max_iters,
             parallelism=p_workers,
             max_merges_per_night=max_merges_n,
+            r5_recheck_times=r5_recheck_n,
             proposal_dir=proposal_dir,
         )
     elif fix_mode == "propose":
@@ -758,6 +768,7 @@ def run_nightly(
             proposal_dir=proposal_dir,
             max_candidates=max_k,
             loop_max_iterations=loop_max_iters,
+            r5_recheck_times=r5_recheck_n,
         )
 
     brief_result = run_brief_fn(
@@ -987,6 +998,13 @@ _HALT_INTEGRATOR_GUARD_FAILED = "integrator: live guard re-check failed"
 _HALT_INTEGRATOR_R4_FAILED = "integrator: live suite re-check failed"
 _HALT_INTEGRATOR_MERGE_FAILED = "integrator: local merge failed"
 _HALT_INTEGRATOR_EMPTY_PATCH = "integrator: verified patch was empty"
+# spec_045 §2-2 (RT-5) — the live diff actually applied does not match
+# the worker's verified diff byte-for-byte (after metadata normalization).
+# Fact-checks "the object we verified is the object we merge" instead of
+# trusting apply determinism. Phrased for the morning brief's §D one-liner.
+_HALT_INTEGRATOR_DIFF_MISMATCH = (
+    "integrator: 検証済み diff と適用結果が不一致"
+)
 # Phrasing the morning brief surfaces verbatim when the un-pushed backlog
 # hits the cap. The test for (b) pins this substring so a rename here
 # also re-acknowledges the operator-facing wording.
@@ -1075,6 +1093,7 @@ def _run_auto_fix_loop(
     loop_max_iterations: int = 1,
     parallelism: int = 1,
     max_merges_per_night: int = 3,
+    r5_recheck_times: int = 1,
     night_wall_clock_budget_s: float | None = None,
     proposal_dir: Path | None = None,
 ) -> tuple[
@@ -1261,6 +1280,7 @@ def _run_auto_fix_loop(
         applier=applier,
         dispatch_timeout_s=dispatch_timeout_s,
         loop_max_iterations=loop_max_iterations,
+        r5_recheck_times=r5_recheck_times,
         parallelism=p_clamped,
         max_merges_per_night=max(1, int(max_merges_per_night or 1)),
         night_wall_clock_budget_s=night_wall_clock_budget_s,
@@ -1366,6 +1386,7 @@ def _run_worker_phase(
     workspace_factory: IsolatedWorkspace,
     dispatch_timeout_s: float,
     loop_max_iterations: int,
+    r5_recheck_times: int = 1,
 ) -> _WorkerPhaseResult:
     """spec_041 §2-2 — execute one candidate's worker phase inside a
     disposable clone.
@@ -1514,6 +1535,7 @@ def _run_worker_phase(
                     recheck_mutation=recheck_mutation,
                     recheck_adversarial=recheck_adversarial,
                     inspect=inspect,
+                    r5_recheck_times=r5_recheck_times,
                 )
 
             try:
@@ -1587,6 +1609,7 @@ def _run_worker_phase(
                     guard_passed=verif.guard_passed,
                     guard_reasons=verif.guard_reasons,
                     r4_detail=verif.r4_detail,
+                    r5_detail=verif.r5_detail,
                 )
                 if (
                     fl.halt_reason
@@ -1617,6 +1640,7 @@ def _run_worker_phase(
                         r5_killed=verif.r5_passed,
                         r4_suite_passed=verif.r4_passed,
                         r4_detail=verif.r4_detail,
+                        r5_detail=verif.r5_detail,
                         guard_passed=verif.guard_passed,
                         guard_halt_reasons=verif.guard_reasons,
                         merged=False,
@@ -1685,6 +1709,7 @@ def _drain_worker_pool(
     applier: PatchApplier,
     dispatch_timeout_s: float,
     loop_max_iterations: int,
+    r5_recheck_times: int,
     parallelism: int,
     max_merges_per_night: int,
     night_wall_clock_budget_s: float | None,
@@ -1794,6 +1819,7 @@ def _drain_worker_pool(
             workspace_factory=workspace_factory,
             dispatch_timeout_s=dispatch_timeout_s,
             loop_max_iterations=loop_max_iterations,
+            r5_recheck_times=r5_recheck_times,
         )
         in_flight[fut] = worker_id
 
@@ -2054,6 +2080,7 @@ def _process_one_auto_fix_candidate(
     apply_patch: PatchApplier,
     dispatch_timeout_s: float,
     loop_max_iterations: int = 1,
+    r5_recheck_times: int = 1,
 ) -> AutoFixOutcome:
     """spec_040 §2-1〜§2-2 — per-candidate body, unified clone-and-patch.
 
@@ -2162,6 +2189,7 @@ def _process_one_auto_fix_candidate(
                     recheck_mutation=recheck_mutation,
                     recheck_adversarial=recheck_adversarial,
                     inspect=inspect,
+                    r5_recheck_times=r5_recheck_times,
                 )
 
             try:
@@ -2231,6 +2259,7 @@ def _process_one_auto_fix_candidate(
                     guard_passed=verif.guard_passed,
                     guard_reasons=verif.guard_reasons,
                     r4_detail=verif.r4_detail,
+                    r5_detail=verif.r5_detail,
                 )
                 if (
                     fl.halt_reason
@@ -2260,6 +2289,7 @@ def _process_one_auto_fix_candidate(
                     r5_killed=verif.r5_passed,
                     r4_suite_passed=verif.r4_passed,
                     r4_detail=verif.r4_detail,
+                    r5_detail=verif.r5_detail,
                     guard_passed=verif.guard_passed,
                     guard_halt_reasons=verif.guard_reasons,
                     merged=False,
@@ -2423,6 +2453,7 @@ def _verify_iteration_auto(
     recheck_adversarial: AdversarialRechecker,
     inspect: GuardInspector,
     baseline: SuiteOutcome | None = None,
+    r5_recheck_times: int = 1,
 ) -> IterationVerification:
     """Run R5 + R4 + guard for a single iteration in auto mode.
 
@@ -2436,12 +2467,13 @@ def _verify_iteration_auto(
     "this iteration failed" rather than propagating out of FixLoop.
     """
 
-    r5_passed, r5_status = _verify_r5(
+    r5_passed, r5_status, r5_detail = _verify_r5(
         template=template,
         finding=finding,
         recheck_mutation=recheck_mutation,
         recheck_adversarial=recheck_adversarial,
         repo=repo,
+        recheck_times=r5_recheck_times,
     )
 
     r4_detail = ""
@@ -2478,6 +2510,7 @@ def _verify_iteration_auto(
         diff=diff_text,
         suite_output=suite_output,
         r4_detail=r4_detail,
+        r5_detail=r5_detail,
     )
 
 
@@ -2549,6 +2582,7 @@ def _run_propose_loop(
     proposal_dir: Path | None = None,
     max_candidates: int = 1,
     loop_max_iterations: int = 1,
+    r5_recheck_times: int = 1,
 ) -> tuple[AutoFixOutcome, tuple[AutoFixOutcome, ...]]:
     """Drive the propose-mode loop for up to ``max_candidates``
     candidates in series (spec_028 §2-2 + spec_038 top-K extension).
@@ -2715,6 +2749,7 @@ def _run_propose_loop(
                 dispatch_timeout_s=dispatch_timeout_s,
                 proposal_dir=proposal_dir,
                 loop_max_iterations=loop_max_iterations,
+                r5_recheck_times=r5_recheck_times,
             )
         )
 
@@ -2741,6 +2776,7 @@ def _process_one_propose_candidate(
     dispatch_timeout_s: float,
     proposal_dir: Path | None,
     loop_max_iterations: int = 1,
+    r5_recheck_times: int = 1,
 ) -> AutoFixOutcome:
     """spec_038 §2-3 — per-candidate body, extended by spec_039 §2-3 to
     run the dispatch + verify cycle through :func:`ccd.loop.run_fix_loop`
@@ -2825,6 +2861,7 @@ def _process_one_propose_candidate(
                     recheck_mutation=recheck_mutation,
                     recheck_adversarial=recheck_adversarial,
                     inspect=inspect,
+                    r5_recheck_times=r5_recheck_times,
                 )
 
             try:
@@ -2882,6 +2919,7 @@ def _process_one_propose_candidate(
             r5_killed = verif.r5_passed
             r4_passed = verif.r4_passed
             r4_detail = verif.r4_detail
+            r5_detail = verif.r5_detail
             guard_passed = verif.guard_passed
             guard_reasons = verif.guard_reasons
             diff_text = verif.diff
@@ -2913,6 +2951,7 @@ def _process_one_propose_candidate(
                     r5_killed=r5_killed,
                     r4_suite_passed=r4_passed,
                     r4_detail=r4_detail,
+                    r5_detail=r5_detail,
                     guard_passed=guard_passed,
                     guard_halt_reasons=guard_reasons,
                     merged=False,
@@ -2941,6 +2980,7 @@ def _process_one_propose_candidate(
                     r5_killed=r5_killed,
                     r4_suite_passed=r4_passed,
                     r4_detail=r4_detail,
+                    r5_detail=r5_detail,
                     guard_passed=guard_passed,
                     guard_halt_reasons=guard_reasons,
                     merged=False,
@@ -2976,6 +3016,7 @@ def _process_one_propose_candidate(
                 r5_killed=r5_killed,
                 r4_suite_passed=r4_passed,
                 r4_detail=r4_detail,
+                r5_detail=r5_detail,
                 guard_passed=guard_passed,
                 guard_halt_reasons=guard_reasons,
                 merged=False,
@@ -3167,27 +3208,57 @@ def _verify_r5(
     recheck_mutation: MutationRechecker,
     recheck_adversarial: AdversarialRechecker,
     repo: Path,
-) -> tuple[bool, str]:
+    recheck_times: int = 1,
+) -> tuple[bool, str, str]:
     """Run the template-specific R5 verification.
 
-    Returns ``(passed, status)`` — ``status`` is the raw rechecker output
-    (or an error sentinel) so the morning brief can show *why* R5 failed
-    (e.g. ``"graceful_success"`` ≠ ``"ungraceful"``, both fail R5 but for
-    structurally different reasons).
+    Returns ``(passed, status, detail)`` — ``status`` is the raw rechecker
+    output (or an error sentinel) so the morning brief can show *why* R5
+    failed (e.g. ``"graceful_success"`` ≠ ``"ungraceful"``, both fail R5
+    but for structurally different reasons). ``detail`` is the human-facing
+    R5 stability one-liner for the morning brief (spec_045 §2-1); it is
+    empty at the default ``recheck_times == 1`` so the spec_023〜044 §B
+    layout stays bit-for-bit identical.
+
+    spec_045 §2-1 (RT-3): for template A the mutation recheck is run
+    ``recheck_times`` times. R5 passes ONLY if **every** run reports
+    ``"killed"`` — a single ``survived`` / ``error`` makes R5 fail as a
+    non-deterministic signal (a flaky / timing-dependent test that
+    occasionally kills a mutant is a false positive we must halt, not
+    merge). At ``recheck_times == 1`` this collapses to the historical
+    single-recheck behavior (one call, raw status surfaced, empty detail).
+    The N-times rule applies to template A only; template B's adversarial
+    recheck is unchanged (a single graceful-error verdict is structural,
+    not a sampled statistic).
     """
 
     if template == "A":
-        try:
-            status = recheck_mutation(
-                repo=repo,
-                file=finding.file,
-                line=finding.line,
-                mutation=finding.mutation,
-                signature=finding.signature,
-            )
-        except Exception as exc:
-            return False, f"error: {type(exc).__name__}: {exc}"
-        return status == "killed", status
+        n = max(1, int(recheck_times))
+        statuses: list[str] = []
+        for _ in range(n):
+            try:
+                statuses.append(
+                    recheck_mutation(
+                        repo=repo,
+                        file=finding.file,
+                        line=finding.line,
+                        mutation=finding.mutation,
+                        signature=finding.signature,
+                    )
+                )
+            except Exception as exc:
+                statuses.append(f"error: {type(exc).__name__}: {exc}")
+        killed = sum(1 for s in statuses if s == "killed")
+        passed = killed == n
+        if n == 1:
+            # spec_023〜044 外形 — single raw status, no stability detail.
+            return passed, statuses[0], ""
+        if passed:
+            return True, "killed", f"killed ({n}/{n} 回安定)"
+        # Unstable: surface the first non-killed status as the "why" and a
+        # stability detail naming how many of N runs actually killed.
+        why = next((s for s in statuses if s != "killed"), "killed")
+        return False, why, f"R5 不安定: killed {n}回中 {killed}回のみ"
 
     # template == "B"
     try:
@@ -3197,10 +3268,10 @@ def _verify_r5(
             case_name=finding.case_name,
         )
     except Exception as exc:
-        return False, f"error: {type(exc).__name__}: {exc}"
+        return False, f"error: {type(exc).__name__}: {exc}", ""
     # ONLY "graceful_error" passes — "graceful_success" is silent
     # acceptance (spec_024 §3 forbids it).
-    return status == "graceful_error", status
+    return status == "graceful_error", status, ""
 
 
 def _select_candidates(
@@ -3468,6 +3539,7 @@ def _compose_halt_reason(
     guard_passed: bool,
     guard_reasons: tuple[str, ...],
     r4_detail: str = "",
+    r5_detail: str = "",
 ) -> str:
     """Build the morning-brief-friendly halt reason for a non-merged fix.
 
@@ -3490,7 +3562,14 @@ def _compose_halt_reason(
                 # "ungraceful" / "unknown" / "error: ..." all surface here.
                 parts.append(f"{_HALT_R5_FAILED_B} (status={r5_status!r})")
         else:
-            parts.append(_HALT_R5_FAILED)
+            # spec_045 §2-1 — when the N-times determinism check is what
+            # dropped R5 (killed on some runs, survived/error on others),
+            # name the instability so the operator sees "killed N回中 M回
+            # のみ" rather than the generic "target mutation not killed".
+            if r5_detail and "不安定" in r5_detail:
+                parts.append(f"{_HALT_R5_FAILED} — {r5_detail}")
+            else:
+                parts.append(_HALT_R5_FAILED)
     if not r4_passed:
         # spec_043 §2-4 — when the dynamic count gate is what dropped R4
         # (vs a plain red suite), name the reason so the operator sees
@@ -3669,6 +3748,52 @@ def _default_patch_applier(
         raise RuntimeError(f"git commit failed: {detail[:500]}")
 
 
+def _normalize_diff_for_hash(diff_text: str) -> str:
+    """spec_045 §2-2 — normalize a unified git diff for byte-stable hashing.
+
+    The Integrator hashes the worker's verified diff and the diff actually
+    captured on live after apply, then compares (RT-5). This normalization
+    absorbs differences that are git *metadata*, not code content, so the
+    same logical patch produced in the disposable clone and re-derived on
+    the live tree hashes identically — while a real change to the patched
+    code still changes the hash.
+
+    What is **absorbed** (meaningless差):
+
+    - ``index <old>..<new> <mode>`` lines are dropped — they carry git
+      blob object-ids whose abbreviation length is environment-sensitive
+      and add no code-content signal.
+    - line terminators are unified via :meth:`str.splitlines` (CRLF / LF /
+      lone CR all collapse to ``\\n``), and trailing blank lines at the
+      end of the diff are dropped — so a missing / extra final newline
+      ("末尾改行") does not register.
+
+    What is **kept verbatim** (so real差 is detected):
+
+    - ``diff --git a/… b/…`` path lines, ``---`` / ``+++`` file headers,
+      ``@@`` hunk ranges, and every ``+`` / ``-`` / context body line are
+      preserved exactly — a one-character change to the actual patched
+      code DOES change the hash (受け入れ基準5).
+    """
+
+    kept: list[str] = []
+    for line in diff_text.splitlines():
+        if line.startswith("index "):
+            continue
+        kept.append(line)
+    while kept and kept[-1] == "":
+        kept.pop()
+    return "\n".join(kept)
+
+
+def _diff_content_hash(diff_text: str) -> str:
+    """spec_045 §2-2 — sha256 of the normalized diff (see
+    :func:`_normalize_diff_for_hash` for exactly what is absorbed)."""
+
+    normalized = _normalize_diff_for_hash(diff_text)
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
 def _integrate_one_candidate(
     *,
     spec_auto_id: str,
@@ -3699,6 +3824,9 @@ def _integrate_one_candidate(
     2. ``apply_patch(repo=live, patch_text=...)`` — single commit
        carrying the worker's verified diff.
     3. ``inspect(...)`` — guard re-check on live (drift detection).
+    3.5 ``_diff_content_hash`` 照合 — confirm the diff that landed on
+       live is byte-identical (under metadata normalization) to the
+       worker's verified diff (spec_045 §2-2 / RT-5). Mismatch → drop.
     4. ``run_suite(repo=live)`` — R4 re-check on live (full suite).
     5. ``gops.merge_branch_into_main(repo=live, branch=...)`` — local
        non-ff merge into ``main``. NO push (spec_023 invariant).
@@ -3711,12 +3839,14 @@ def _integrate_one_candidate(
     The morning brief surfaces a one-line halt reason in §D with the
     canonical ``_HALT_INTEGRATOR_*`` anchor.
 
-    R5 is NOT re-run on live — the worker's clone ran R5 against the
-    same baseline content (it copied from live), so re-running on live
-    would just duplicate R5's verdict. Drift is caught by guard + R4
-    re-check, which are the cheap checks; R5 (mutation re-run /
-    adversarial parser) is expensive and adds no signal in the common
-    case where live hasn't shifted since the worker started.
+    R5 is NOT re-run on live (spec_045 §2-3 — explicit decision). The
+    worker's clone ran R5 against the same baseline content (it copied
+    from live), and step 3.5's hash 照合 now *proves* the same object is
+    being merged, so a live R5 re-run (an expensive mutmut / adversarial
+    re-execution) would only duplicate the clone's verdict. Drift is
+    caught by guard + R4 re-check + the hash照合, which are the cheap
+    checks; the hash照合 is the zero-false-negative substitute the spec
+    chose over re-firing R5 on live.
     """
 
     if not diff_text.strip():
@@ -3734,6 +3864,7 @@ def _integrate_one_candidate(
             r5_killed=worker_verification.r5_passed,
             r4_suite_passed=worker_verification.r4_passed,
             r4_detail=worker_verification.r4_detail,
+            r5_detail=worker_verification.r5_detail,
             guard_passed=worker_verification.guard_passed,
             guard_halt_reasons=worker_verification.guard_reasons,
             merged=False,
@@ -3836,6 +3967,30 @@ def _integrate_one_candidate(
             guard_reasons=tuple(guard_result.halt_reasons),
         )
 
+    # 3.5 spec_045 §2-2 (RT-5) — verified-diff hash 照合. The worker
+    # verified ``diff_text`` inside its disposable clone; here we confirm
+    # the diff that actually landed on live (``live_diff_text`` = ``git
+    # diff main..HEAD`` after apply + commit) is byte-identical to it
+    # under metadata-absorbing normalization. This replaces "trust apply
+    # determinism" with "fact-check the object we merge IS the object we
+    # verified" — a mismatch means something other than the verified patch
+    # is about to be merged, so we drop (restore live, no merge, one-line
+    # §D note). Live R5 is NOT re-run (spec §2-3): this hash照合 is the
+    # cheaper, zero-false-negative substitute.
+    if _diff_content_hash(diff_text) != _diff_content_hash(live_diff_text):
+        _restore_repo_after_halt(gops=gops, repo=live_repo, branch=branch)
+        return _integrator_halt_outcome(
+            spec_auto_id=spec_auto_id,
+            spec_auto_path=spec_auto_path,
+            finding=finding,
+            template=template,
+            candidate_count=candidate_count,
+            branch=branch,
+            worker_verification=worker_verification,
+            fl=fl,
+            halt_reason=_HALT_INTEGRATOR_DIFF_MISMATCH,
+        )
+
     # 4. R4 (suite) re-check on live.
     try:
         suite_outcome = run_suite(repo=live_repo)
@@ -3917,6 +4072,7 @@ def _integrate_one_candidate(
         r5_killed=worker_verification.r5_passed,
         r4_suite_passed=True,
         r4_detail=worker_verification.r4_detail,
+        r5_detail=worker_verification.r5_detail,
         guard_passed=True,
         guard_halt_reasons=(),
         merged=True,
@@ -3968,6 +4124,7 @@ def _integrator_halt_outcome(
         r5_killed=worker_verification.r5_passed,
         r4_suite_passed=r4_passed and worker_verification.r4_passed,
         r4_detail=worker_verification.r4_detail,
+        r5_detail=worker_verification.r5_detail,
         guard_passed=guard_passed and worker_verification.guard_passed,
         guard_halt_reasons=(
             guard_reasons if guard_reasons else worker_verification.guard_reasons

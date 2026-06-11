@@ -1623,3 +1623,132 @@ def test_safety_loop_max_iterations_renders_in_profile_block(
     assert rc == 0
     out = capsys.readouterr().out
     assert "loop_max_iterations = 1" in out
+
+
+# --------------------------------------------------------------------------- #
+# spec_045 — safety.r5_recheck_times (RT-3: R5 N回決定性)
+# --------------------------------------------------------------------------- #
+
+
+def test_safety_default_r5_recheck_times_is_one() -> None:
+    """spec_045 §2-1 — default ``r5_recheck_times`` is 1, preserving the
+    spec_023〜044 single-recheck R5 behavior bit-for-bit."""
+
+    profile = Profile()
+
+    assert profile.safety.r5_recheck_times == 1
+
+
+def test_safety_r5_recheck_times_loaded_from_toml(tmp_path: Path) -> None:
+    """An operator opts into the N-times determinism check by writing
+    ``r5_recheck_times`` in ``[safety]``; the loader surfaces it without
+    coercion."""
+
+    profile_path = tmp_path / "_ai_workspace" / "ccd_profile.toml"
+    profile_path.parent.mkdir(parents=True)
+    profile_path.write_text(
+        dedent(
+            """
+            [safety]
+            fix_mode = "auto"
+            r5_recheck_times = 3
+            """
+        ).strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    profile = load_profile(tmp_path)
+
+    assert profile.safety.r5_recheck_times == 3
+
+
+def test_safety_r5_recheck_times_zero_raises(tmp_path: Path) -> None:
+    """spec_045 §2-1 — ``r5_recheck_times`` must be in 1..5; 0 (R5 would
+    never verify the kill) loud-fails at load time."""
+
+    profile_path = tmp_path / "_ai_workspace" / "ccd_profile.toml"
+    profile_path.parent.mkdir(parents=True)
+    profile_path.write_text(
+        dedent(
+            """
+            [safety]
+            r5_recheck_times = 0
+            """
+        ).strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError) as excinfo:
+        load_profile(tmp_path)
+    assert "r5_recheck_times" in str(excinfo.value)
+
+
+def test_safety_r5_recheck_times_too_high_raises(tmp_path: Path) -> None:
+    """spec_045 §2-1 — ``r5_recheck_times`` must be in 1..5; 6 (mutmut
+    re-run cost past the night's budget) loud-fails at load time."""
+
+    profile_path = tmp_path / "_ai_workspace" / "ccd_profile.toml"
+    profile_path.parent.mkdir(parents=True)
+    profile_path.write_text(
+        dedent(
+            """
+            [safety]
+            r5_recheck_times = 6
+            """
+        ).strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError) as excinfo:
+        load_profile(tmp_path)
+    assert "r5_recheck_times" in str(excinfo.value)
+
+
+def test_safety_r5_recheck_times_renders_in_profile_block(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """``ccd profile`` surfaces ``r5_recheck_times`` in the TOML-shaped
+    render so an operator can see the effective value."""
+
+    rc = cli.main(["profile", "--repo", str(tmp_path)])
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "r5_recheck_times = 1" in out
+
+
+def test_render_profile_round_trip_preserves_r5_recheck_times(
+    tmp_path: Path,
+) -> None:
+    """spec_045 — a non-default ``r5_recheck_times`` survives a
+    render → load round-trip (the renderer is a faithful TOML emitter)."""
+
+    profile_path = tmp_path / "_ai_workspace" / "ccd_profile.toml"
+    profile_path.parent.mkdir(parents=True)
+    profile_path.write_text(
+        dedent(
+            """
+            [safety]
+            fix_mode = "auto"
+            r5_recheck_times = 4
+            """
+        ).strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    original = load_profile_with_source(tmp_path)
+    rendered = render_profile(original)
+    body = "\n".join(
+        line for line in rendered.splitlines() if not line.startswith("#")
+    )
+    round_trip_path = tmp_path / "round_trip.toml"
+    round_trip_path.write_text(body, encoding="utf-8")
+
+    reloaded = load_profile(tmp_path, path=round_trip_path)
+    assert reloaded.safety.r5_recheck_times == 4
+    assert reloaded == original.profile

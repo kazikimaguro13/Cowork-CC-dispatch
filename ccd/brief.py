@@ -787,9 +787,7 @@ def _render_section_b_phase2(
         r5_label = "R5 (parser now raises a graceful error)"
     else:
         r5_label = "R5"
-    lines.append(
-        f"- {r5_label}: **{'pass' if auto_fix.r5_killed else 'fail'}**"
-    )
+    lines.append(_r5_evidence_line(auto_fix, label=r5_label))
     lines.append(_r4_evidence_line(auto_fix, in_clone=False))
     if auto_fix.guard_passed:
         lines.append("- ガード (R1〜R3): **pass**")
@@ -897,9 +895,7 @@ def _render_section_b_propose(
         r5_label = "R5 (parser now raises a graceful error in clone)"
     else:
         r5_label = "R5"
-    lines.append(
-        f"- {r5_label}: **{'pass' if auto_fix.r5_killed else 'fail'}**"
-    )
+    lines.append(_r5_evidence_line(auto_fix, label=r5_label))
     lines.append(_r4_evidence_line(auto_fix, in_clone=True))
     if auto_fix.guard_passed:
         lines.append("- ガード (R1〜R3): **pass**")
@@ -991,6 +987,25 @@ def _compose_push_command(repo: Path | None) -> str:
             repo_str = str(repo)
         return f"git -C {repo_str} push origin main"
     return "git push origin main"
+
+
+def _r5_evidence_line(outcome: AutoFixOutcome, *, label: str) -> str:
+    """spec_045 §2-1 — the §B/§D R5 evidence line with the N-times
+    determinism detail (RT-3).
+
+    Renders ``- {label}: **pass** — killed (N/N 回安定)`` when
+    ``outcome.r5_detail`` is non-empty (the profile raised
+    ``safety.r5_recheck_times`` above 1), falling back to the bare
+    ``**pass/fail**`` line otherwise so a default-profile (``=1``) night
+    keeps the spec_023〜044 §B layout bit-for-bit. On an unstable fail
+    the detail carries ``R5 不安定: killed N回中 M回のみ``."""
+
+    verdict = "pass" if outcome.r5_killed else "fail"
+    base = f"- {label}: **{verdict}**"
+    detail = (outcome.r5_detail or "").strip()
+    if detail:
+        return f"{base} — {detail}"
+    return base
 
 
 def _r4_evidence_line(auto_fix: AutoFixOutcome, *, in_clone: bool) -> str:
@@ -1247,9 +1262,7 @@ def _render_one_candidate_subsection(
     else:
         r5_label = "R5"
     if outcome.dispatched:
-        lines.append(
-            f"- {r5_label}: **{'pass' if outcome.r5_killed else 'fail'}**"
-        )
+        lines.append(_r5_evidence_line(outcome, label=r5_label))
         lines.append(_r4_evidence_line(outcome, in_clone=False))
         if outcome.guard_passed:
             lines.append("- ガード (R1〜R3): **pass**")

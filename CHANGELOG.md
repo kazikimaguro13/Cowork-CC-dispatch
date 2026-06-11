@@ -2,6 +2,37 @@
 
 本プロジェクトの注目すべき変更を記録する。フォーマットは [Keep a Changelog](https://keepachangelog.com/) に準ずる。
 
+## [0.29.0] — 2026-06-11
+
+### Fixed (verification hardening — レッドチーム RT-3 / RT-5)
+
+- spec_045: **検証の堅牢化 ── R5 の N 回決定性 + Integrator の検証済み-diff
+  ハッシュ照合**。2026-06-10 のレッドチーム残2件（中・低、`docs/redteam_2026-06-10.md`）
+  を塞ぐ。どちらも「検証が思っているより緩い瞬間」を厳しくする方向のみ。
+  - **RT-3（中）— R5 の N 回決定性**: テンプレA の `_verify_r5`（mutation
+    recheck）は `killed` 1回だけを見ており、フレーキー／タイミング依存のテストが
+    たまたま killed を出す偽陽性を無人 auto で取りこぼしうる。profile の `[safety]`
+    に **`r5_recheck_times`（既定 1、1..5、バリデータ付き）** を追加。`>= 2` のとき
+    recheck を N 回回し **全回 killed のときだけ R5 pass**、1回でも survived/error が
+    混ざれば **R5 fail**（非決定的シグナルとして halt）。朝レポートに
+    `R5: killed (N/N 回安定)`（安定 pass）／`R5 不安定: killed N回中 M回のみ`
+    （不安定 fail）を出す。既定 1 は spec_023〜044 と挙動・外形ともに bit-for-bit
+    互換（recheck 1 回、stability 文言なし）。DESIGN §9.5 ルール5「決定的・N回」の
+    既存文言を実装に配線した。mutmut 再実行はコスト高のため有効化は operator 判断
+    （spec_046 の軽量サブセット merge 後が現実的）。
+  - **RT-5（低）— Integrator の検証済み-diff ハッシュ照合**: Integrator は apply 後
+    に guard + suite は再検証するが、「検証した object と merge する object の同一性」
+    が apply の決定性に全依存していた。worker の検証済み diff と、apply + commit 後に
+    live から取った `git diff main..HEAD` を、**メタデータ吸収正規化のうえ sha256 で
+    照合** → 不一致なら **drop**（live 復元・朝レポート §D に「検証済み diff と適用結果
+    が不一致」1行）。正規化は `index` 行（blob object-id）と末尾改行/改行コード差を
+    吸収し、本文1文字差は検出する（`_normalize_diff_for_hash` の docstring に何を吸収
+    するか明記）。これで「検証した patch とは違うものが merge される」を *apply の
+    決定性への信頼でなく事実照合* で排除する。
+  - **§2-3 の判断記録**: live で R5 を撃ち直す案は **採らない**（mutation 再実行は
+    高コスト、ハッシュ照合で「同一 object が merge される」が保証できれば clone の
+    R5 結果が live にも妥当）。ハッシュ照合がその安価な代替。
+
 ## [0.28.0] — 2026-06-11
 
 ### Security (self-protection / hardening)
