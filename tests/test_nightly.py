@@ -2664,6 +2664,7 @@ def test_unpushed_counter_exception_does_not_block(tmp_path: Path) -> None:
     assert af.merged is True
 
 
+@pytest.mark.slow  # spec_046 — sleeps 2s past the timeout; bloats per-mutant time
 def test_dispatch_timeout_marks_candidate_failed(tmp_path: Path) -> None:
     """spec_025 §2-1(a) — when dispatch exceeds the timeout, the loop
     marks the candidate as failed (not merged) and the halt_reason

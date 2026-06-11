@@ -2,6 +2,44 @@
 
 本プロジェクトの注目すべき変更を記録する。フォーマットは [Keep a Changelog](https://keepachangelog.com/) に準ずる。
 
+## [0.27.0] — 2026-06-11
+
+### Fixed (performance / 構造)
+
+- spec_046: **mutation 発見 / R5 検証から重い統合テストを除外する ── per-mutant
+  コスト爆発の根治**。2026-06-11 の `ccd=auto` / `axis=propose` 手動 `nightly-all`
+  初実走で、CCD 自身の mutation 発見 + R5 検証が **1 時間半経っても protocol.py
+  1 ファイルを抜けられなかった**。根本原因: mutation testing は **ミュータント
+  1 体ごとにテストスイートを丸ごと実行**するが、CCD のスイートには **テスト自身が
+  `ccd nightly-all` / mutmut / 隔離 venv プロビジョニングをまるごと起動する統合
+  テスト**が含まれ（プロセスツリーに `ccd nightly-all --repo /tmp/pytest-of-…`、
+  `…/.ccd-iso-venv` 等を実測）、それが mutmut subprocess の中で**入れ子に再起動**
+  して所要時間が非線形に膨らんでいた。
+  - **方針A（マーカー除外）を採用**。重い統合テスト（`ccd nightly-all` / iso-venv
+    を実起動する `test_launchers.py` の wrapper 実行 5 件 +
+    `test_discover.py::test_provision_iso_venv_creates_clone_local_python` + 2s sleep の
+    `test_nightly.py::test_dispatch_timeout_marks_candidate_failed`、計 7 件）に
+    **`@pytest.mark.slow`（デコレータ形）**を付与。pyproject に `slow` マーカーを
+    登録。マーカーは **モジュールレベル `pytestmark =` 代入形ではなくデコレータ形**
+    で付ける（代入形は guard R2 (spec_043) が skip ベクタとして弾くため）。
+  - CCD profile（`_ai_workspace/profiles/ccd.toml` / `ccd_profile.toml`）を spec_032
+    の `[discovery.mutation]` 形に変換し、`extra_args = ["--runner", "python -m
+    pytest -x --assert=plain -m 'not slow'"]` を設定。mutmut の既定ランナー
+    （`python -m pytest -x --assert=plain`）に `-m "not slow"` を足して**発見/R5
+    検証のサブセットから重い統合テストを除外**する。axis profile は現状維持。
+  - R5 recheck の既定ランナー（`_build_default_mutation_rechecker`）が **bare
+    `MutmutRunner()` にフォールバックしてフルスイートを回していた穴**を塞ぎ、
+    profile の `mutation_config`（cwd / tests_dir / extra_args）を
+    `_mutmut_runner_from_config` 経由で threading。発見と R5 検証が**同じ軽量
+    サブセット**を回す。R5 の判定基準（killed / survived / unknown）は不変。
+  - **最終ゲートは従来どおりフル**: R4（`_default_suite_runner`）はベースライン
+    （修正前クローン）・修正後・live 再検証のいずれも `pytest -q -p no:cacheprovider`
+    で**フルスイート**を回す（`-m` を一切渡さない）。サブセット化は mutmut 専用で、
+    R4 のベースライン/修正後は同一ランナーで測られ subset 一致 → 偽陽性 halt しない。
+    「発見・検証ループの中だけ軽量サブセット、最終ゲートはフル」を明確に分離。
+  - 実測: protocol.py を回す per-suite-run が **33.3s → 7.4s（4.5×）**、かつ
+    入れ子の nightly-all/mutmut/iso-venv 再起動を完全に排除（これが 1.5h 爆発の主因）。
+
 ## [0.26.0] — 2026-06-11
 
 ### Changed (security-hardening)
