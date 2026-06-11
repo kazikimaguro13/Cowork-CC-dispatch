@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cowork-cc-dispatch"
-version = "0.26.0"
+version = "0.27.0"
 description = "Orchestration substrate for one AI agent to dispatch work to another (Cowork → Claude Code)."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -45,3 +45,16 @@ select = ["E", "F", "I", "B", "UP", "W"]
 minversion = "8.0"
 testpaths = ["tests"]
 addopts = "-ra"
+markers = [
+  # spec_046 — heavy integration tests that spawn a real `ccd nightly-all`,
+  # a real `mutmut`, or provision an iso-venv (`python -m venv` + `pip
+  # install -e`). They are correct and run in the FULL suite (R4 / CI), but
+  # mutation testing re-runs the test suite once PER mutant, and these tests
+  # nest another nightly-all/mutmut/iso-venv inside that already-isolated
+  # mutmut subprocess — turning one mutant into a multi-minute provision and
+  # exploding per-mutant cost non-linearly. The CCD profile's mutation runner
+  # therefore selects `-m "not slow"` so mutation discovery / R5 recheck skip
+  # them. Marking is by decorator (`@pytest.mark.slow`) — never the
+  # module-level `pytestmark =` assignment form, which guard R2 flags.
+  "slow: heavy integration test excluded from the mutation-testing subset (spec_046)",
+]

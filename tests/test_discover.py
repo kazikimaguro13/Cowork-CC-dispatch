@@ -1175,6 +1175,7 @@ def test_cli_canary_halt_surfaces_through_discover(
 # --------------------------------------------------------------------------- #
 
 
+@pytest.mark.slow  # spec_046 — provisions a real iso-venv (python -m venv + pip)
 def test_provision_iso_venv_creates_clone_local_python(tmp_path: Path) -> None:
     """spec_019 §2-1 — the iso-venv must live INSIDE the clone (so its
     site-packages comes first on the iso-Python's sys.path, and its

@@ -7,6 +7,8 @@
 import subprocess
 from pathlib import Path
 
+import pytest
+
 
 def test_nightly_all_wrapper_bash_syntax_valid() -> None:
     """`bash -n` で構文エラーが無いこと。"""
@@ -38,6 +40,7 @@ def test_nightly_all_wrapper_is_executable() -> None:
     assert mode & stat.S_IXUSR, "wrapper script is not user-executable"
 
 
+@pytest.mark.slow  # spec_046 — executes the wrapper → `ccd nightly-all`
 def test_nightly_all_wrapper_resolves_project_relatively(tmp_path) -> None:
     """spec_034 — wrapper の場所から PROJECT を相対解決できる。
 
@@ -64,6 +67,7 @@ def test_nightly_all_wrapper_resolves_project_relatively(tmp_path) -> None:
     )
 
 
+@pytest.mark.slow  # spec_046 — executes the wrapper → `ccd nightly-all`
 def test_nightly_all_wrapper_accepts_explicit_project_argument(tmp_path) -> None:
     """spec_034 — 第 1 引数で PROJECT を明示渡しできる。
 
@@ -135,6 +139,7 @@ def test_register_nightly_template_exists() -> None:
     assert "$ProjectDir" in body, "ProjectDir プレースホルダが template に無い"
 
 
+@pytest.mark.slow  # spec_046 — executes the wrapper → `ccd nightly-all`
 def test_nightly_all_wrapper_warns_without_explicit_argument(tmp_path) -> None:
     """spec_035 — wrapper が引数なしで呼ばれたらログに WARNING を残す（§2-ii）。
 
@@ -175,6 +180,7 @@ def test_nightly_all_wrapper_warns_without_explicit_argument(tmp_path) -> None:
     )
 
 
+@pytest.mark.slow  # spec_046 — executes the wrapper → `ccd nightly-all`
 def test_nightly_all_wrapper_logs_venv_activate_exit(tmp_path) -> None:
     """spec_035 — wrapper が venv activate の exit code をログに明示記録する（§3-b）。
 
@@ -201,6 +207,7 @@ def test_nightly_all_wrapper_logs_venv_activate_exit(tmp_path) -> None:
     )
 
 
+@pytest.mark.slow  # spec_046 — executes the wrapper → `ccd nightly-all`
 def test_nightly_all_wrapper_unifies_ccd_and_activate_exit(tmp_path) -> None:
     """spec_036 — using ccd と venv activate exit が同一行（=同一 activate）で記録される。
 

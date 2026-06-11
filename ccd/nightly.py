@@ -702,6 +702,7 @@ def run_nightly(
             today=today,
             agent_runner=agent_runner,
             mutation_runner=mutation_runner,
+            mutation_config=mut_cfg,
             fix_dispatcher=fix_dispatcher,
             suite_runner=suite_runner,
             mutation_rechecker=mutation_rechecker,
@@ -735,6 +736,7 @@ def run_nightly(
             today=today,
             agent_runner=agent_runner,
             mutation_runner=mutation_runner,
+            mutation_config=mut_cfg,
             fix_dispatcher=fix_dispatcher,
             suite_runner=suite_runner,
             mutation_rechecker=mutation_rechecker,
@@ -1057,6 +1059,7 @@ def _run_auto_fix_loop(
     today: date | None,
     agent_runner: AgentRunner | None,
     mutation_runner: MutationRunner | None,
+    mutation_config: Any = None,
     fix_dispatcher: FixDispatcher | None,
     suite_runner: SuiteRunner | None,
     mutation_rechecker: MutationRechecker | None,
@@ -1187,7 +1190,7 @@ def _run_auto_fix_loop(
     recheck_mutation = (
         mutation_rechecker
         if mutation_rechecker is not None
-        else _build_default_mutation_rechecker(mutation_runner)
+        else _build_default_mutation_rechecker(mutation_runner, mutation_config)
     )
     recheck_adversarial = (
         adversarial_rechecker
@@ -2532,6 +2535,7 @@ def _run_propose_loop(
     today: date | None,
     agent_runner: AgentRunner | None,
     mutation_runner: MutationRunner | None,
+    mutation_config: Any = None,
     fix_dispatcher: FixDispatcher | None,
     suite_runner: SuiteRunner | None,
     mutation_rechecker: MutationRechecker | None,
@@ -2636,7 +2640,7 @@ def _run_propose_loop(
     recheck_mutation = (
         mutation_rechecker
         if mutation_rechecker is not None
-        else _build_default_mutation_rechecker(mutation_runner)
+        else _build_default_mutation_rechecker(mutation_runner, mutation_config)
     )
     recheck_adversarial = (
         adversarial_rechecker
@@ -4148,13 +4152,54 @@ def _default_suite_runner(*, repo: Path) -> SuiteOutcome:
     )
 
 
+def _mutmut_runner_from_config(
+    mutation_runner: MutationRunner | None,
+    mutation_config: Any = None,
+) -> MutationRunner:
+    """Resolve the :class:`MutationRunner` used for the R5 recheck.
+
+    spec_046 §2-1 — when no explicit runner is injected (the production
+    path), build a :class:`MutmutRunner` that carries the profile's
+    mutation ``cwd`` / ``tests_dir`` / ``extra_args``. This is the SAME
+    config the discovery channel already forwards (spec_032, via
+    :func:`_run_channels`), so the R5 recheck re-runs mutmut over the
+    SAME lightweight test subset that discovery used. Without this the
+    recheck would silently fall back to a bare ``MutmutRunner()`` and
+    re-run the FULL suite for the target mutant — re-introducing the
+    per-mutant cost explosion the CCD profile's ``-m "not slow"`` runner
+    is meant to kill (the recheck is the per-candidate R5 gate, run once
+    per fix iteration). An explicitly injected ``mutation_runner`` (test
+    doubles) is honoured verbatim — config is only consulted to build
+    the default."""
+
+    if mutation_runner is not None:
+        return mutation_runner
+    kwargs: dict[str, Any] = {}
+    if mutation_config is not None:
+        kwargs["cwd"] = getattr(mutation_config, "cwd", None)
+        kwargs["tests_dir"] = getattr(mutation_config, "tests_dir", None)
+        kwargs["extra_args"] = list(
+            getattr(mutation_config, "extra_args", []) or []
+        )
+    return MutmutRunner(**kwargs)
+
+
 def _build_default_mutation_rechecker(
     mutation_runner: MutationRunner | None,
+    mutation_config: Any = None,
 ) -> MutationRechecker:
     """Re-run the mutation channel against the target file and return
-    the signature's new status (`killed` / `survived` / `unknown`)."""
+    the signature's new status (`killed` / `survived` / `unknown`).
 
-    runner_obj = mutation_runner if mutation_runner is not None else MutmutRunner()
+    spec_046 — ``mutation_config`` (the profile's effective
+    :class:`MutationConfig`) is threaded into the default runner so the
+    R5 recheck excludes the heavy ``@pytest.mark.slow`` integration
+    tests, mirroring discovery. The R5 *judgment* is unchanged: the
+    target signature surviving → ``"survived"``; absent from the
+    survivor lists → ``"killed"``; the run failing to produce any
+    mutants → ``"unknown"`` (conservative halt)."""
+
+    runner_obj = _mutmut_runner_from_config(mutation_runner, mutation_config)
 
     def _recheck(
         *,
