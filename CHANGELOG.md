@@ -2,6 +2,39 @@
 
 本プロジェクトの注目すべき変更を記録する。フォーマットは [Keep a Changelog](https://keepachangelog.com/) に準ずる。
 
+## [0.28.0] — 2026-06-11
+
+### Security (self-protection / hardening)
+
+- spec_044: **自己保護 denylist の反転 ── 「列挙 deny」から「既定 deny + 明示
+  allow」へ（レッドチーム RT-2 の根治）**。2026-06-10 のレッドチーム（Fable 5）が
+  指摘した **RT-2（高）**: guard の自己保護は `guard.py` / `nightly.py` / CI /
+  packaging / profile しか守っておらず、v2→v3 でループとガードの実装が分散した
+  結果 **`loop.py` / `retry.py` / `translate.py` / `metrics.py` / `backfill.py` /
+  `discover.py` / `adversarial.py` / `profile.py` / `integrate.py` ほかが無防備**
+  だった。テンプレA（tests-only）運用では塞がっているが、テンプレB（名指し
+  production 1 ファイル許可）を有効化した瞬間、finding が core モジュールを名指す
+  と R1 が許可して denylist を素通りし、最悪「ループが自分の `metrics.py` を都合
+  よく書き換える」修正が原理的に通る。
+  - 根本原因は denylist が **列挙式（書いたものだけ守る）** であること。
+    `ccd/guard.py` の判定を **「既定 deny + 明示 allow」に反転**: `ccd/` 配下の
+    `.py` は既定で denylist 扱いとし、**`PRODUCT_FIXABLE` 明示 allowlist**
+    （初期値 `protocol.py` / `models.py` の 2 つのみ）に載った非 core モジュール
+    だけがテンプレB の名指し対象として許可されうる。新しい `ccd/` モジュールを
+    足すと、明示 allow しない限り自動で保護される（守り忘れが穴にならない安全側
+    の既定）。
+  - `CORE_CCD_MODULES` を明示列挙（ループ機構 guard/nightly/loop/retry/translate/
+    metrics/backfill/discover/adversarial/profile/integrate/agent/chain/cli/
+    dispatch/run_writer/sweep + 監査報告系 dashboard/brief/ai_review/retrospect +
+    package plumbing）。`tests/test_guard.py` に **新モジュール追加を検知する強制
+    テスト**（`ccd/*.py` を走査し CORE でも PRODUCT_FIXABLE でもない未分類モジュール
+    があれば fail）を追加し、「既定 deny」を運用で担保。
+  - テンプレA（tests-only）の挙動は不変。既存の非 `ccd/` 保護（CI/packaging/
+    profile）も維持。denylist ヒットは guard の halt_reason 経由で朝レポート §D に
+    `denylist: <file> は core 機構のため修正対象にできない（テンプレB は
+    PRODUCT_FIXABLE のみ）` と明示される。偽陽性（正当な protocol.py 修正を弾く等）
+    が出たら `PRODUCT_FIXABLE` に追加すればよい運用。
+
 ## [0.27.0] — 2026-06-11
 
 ### Fixed (performance / 構造)
