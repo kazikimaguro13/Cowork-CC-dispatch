@@ -42,6 +42,7 @@ from datetime import UTC, date, datetime
 from pathlib import Path
 
 __all__ = [
+    "DEFAULT_ARCHIVE_DIR_REL",
     "DEFAULT_INBOX_DIR_REL",
     "DEFAULT_OUTBOX_DIR_REL",
     "Finding",
@@ -62,6 +63,13 @@ DEFAULT_INBOX_DIR_REL = Path("_ai_workspace") / "bridge" / "inbox"
 
 # The bridge outbox path the fix-task is told to write its result to.
 DEFAULT_OUTBOX_DIR_REL = Path("_ai_workspace") / "bridge" / "outbox"
+
+# spec_047 §2-2 — where superseded / merged spec_auto_NNN.md files are
+# retired to. inbox is meant to hold only *live* (pending-dispatch) specs;
+# anything that was merged (bookkeeping done in the Integrator) or replaced
+# by a newer spec for the same source signature moves here so an audit can
+# still read it without it cluttering "what is currently in flight".
+DEFAULT_ARCHIVE_DIR_REL = Path("_ai_workspace") / "bridge" / "archive"
 
 
 # --------------------------------------------------------------------------- #
@@ -212,6 +220,13 @@ class TranslateResult:
     finding: Finding
     template: str = ""
     halt_reason: str = ""
+    # spec_047 §2-2 — ids of any pre-existing inbox specs that carried the
+    # SAME source signature and were retired to ``bridge/archive/`` when
+    # this spec was issued. Empty in the common case (first spec for a
+    # signature). The morning brief surfaces a one-line "superseded by"
+    # note so the audit trail records the replacement, not a silent number
+    # bump.
+    superseded_ids: tuple[str, ...] = ()
 
 
 # --------------------------------------------------------------------------- #
@@ -358,6 +373,13 @@ def _translate_template_a(
     spec_auto_id = f"spec_auto_{seq:03d}"
     spec_auto_path = inbox_dir / f"{spec_auto_id}.md"
 
+    # spec_047 §2-2 — retire any older inbox spec for the SAME source
+    # signature BEFORE writing the new one. seq is already max+1 so the
+    # new number never collides with an archived one.
+    superseded = _supersede_existing_specs(
+        inbox_dir=inbox_dir, signature=finding.signature
+    )
+
     today_str = (today or datetime.now(UTC).date()).isoformat()
     body = _render_template_a(
         spec_auto_id=spec_auto_id,
@@ -374,6 +396,7 @@ def _translate_template_a(
         finding=finding,
         template="A",
         halt_reason="",
+        superseded_ids=superseded,
     )
 
 
@@ -406,6 +429,12 @@ def _translate_template_b(
     spec_auto_id = f"spec_auto_{seq:03d}"
     spec_auto_path = inbox_dir / f"{spec_auto_id}.md"
 
+    # spec_047 §2-2 — retire any older inbox spec for the SAME source
+    # signature before writing the new one (see template A for the why).
+    superseded = _supersede_existing_specs(
+        inbox_dir=inbox_dir, signature=finding.signature
+    )
+
     today_str = (today or datetime.now(UTC).date()).isoformat()
     body = _render_template_b(
         spec_auto_id=spec_auto_id,
@@ -422,6 +451,7 @@ def _translate_template_b(
         finding=finding,
         template="B",
         halt_reason="",
+        superseded_ids=superseded,
     )
 
 
@@ -1019,6 +1049,64 @@ def _next_spec_auto_seq(inbox_dir: Path) -> int:
             if m:
                 nums.append(int(m.group(1)))
     return max(nums, default=0) + 1
+
+
+# spec_047 §2-2 — the metadata line every template renders for the source
+# signature ("- **Source signature**: `<sig>`"). Read back to decide
+# supersession without re-parsing the whole spec body.
+_SOURCE_SIGNATURE_RE = re.compile(
+    r"^- \*\*Source signature\*\*: `(?P<sig>.+)`\s*$", re.MULTILINE
+)
+
+
+def _read_spec_source_signature(path: Path) -> str:
+    """Return the ``Source signature`` recorded in a spec_auto_NNN.md, or
+    ``""`` when the file is unreadable or has no signature line.
+
+    Deliberately tolerant: a malformed / hand-edited spec simply does not
+    match (it is left in inbox rather than risking an accidental archive)."""
+
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return ""
+    m = _SOURCE_SIGNATURE_RE.search(text)
+    return m.group("sig").strip() if m else ""
+
+
+def _supersede_existing_specs(
+    *, inbox_dir: Path, signature: str
+) -> tuple[str, ...]:
+    """spec_047 §2-2 — move every inbox spec whose ``Source signature``
+    equals ``signature`` into ``bridge/archive/`` and return their ids.
+
+    Called just before a freshly-numbered spec for ``signature`` is
+    written, so the inbox never accumulates two live specs for the same
+    target (the spec_auto_003/004 堆積 the spec observed). The archive
+    directory is resolved as a sibling of ``inbox_dir`` so test overrides
+    (``inbox_dir`` pointed at a tmp dir) keep the archive co-located.
+
+    Best-effort: a signature with an empty value matches nothing (we never
+    archive on a blank key), and an individual move that fails is skipped
+    rather than aborting the translate (the new spec must still be issued)."""
+
+    if not signature or not inbox_dir.exists():
+        return ()
+    archive_dir = inbox_dir.parent / "archive"
+    superseded: list[str] = []
+    for p in sorted(inbox_dir.glob("spec_auto_*.md")):
+        m = _SPEC_AUTO_RE.match(p.name)
+        if not m:
+            continue
+        if _read_spec_source_signature(p) != signature:
+            continue
+        try:
+            archive_dir.mkdir(parents=True, exist_ok=True)
+            p.replace(archive_dir / p.name)
+        except OSError:
+            continue
+        superseded.append(p.stem)
+    return tuple(superseded)
 
 
 def _relpath_or_str(target: Path, base: Path) -> str:

@@ -1135,7 +1135,16 @@ def test_autonomous_fix_happy_path_merges_locally(tmp_path: Path) -> None:
     assert af.skipped is False
     assert af.spec_auto_id.startswith("spec_auto_")
     assert af.spec_auto_path is not None
-    assert af.spec_auto_path.exists()
+    # spec_047 §2-2 — on a successful merge the inbox spec is retired to
+    # bridge/archive/ (inbox holds only pending-dispatch work).
+    assert not af.spec_auto_path.exists()
+    assert (
+        tmp_path
+        / "_ai_workspace"
+        / "bridge"
+        / "archive"
+        / f"{af.spec_auto_id}.md"
+    ).exists()
     assert af.finding_signature == "ccd/protocol.py:46:x == y → x != y"
     assert af.template == "A"
     assert af.branch == f"auto/{af.spec_auto_id}"
@@ -1937,7 +1946,15 @@ def test_template_b_happy_path_merges_locally(tmp_path: Path) -> None:
     assert af.template == "B"
     assert af.spec_auto_id.startswith("spec_auto_")
     assert af.spec_auto_path is not None
-    assert af.spec_auto_path.exists()
+    # spec_047 §2-2 — merged ⇒ inbox spec retired to bridge/archive/.
+    assert not af.spec_auto_path.exists()
+    assert (
+        tmp_path
+        / "_ai_workspace"
+        / "bridge"
+        / "archive"
+        / f"{af.spec_auto_id}.md"
+    ).exists()
     assert af.finding_signature == (
         "ccd.protocol.parse_spec:05_invalid_utf8_bytes:UnicodeDecodeError"
     )

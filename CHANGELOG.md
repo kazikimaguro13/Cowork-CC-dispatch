@@ -2,6 +2,50 @@
 
 本プロジェクトの注目すべき変更を記録する。フォーマットは [Keep a Changelog](https://keepachangelog.com/) に準ずる。
 
+## [0.30.0] — 2026-06-11
+
+### Fixed (operational hygiene — 2026-06-11 本番経路実走の観察起源)
+
+- spec_047: **auto ループの運用衛生 ── HALT 観測可能性 + inbox 退場 + 同夜
+  staleness 照合**。CcdNightlyMaintenance 起動の `nightly-all`（axis=propose →
+  ccd=auto、rc=0、悪い merge ゼロ）を実走して観察した運用上の3問題を塞ぐ。
+  システムは安全側に振る舞ったが、無人運用の生命線「失敗の翌朝に人間が原因を
+  読める」材料が残らなかった。検証ロジック（guard / R4 / R5）は一切緩めていない
+  ── すべて観測の追加。
+  - **§2-1（最重要）— HALT アーティファクトの持ち出し**: fix ループ／propose
+    ループの dispatch が halt（`smoke_failed` / timeout / guard HALT 等）したとき、
+    隔離クローンを破棄する**前**に診断材料を
+    `_ai_workspace/nightly[/<policy>]/halts/<night_id>_<spec_id>/` へ永続化する。
+    CC が作った diff（`git diff` / 検証済み diff）・smoke/suite の出力末尾・
+    クローン内の feedback / result ファイル・halt の機械分類 + 発生フェーズ
+    （`halt.md`）。1 halt あたり末尾優先で 1MB に切る。これまで朝レポートに残るのは
+    「dispatch failed: smoke_failed」の一行だけで原因を事後診断できなかった
+    （クローン削除と共に全消滅）。朝レポート §D の halt 行から相対リンクで辿れる。
+    **失敗時のみ**持ち出す（成功時の肥大化を避ける）。
+  - **§2-2 — inbox 退場規則**: auto merge 確定時に対応する
+    `bridge/inbox/spec_auto_NNN.md` を `bridge/archive/` へ move。translate が新 spec を
+    発行するとき、**同一 source signature の既存 inbox spec があれば supersede**
+    （既存を archive へ move、`TranslateResult.superseded_ids` に記録、§D に
+    「inbox supersede: 旧 → 新」1行）。新番号の乱発でなく置き換え。これで inbox が
+    終了済み spec（merge 済み auto_002 / 中止 run の遺物 auto_003）で溜まり続けるのを
+    止め、監査時に「どれが生きているか」が読める。
+  - **§2-3 — 同夜 staleness 照合（K≥2 の備え）**: `max_merges_per_night >= 2` の夜は、
+    2件目以降の候補を dispatch する**前**に target signature のミュータントが現 HEAD で
+    まだ survived か recheck で照合する（1件目の merge が2件目を既に kill している
+    ケース）。killed なら dispatch せず §D に「stale candidate skipped: <signature>」
+    1行・K/merge 枠を消費しない。R5 recheck とは**別シーム**（R5 は fix 適用済み
+    クローンで killed を期待、staleness は未修正 live HEAD で survived を期待）。**K=1
+    （現運用）では rechecker を配線せず挙動は bit-for-bit 不変**。spec_046 の軽量
+    サブセットにより recheck 1回のコストは現実的。
+  - **§2-4 — dispatch の観測可能性**: dispatch のたびに live 側
+    `_ai_workspace/logs/dispatch_<night_id>_<spec_id>.log` に **policy 名 + spec の
+    絶対パス + branch** のブレッドクラムを残す。施策ごとに `spec_auto_NNN` 採番が独立
+    （ccd の 002 と axis の 002 は別物）で operator が「merge 済み spec の再 dispatch」と
+    誤診断した §1-3 の観測コストを下げる。
+  - 版を 0.30.0 に。新規 `tests/test_spec_047.py`（受け入れ基準 #1〜#5 を固定:
+    smoke_failed / timeout の持ち出しがクローン削除後も読めること、merge → archive、
+    再 translate → supersede、K=2 の stale skip）。
+
 ## [0.29.0] — 2026-06-11
 
 ### Fixed (verification hardening — レッドチーム RT-3 / RT-5)

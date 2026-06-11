@@ -1378,6 +1378,22 @@ def _render_section_c(by_channel: dict[str, ChannelReport]) -> list[str]:
     return lines
 
 
+def _halt_artifacts_link(outcome: AutoFixOutcome | None) -> str:
+    """spec_047 §2-1 — relative markdown link to a HALT's persisted
+    artifacts, or ``""`` when none were captured.
+
+    The artifact dir (``…/nightly[/<policy>]/halts/<night>_<spec>/``) is a
+    sibling sub-tree of the per-night report, so a link relative to the
+    report is just ``halts/<dirname>/`` — robust whether the report is the
+    flat single-policy one or a per-policy sweep report."""
+
+    art = getattr(outcome, "halt_artifacts_dir", None)
+    if art is None:
+        return ""
+    name = Path(art).name
+    return f"[halts/{name}/](halts/{name}/)"
+
+
 def _render_section_d(
     by_channel: dict[str, ChannelReport],
     summary: BriefSummary,
@@ -1468,12 +1484,40 @@ def _render_section_d(
                 f"{auto_fix.halt_reason or '理由不明'}"
             )
         elif not auto_fix.skipped and not auto_fix.merged:
-            items.append(
+            line = (
                 f"- **自律修正 HALT** "
                 f"(`{auto_fix.spec_auto_id or 'no spec'}`, "
                 f"template {auto_fix.template or '?'}): "
                 f"{auto_fix.halt_reason or '理由不明'}"
             )
+            link = _halt_artifacts_link(auto_fix)
+            if link:
+                line += f" — 診断: {link}"
+            items.append(line)
+
+    # spec_047 — additive §D lines that surface regardless of the K>1
+    # suppression above (they are NOT per-candidate verdicts §B re-tells):
+    #   §2-3 stale-candidate skips, §2-2 inbox supersessions. Collected over
+    # every outcome (primary + extras) and de-duplicated so a multi-candidate
+    # night still shows them exactly once.
+    all_outcomes = (
+        (auto_fix, *auto_fix_extras) if auto_fix is not None else ()
+    )
+    stale_lines: list[str] = []
+    supersede_lines: list[str] = []
+    for o in all_outcomes:
+        skip_reason = getattr(o, "skip_reason", "") or ""
+        if skip_reason.startswith("stale candidate skipped"):
+            entry = f"- **{skip_reason}**"
+            if entry not in stale_lines:
+                stale_lines.append(entry)
+        for old_id in getattr(o, "superseded_ids", ()) or ():
+            new_id = getattr(o, "spec_auto_id", "") or "?"
+            entry = f"- **inbox supersede**: `{old_id}` → `{new_id}` が置換 (同一 signature)"
+            if entry not in supersede_lines:
+                supersede_lines.append(entry)
+    items.extend(stale_lines)
+    items.extend(supersede_lines)
 
     if not items:
         return []
