@@ -694,6 +694,51 @@ def test_section_b_stays_phase1_when_auto_fix_halted(tmp_path: Path) -> None:
     assert "R5 failed" in md
 
 
+def test_section_d_warns_on_added_slow_marker(tmp_path: Path) -> None:
+    """spec_048 §2-3 / §3-4 — a merged fix whose diff purely ADDS
+    @pytest.mark.slow surfaces a one-line warning in §D (the test it tagged
+    drops from the `-m "not slow"` mutation subset). It is safe-side, so the
+    fix still MERGES — the §B happy-path narrative is unchanged and no HALT
+    occurs; §D merely adds the observation."""
+
+    discover = tmp_path / "_ai_workspace" / "discover"
+    _write_mutation(discover, seq=1)
+    slow_diff = (
+        "diff --git a/tests/test_protocol.py b/tests/test_protocol.py\n"
+        "--- a/tests/test_protocol.py\n"
+        "+++ b/tests/test_protocol.py\n"
+        "@@ -10,3 +10,6 @@ def test_existing():\n"
+        "     assert parse('X') == 'x'\n"
+        "+\n"
+        "+@pytest.mark.slow\n"
+        "+def test_new_heavy_case():\n"
+    )
+    af = _make_merged_auto_fix(merge_diff=slow_diff)
+    result = run_brief(repo=tmp_path, today=date(2026, 5, 25), auto_fix=af)
+    assert result.report_path is not None
+    md = result.report_path.read_text(encoding="utf-8")
+
+    # Still a merged happy-path (no HALT), §B is the Phase 2 narrative.
+    assert "## B. 昨夜の自律修正" in md
+    assert "自律修正 HALT" not in md
+    # §D carries the non-halting observation.
+    assert "mutation サブセット縮小" in md
+    assert "@pytest.mark.slow" in md
+
+
+def test_section_d_no_slow_warning_without_marker(tmp_path: Path) -> None:
+    """A merged fix with an ordinary diff (no slow marker) gets no §D
+    warning — the observation only fires on a real純追加."""
+
+    discover = tmp_path / "_ai_workspace" / "discover"
+    _write_mutation(discover, seq=1)
+    af = _make_merged_auto_fix()  # default diff has no slow marker
+    result = run_brief(repo=tmp_path, today=date(2026, 5, 25), auto_fix=af)
+    assert result.report_path is not None
+    md = result.report_path.read_text(encoding="utf-8")
+    assert "mutation サブセット縮小" not in md
+
+
 def test_section_b_phase2_diff_truncation(tmp_path: Path) -> None:
     """A pathologically large diff is truncated with an explanatory
     footer so the morning report doesn't balloon."""

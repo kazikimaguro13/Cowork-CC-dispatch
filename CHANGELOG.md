@@ -2,6 +2,40 @@
 
 本プロジェクトの注目すべき変更を記録する。フォーマットは [Keep a Changelog](https://keepachangelog.com/) に準ずる。
 
+## [0.31.0] — 2026-06-11
+
+### Fixed (security-hardening — Fable 5 全コードレビュー 🟢-1 起源)
+
+- spec_048: **denylist 反転を config にも一般化 ── profile 正本の保護漏れを
+  構造的に塞ぐ**。2026-06-11 の Fable 5 全コードレビューが見つけた spec_044
+  （denylist 反転）の不変条件取りこぼし（深刻度 🟢 低・現状到達不能だが latent）を
+  根治。
+  - **§2-1 — profile 正本ディレクトリを denylist に追加**: `DENYLIST_GLOBS`
+    （`ccd/guard.py`）が保護していた profile は旧単一パス
+    `_ai_workspace/ccd_profile.toml` のみだったが、本番 `nightly-all` が実際に
+    読む正本は多施策ディレクトリ `_ai_workspace/profiles/*.toml`
+    （`ccd.profile.PROFILES_DIR_REL`; spec_029/046）。この profile は mutation
+    ランナー / `r5_recheck_times` / `max_merges_per_night` / 有効テンプレ など
+    「検証の強さを決めるツマミ」を持つ（RT-2「メトリクスが嘘をつくを再生産する」の
+    本丸）。`_ai_workspace/profiles/**` glob を追加し正本ストア全体を保護。旧
+    単一パスは後方互換で残置。
+  - **§2-2（本筋）— 保護対象 config の denylist カバレッジを実走査で強制**:
+    spec_044 の `test_every_ccd_module_on_disk_is_classified`（`.py` を実走査して
+    未分類を fail）の config 版を追加。`ccd.profile.PROFILES_DIR_REL`（本番と同じ
+    正本ソース）から profile ディレクトリを導出し、各 `*.toml` + discovery
+    blocklist が `DENYLIST_GLOBS` のいずれかでカバーされることを
+    `uncovered_protected_configs` で実走査検証。「正本パスを移行したが denylist
+    列挙の更新を忘れた」（まさに今回の事象）が CI で落ちる。偽陽性許容・保護対象は
+    広めに倒す方針。
+  - **§2-3（🟢-2 観測強化）— slow マーカー純追加の可視化**: fix の diff が既存／
+    新規テストに `@pytest.mark.slow` を純追加すると、そのテストが mutation
+    サブセット（`-m "not slow"`）から恒久的に外れる。これは安全側（ミュータント
+    生存↑＝発見↑、悪い merge には到達しない）ため **HALT しない**が、朝レポート
+    §D に警告1行を出す（`added_slow_markers`; 既に outcome 上にある diff から計算、
+    ループへの追加配線なし）。偽陽性 OK。
+  - 検証ロジック（guard R1〜R3 / R4 / R5 / Integrator）は一切緩めていない ──
+    §2-1/§2-2 は denylist を**広げる**（より厳しく）方向、§2-3 は観測の追加のみ。
+
 ## [0.30.0] — 2026-06-11
 
 ### Fixed (operational hygiene — 2026-06-11 本番経路実走の観察起源)

@@ -75,6 +75,8 @@ from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from ccd.guard import added_slow_markers
+
 if TYPE_CHECKING:
     from ccd.nightly import AutoFixOutcome, ChannelOutcome
 
@@ -1518,6 +1520,31 @@ def _render_section_d(
                 supersede_lines.append(entry)
     items.extend(stale_lines)
     items.extend(supersede_lines)
+
+    # spec_048 §2-3 (🟢-2 観測強化) — a fix that purely ADDS @pytest.mark.slow
+    # to an existing test silently drops it from the mutation subset runner
+    # (``-m "not slow"``). This is safe-side (more surviving mutants → more
+    # discovery; it never reaches a worse merge) so it does NOT halt — but the
+    # permanent subset shrink deserves one warning line so a human notices.
+    # Scanned from the diff already on each outcome (merge_diff / proposal_diff);
+    # no extra plumbing through the loop. False positives are acceptable.
+    slow_lines: list[str] = []
+    for o in all_outcomes:
+        diff = (getattr(o, "merge_diff", "") or "") or (
+            getattr(o, "proposal_diff", "") or ""
+        )
+        if not diff:
+            continue
+        for marker in added_slow_markers(diff):
+            entry = (
+                f"- ⚠️ **mutation サブセット縮小** (`{getattr(o, 'spec_auto_id', '') or '?'}`): "
+                f"fix が `@pytest.mark.slow` を純追加 ({marker}) — "
+                f"当該テストは `-m \"not slow\"` 発見サブセットから恒久的に外れる "
+                f"(安全側: ミュータント生存↑＝発見↑。HALT 不要・要確認のみ)"
+            )
+            if entry not in slow_lines:
+                slow_lines.append(entry)
+    items.extend(slow_lines)
 
     if not items:
         return []

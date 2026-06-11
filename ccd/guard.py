@@ -87,6 +87,19 @@ from pathlib import Path, PurePosixPath
 #   ccd profile (which channels are enabled, schedule, future cost
 #   ceilings). The loop must not flip its own switches.
 # - ``.pre-commit-config.yaml`` — same reason as CI.
+#
+# spec_048 (Fable 5 全レビュー 🟢-1): the *canonical* profile store the
+# production ``nightly-all`` actually reads is the multi-policy directory
+# ``_ai_workspace/profiles/*.toml`` (``ccd.profile.PROFILES_DIR_REL``;
+# spec_029/046), NOT the legacy single ``ccd_profile.toml`` the original list
+# named. That profile carries the **verification-strength knobs** (mutation
+# runner, ``r5_recheck_times``, ``max_merges_per_night``, enabled templates) —
+# the self-referential bug RT-2 warned about ("the system reproduces metrics
+# that lie"). The legacy single-path entries are kept for backward
+# compatibility; the ``profiles/**`` glob protects the whole canonical store so
+# a forgotten enumeration cannot reopen the hole. The §2-2 forced-coverage test
+# (:func:`uncovered_protected_configs`) pins that this list keeps covering the
+# canonical config even if the path is migrated again.
 DENYLIST_GLOBS: tuple[str, ...] = (
     "ccd/guard.py",
     "ccd/nightly.py",
@@ -99,8 +112,9 @@ DENYLIST_GLOBS: tuple[str, ...] = (
     "setup.cfg",
     ".pre-commit-config.yaml",
     "_ai_workspace/discover/blocklist.txt",
-    "_ai_workspace/ccd_profile.toml",
-    "ccd_profile.toml",
+    "_ai_workspace/profiles/**",  # 多施策 profile 正本（spec_029/046 で移行）
+    "_ai_workspace/ccd_profile.toml",  # 旧単一パス（後方互換で残置）
+    "ccd_profile.toml",  # 旧裸パス（後方互換で残置）
 )
 
 # --------------------------------------------------------------------------- #
@@ -369,6 +383,65 @@ def unclassified_ccd_modules(relpaths: Iterable[str]) -> list[str]:
     real ``ccd/`` tree through this and fails if it is non-empty.
     """
     return sorted(r for r in relpaths if classify_ccd_module(r) == "unclassified")
+
+
+def uncovered_protected_configs(paths: Iterable[str]) -> list[str]:
+    """Return the protected-config ``paths`` NOT covered by any
+    ``DENYLIST_GLOBS`` glob, sorted (spec_048 §2-2).
+
+    The §2-1 inversion for ``ccd/*.py`` made "forgetting to protect a *module*"
+    structurally impossible. The analogous hole for **config** is "the loop's
+    verification-strength knobs live in ``_ai_workspace/`` and someone migrated
+    the canonical path but forgot to update ``DENYLIST_GLOBS``" — exactly the
+    Fable 5 🟢-1 finding (profile正本が ``ccd_profile.toml`` → ``profiles/*.toml``
+    に移ったのに denylist が旧パスのままだった). This helper is the forced check:
+    the §2-2 test enumerates the *actual* canonical config on disk (deriving the
+    profile directory from :data:`ccd.profile.PROFILES_DIR_REL`, the same source
+    of truth production reads) and fails if any of it is uncovered. False
+    positives are fine — the protected set is kept deliberately broad.
+    """
+    return sorted(p for p in paths if not _matches_any(p, DENYLIST_GLOBS))
+
+
+# spec_048 §2-3 — markers that, when *added* to an existing test by a fix,
+# permanently drop that test from the mutation subset runner
+# (``-m "not slow"``; CCD profile, spec_046). This is **safe-side**: a test
+# pulled out of the subset means more surviving mutants → more discovery, never
+# a worse merge — so it must NOT halt. But the silent, permanent subset shrink
+# is worth one warning line in the morning brief §D so a human can notice it.
+# Mirrors the decorator / module-level (``pytestmark = ...``) forms the R2
+# skip-marker scan already understands.
+_SLOW_MARKER_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"@\s*pytest\.mark\.slow\b"),
+    re.compile(r"^\s*pytestmark\s*=.*\bslow\b"),
+)
+
+
+def added_slow_markers(diff: str) -> list[str]:
+    """Return ``"<path>: <marker>"`` for every ``@pytest.mark.slow`` (or
+    module-level ``pytestmark = ... slow``) marker **added** by ``diff``
+    (spec_048 §2-3).
+
+    Best-effort, non-halting observation only (see :data:`_SLOW_MARKER_PATTERNS`).
+    Scans added (``+``) hunk lines of every parsed file; unparseable diffs
+    yield ``[]`` (the dynamic R4 count gate remains the主防御 against any real
+    test muting). Duplicates within a file are collapsed.
+    """
+    try:
+        file_diffs = _parse_diff(diff)
+    except _UnparseableDiff:
+        return []
+    out: list[str] = []
+    for fd in file_diffs:
+        seen: set[str] = set()
+        for line in fd.added_text:
+            for pat in _SLOW_MARKER_PATTERNS:
+                m = pat.search(line)
+                if m and m.group(0) not in seen:
+                    seen.add(m.group(0))
+                    out.append(f"{fd.path}: {m.group(0).strip()}")
+                    break
+    return out
 
 
 def _ccd_default_deny_hit(fd: FileDiff) -> str | None:
@@ -721,8 +794,10 @@ __all__ = [
     "PRODUCT_FIXABLE",
     "FileDiff",
     "GuardResult",
+    "added_slow_markers",
     "classify_ccd_module",
     "fetch_diff",
     "inspect_diff",
     "unclassified_ccd_modules",
+    "uncovered_protected_configs",
 ]

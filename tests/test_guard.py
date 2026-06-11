@@ -729,6 +729,164 @@ def test_core_module_denied_even_via_rename_old_path() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# spec_048 — generalize the default-deny inversion to config (Fable 5 🟢-1):
+# protect the canonical multi-policy profile store, and forcibly verify config
+# denylist coverage by walking the real tree.
+# --------------------------------------------------------------------------- #
+
+
+def _diff_template_b_config(config_file: str) -> str:
+    """A template-B style diff naming a non-``ccd/`` config file. Mirrors
+    ``_diff_template_b_small`` but for a ``.toml`` under ``_ai_workspace/``."""
+    return f"""diff --git a/{config_file} b/{config_file}
+index 1234567..2345678 100644
+--- a/{config_file}
++++ b/{config_file}
+@@ -1,1 +1,1 @@
+-r5_recheck_times = 3
++r5_recheck_times = 1
+"""
+
+
+def test_denylist_profiles_canonical_toml_halts() -> None:
+    """§3-1: a finding (template B 想定) that names the canonical profile
+    ``_ai_workspace/profiles/ccd.toml`` HALTs on the denylist — the profile
+    carries the verification-strength knobs the loop must never flip."""
+    res = inspect_diff(
+        diff=_diff_template_b_config("_ai_workspace/profiles/ccd.toml"),
+        allowed_files=["_ai_workspace/profiles/ccd.toml", "tests/"],
+        template="B",
+    )
+    assert res.passed is False
+    assert any(
+        "denylist" in r and "_ai_workspace/profiles/ccd.toml" in r
+        for r in res.halt_reasons
+    ), res.halt_reasons
+
+
+def test_profiles_glob_matches_each_policy_file() -> None:
+    """§2-1: the ``profiles/**`` glob covers every multi-policy file, not just
+    one enumerated name."""
+    from ccd.guard import _matches_any  # noqa: PLC0415
+
+    for p in (
+        "_ai_workspace/profiles/ccd.toml",
+        "_ai_workspace/profiles/axis-knowledge-rag.toml",
+        "_ai_workspace/profiles/some-future-policy.toml",
+    ):
+        assert _matches_any(p, DENYLIST_GLOBS), p
+
+
+def _canonical_protected_configs() -> list[str]:
+    """Enumerate the *actual* verification-strength config on disk, deriving
+    the profile directory from the same source of truth production reads
+    (``ccd.profile.PROFILES_DIR_REL``). Future ``*.toml`` additions are picked
+    up automatically; the discovery blocklist is included as a known protected
+    path whether or not it exists yet."""
+    from ccd.profile import PROFILES_DIR_REL  # noqa: PLC0415
+
+    repo = Path(__file__).resolve().parent.parent
+    protected: list[str] = []
+    profiles_dir = repo / PROFILES_DIR_REL
+    if profiles_dir.is_dir():
+        protected.extend(
+            (PROFILES_DIR_REL / p.name).as_posix()
+            for p in sorted(profiles_dir.glob("*.toml"))
+        )
+    protected.append("_ai_workspace/discover/blocklist.txt")
+    return protected
+
+
+def test_canonical_config_is_fully_denylist_covered() -> None:
+    """§2-2 / §3-2 (real side): every verification-strength config on disk is
+    covered by some ``DENYLIST_GLOBS`` glob. This fails if the canonical path
+    is migrated (e.g. ``profiles/`` → ``policies/``) but the denylist
+    enumeration is not updated — exactly the Fable 5 🟢-1 failure mode."""
+    from ccd.guard import uncovered_protected_configs  # noqa: PLC0415
+
+    protected = _canonical_protected_configs()
+    # We must at least have found the multi-policy profiles on disk.
+    assert any(p.startswith("_ai_workspace/profiles/") for p in protected), protected
+    leftover = uncovered_protected_configs(protected)
+    assert leftover == [], (
+        "verification-strength config not covered by DENYLIST_GLOBS — a "
+        "canonical path was migrated without updating the denylist "
+        f"(add a glob in ccd/guard.py): {leftover}"
+    )
+
+
+def test_uncovered_protected_configs_flags_a_migrated_uncovered_path() -> None:
+    """§3-2 (synthetic): the forced helper *would* flag a protected config path
+    that no glob covers — e.g. a hypothetical migrated profile store
+    ``_ai_workspace/policies/ccd.toml``. (A new file under the *existing*
+    ``profiles/`` dir is already covered by ``profiles/**`` and so is safe —
+    the realistic regression the test guards against is a path migration.)"""
+    from ccd.guard import uncovered_protected_configs  # noqa: PLC0415
+
+    assert uncovered_protected_configs(["_ai_workspace/profiles/ccd.toml"]) == []
+    assert uncovered_protected_configs(
+        ["_ai_workspace/profiles/brand_new.toml"]
+    ) == []
+    assert uncovered_protected_configs(
+        ["_ai_workspace/profiles/ccd.toml", "_ai_workspace/policies/ccd.toml"]
+    ) == ["_ai_workspace/policies/ccd.toml"]
+
+
+# --------------------------------------------------------------------------- #
+# spec_048 §2-3 — non-halting observation: a fix that purely ADDS
+# @pytest.mark.slow drops a test from the mutation subset (`-m "not slow"`).
+# --------------------------------------------------------------------------- #
+
+
+def _diff_add_slow_marker(file: str = "tests/test_widget.py") -> str:
+    """A tests-only append that adds @pytest.mark.slow to a NEW test func —
+    R2-legal (append-only, no skip/xfail), but it shrinks the subset."""
+    return f"""diff --git a/{file} b/{file}
+index 1111111..2222222 100644
+--- a/{file}
++++ b/{file}
+@@ -10,3 +10,7 @@ def test_existing():
+     assert widget() == 1
+     assert widget() == 1
+     assert widget() == 1
++
++@pytest.mark.slow
++def test_new_heavy_case():
++    assert run_full_suite() == 0
+"""
+
+
+def test_added_slow_marker_detected() -> None:
+    """§2-3: a newly added @pytest.mark.slow is surfaced by the detector."""
+    from ccd.guard import added_slow_markers  # noqa: PLC0415
+
+    markers = added_slow_markers(_diff_add_slow_marker())
+    assert markers, markers
+    assert any("@pytest.mark.slow" in m for m in markers), markers
+    assert any("tests/test_widget.py" in m for m in markers), markers
+
+
+def test_added_slow_marker_does_not_halt_guard() -> None:
+    """§2-3 / §3-4: adding @pytest.mark.slow is R2-legal (it is not a
+    skip/xfail/disable marker) — the guard must NOT halt on it. The observation
+    is brief-only; enforcement is unchanged."""
+    res = inspect_diff(
+        diff=_diff_add_slow_marker(),
+        allowed_files=["tests/"],
+        template="A",
+    )
+    assert res.passed is True, res.halt_reasons
+
+
+def test_no_slow_marker_yields_empty() -> None:
+    """A plain test append (no slow marker) yields no observation."""
+    from ccd.guard import added_slow_markers  # noqa: PLC0415
+
+    assert added_slow_markers(_diff_append_to_existing_test()) == []
+    assert added_slow_markers("") == []
+
+
+# --------------------------------------------------------------------------- #
 # CLI end-to-end against a real (tiny) git repo
 # --------------------------------------------------------------------------- #
 
