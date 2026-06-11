@@ -45,6 +45,12 @@ echo "[$(date -Is)] using ccd: ${CCD_INFO#*|} (venv activate exit: ${CCD_INFO%%|
 # exit 後も生存」は対話 WSL 前提で、本番経路では成立しなかった。
 # → タスク内で同期実行し、タスク完了まで wsl を保持する。ExecutionTimeLimit=PT6H が上限ガード。
 echo "[$(date -Is)] nightly-all starting (synchronous hotfix 2026-06-07)" >> "$LOG"
+# 2026-06-11 — fix dispatch が呼ぶ claude CLI を dev-b (Opus 4.7) に固定する。
+# 未設定だと PATH 解決で Windows 側 claude.exe を拾い、使用アカウント/モデルが
+# 未統制になる（run_chain_*.sh は明示 export 済みだが wrapper は漏れていた）。
+export CLAUDE_CONFIG_DIR="$HOME/.claude-project-b"
+export PATH="$HOME/.npm-global/bin:$PATH"
+echo "[$(date -Is)] agent env: CLAUDE_CONFIG_DIR=$CLAUDE_CONFIG_DIR claude=$(command -v claude 2>/dev/null || echo 'NOT FOUND')" >> "$LOG"
 . .venv/bin/activate 2>/dev/null
 ccd nightly-all --repo "$PROJECT" >> "$LOG" 2>&1
 rc=$?
