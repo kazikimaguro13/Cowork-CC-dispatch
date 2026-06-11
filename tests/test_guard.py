@@ -21,10 +21,14 @@ import pytest
 
 from ccd import cli
 from ccd.guard import (
+    CORE_CCD_MODULES,
     DEFAULT_PROD_DIFF_LIMIT,
     DENYLIST_GLOBS,
+    PRODUCT_FIXABLE,
     GuardResult,
+    classify_ccd_module,
     inspect_diff,
+    unclassified_ccd_modules,
 )
 
 # --------------------------------------------------------------------------- #
@@ -123,7 +127,10 @@ index 0000000..7777777
 """
 
 
-def _diff_touch_outside_allowed(file: str = "ccd/integrate.py") -> str:
+# A path that is neither in the caller's allowlist nor on any denylist (not
+# under ``ccd/``) — so it exercises R1 cleanly. spec_044 inverted ``ccd/`` to
+# default-deny, so a ``ccd/*.py`` here would HALT on the denylist before R1.
+def _diff_touch_outside_allowed(file: str = "scripts/helper.py") -> str:
     return f"""diff --git a/{file} b/{file}
 index 8888888..9999999 100644
 --- a/{file}
@@ -574,6 +581,151 @@ def test_denylist_globs_cover_expected_paths() -> None:
 
     for p in must_be_denied:
         assert _matches_any(p, DENYLIST_GLOBS), p
+
+
+# --------------------------------------------------------------------------- #
+# spec_044 — inverted self-protection: ccd/ default-deny + explicit allow
+# --------------------------------------------------------------------------- #
+
+
+def test_template_b_core_module_metrics_halts_on_denylist() -> None:
+    """§3-1: a template-B finding that names a CORE module (``ccd/metrics.py``)
+    must HALT on the denylist *before* R1 — even though the caller explicitly
+    allowed it. This is the RT-2 root-cause: "the loop rewrites its own
+    metrics.py" must be structurally impossible."""
+    res = inspect_diff(
+        diff=_diff_template_b_small("ccd/metrics.py"),
+        allowed_files=["ccd/metrics.py", "tests/"],
+        template="B",
+    )
+    assert res.passed is False
+    assert any("denylist" in r and "ccd/metrics.py" in r for r in res.halt_reasons), (
+        res.halt_reasons
+    )
+    # The denylist must win over R1 — no R1 "not in allowed set" reason, since
+    # the file *was* allowed; it is denied for being core, not for being unlisted.
+    assert not any("R1" in r for r in res.halt_reasons), res.halt_reasons
+
+
+def test_template_b_product_fixable_protocol_passes() -> None:
+    """§3-2: a template-B finding that names a PRODUCT_FIXABLE module
+    (``ccd/protocol.py``) is allowed through the inversion (and then passes
+    the remaining rules for a small, clean diff)."""
+    res = inspect_diff(
+        diff=_diff_template_b_small("ccd/protocol.py"),
+        allowed_files=["ccd/protocol.py", "tests/"],
+        template="B",
+    )
+    assert res.passed is True, res.halt_reasons
+
+
+def test_template_b_other_core_modules_all_denied() -> None:
+    """Every CORE module — not just the originally-enumerated guard/nightly —
+    is denied even when explicitly allowed. This is the breadth RT-2 was
+    about: loop/retry/translate/discover/adversarial/profile/integrate and the
+    audit surfaces (brief/dashboard/...) were all previously unprotected."""
+    for mod in sorted(CORE_CCD_MODULES):
+        path = f"ccd/{mod}"
+        res = inspect_diff(
+            diff=_diff_template_b_small(path),
+            allowed_files=[path, "tests/"],
+            template="B",
+        )
+        assert res.passed is False, f"{path} should be denied"
+        assert any("denylist" in r for r in res.halt_reasons), (mod, res.halt_reasons)
+
+
+def test_template_b_new_unclassified_ccd_module_denied_by_default() -> None:
+    """A brand-new ``ccd/foo.py`` that nobody has classified is denied by
+    default (safe side) — the whole point of the inversion."""
+    res = inspect_diff(
+        diff=_diff_template_b_small("ccd/foo.py"),
+        allowed_files=["ccd/foo.py", "tests/"],
+        template="B",
+    )
+    assert res.passed is False
+    assert any("denylist" in r for r in res.halt_reasons), res.halt_reasons
+
+
+def test_template_a_tests_only_unchanged_under_inversion() -> None:
+    """§3-4: template A (tests-only) behaviour is unchanged — a normal append
+    to an existing test still passes; the inversion only governs ``ccd/``."""
+    res = inspect_diff(
+        diff=_diff_append_to_existing_test(),
+        allowed_files=["tests/"],
+        template="A",
+    )
+    assert res.passed is True, res.halt_reasons
+
+
+def test_every_ccd_module_on_disk_is_classified() -> None:
+    """§3-3 (real side): walk the actual ``ccd/`` package and require every
+    ``.py`` module to be classified as CORE or PRODUCT_FIXABLE. A new module
+    added without classification makes this fail — that is the forced-triage
+    mechanism that operationally guarantees "default deny"."""
+    ccd_dir = Path(__file__).resolve().parent.parent / "ccd"
+    on_disk = sorted(
+        str(p.relative_to(ccd_dir).as_posix()) for p in ccd_dir.rglob("*.py")
+    )
+    assert on_disk, "expected to find ccd/*.py modules"
+    leftover = unclassified_ccd_modules(on_disk)
+    assert leftover == [], (
+        f"unclassified ccd modules (add to CORE_CCD_MODULES or PRODUCT_FIXABLE "
+        f"in ccd/guard.py — when in doubt, CORE): {leftover}"
+    )
+
+
+def test_forced_classification_test_fails_on_synthetic_new_module() -> None:
+    """§3-3: pin that the forced-classification helper *would* flag a new,
+    unclassified module. We don't create ``ccd/foo.py`` on disk (that would
+    break the real test); instead we feed the helper a synthetic list."""
+    synthetic = ["metrics.py", "protocol.py", "foo.py"]
+    assert unclassified_ccd_modules(synthetic) == ["foo.py"]
+    assert classify_ccd_module("foo.py") == "unclassified"
+    assert classify_ccd_module("metrics.py") == "core"
+    assert classify_ccd_module("protocol.py") == "product_fixable"
+
+
+def test_core_and_product_fixable_are_disjoint() -> None:
+    """When in doubt, CORE — a module must never be in both sets."""
+    assert CORE_CCD_MODULES.isdisjoint(PRODUCT_FIXABLE), (
+        CORE_CCD_MODULES & PRODUCT_FIXABLE
+    )
+
+
+def test_product_fixable_initial_value_is_minimal() -> None:
+    """spec_044 §2-1: the initial PRODUCT_FIXABLE is exactly protocol.py /
+    models.py. Widening it to make a test pass is against the spec — this
+    test makes such widening a deliberate, visible change."""
+    assert PRODUCT_FIXABLE == frozenset({"protocol.py", "models.py"})
+
+
+def test_non_ccd_protections_still_maintained() -> None:
+    """§3-5: the existing non-``ccd/`` protections (CI / packaging / profile)
+    are untouched by the inversion."""
+    from ccd.guard import _matches_any  # noqa: PLC0415
+
+    for p in (
+        "pyproject.toml",
+        ".github/workflows/ci.yml",
+        "_ai_workspace/ccd_profile.toml",
+        "_ai_workspace/discover/blocklist.txt",
+        ".pre-commit-config.yaml",
+    ):
+        assert _matches_any(p, DENYLIST_GLOBS), p
+
+
+def test_core_module_denied_even_via_rename_old_path() -> None:
+    """A rename that moves a core module out is caught on the old side too —
+    the inversion checks both old and new paths."""
+    diff = _diff_rename("ccd/metrics.py", "ccd/metrics_renamed.py")
+    res = inspect_diff(
+        diff=diff,
+        allowed_files=["ccd/", "tests/"],
+        template="B",
+    )
+    assert res.passed is False
+    assert any("denylist" in r for r in res.halt_reasons), res.halt_reasons
 
 
 # --------------------------------------------------------------------------- #

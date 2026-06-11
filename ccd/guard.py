@@ -33,12 +33,22 @@ loop-wiring spec (spec_023). Do not blend them into this module.
 Self-protection
 ---------------
 
-A hardcoded **denylist** holds the files the guard must refuse to allow
-modifications to, *regardless of the caller's allowlist*: the guard
-itself, the nightly scheduler modules, CI config, mutation/discovery
-config, ``pyproject.toml``. ("Who guards the guard": the guard cannot be
-weakened by the same loop it is supposed to police.) Denylist hits are
-HALT even when the caller asks nicely.
+The guard refuses to allow modifications to its own machinery,
+*regardless of the caller's allowlist*. ("Who guards the guard": the
+guard cannot be weakened by the same loop it is supposed to police.)
+Denylist hits are HALT even when the caller asks nicely. Two layers:
+
+- **Non-``ccd/`` enumeration** (``DENYLIST_GLOBS``) — CI config under
+  ``.github/``, ``pyproject.toml`` / ``setup.*`` / ``.pre-commit-config``,
+  and the ``_ai_workspace/`` profile + discovery blocklist.
+- **Inverted ``ccd/`` rule** (spec_044, RT-2 root-cause fix) — every
+  ``.py`` under ``ccd/`` is **denied by default**; only modules on the
+  explicit ``PRODUCT_FIXABLE`` allowlist (``protocol.py`` / ``models.py``)
+  may be named by a template-B fix. An enumerated denylist protects only
+  what someone remembered to list; the inverted rule protects a new module
+  automatically, so a forgotten classification fails *safe* (denied), not
+  *open*. ``CORE_CCD_MODULES`` enumerates the machinery so the §2-3 forced
+  test can distinguish a deliberately-CORE module from an unclassified one.
 
 False positives OK, false negatives not OK
 ------------------------------------------
@@ -91,6 +101,81 @@ DENYLIST_GLOBS: tuple[str, ...] = (
     "_ai_workspace/discover/blocklist.txt",
     "_ai_workspace/ccd_profile.toml",
     "ccd_profile.toml",
+)
+
+# --------------------------------------------------------------------------- #
+# Inverted self-protection for ``ccd/`` (spec_044 — RT-2 root-cause fix)
+# --------------------------------------------------------------------------- #
+#
+# RT-2 (2026-06-10 red team, Fable 5): the *enumerated* ``DENYLIST_GLOBS``
+# above only names ``guard`` / ``nightly`` / CI / packaging / profile config.
+# After v2→v3 split the loop-and-guard machinery, ``loop.py`` / ``retry.py`` /
+# ``translate.py`` / ``metrics.py`` / ``backfill.py`` / ``discover.py`` /
+# ``adversarial.py`` / ``profile.py`` / Integrator were left **unprotected**.
+# Today template A (tests-only) papers over it, but the moment template B
+# (one named production file) ignites, a finding that names one of those core
+# modules would sail through R1 and the loop could rewrite its own
+# ``metrics.py`` — "the metrics lie" reproduced by the system itself.
+#
+# The root cause is that an *enumerated* denylist protects only what someone
+# remembered to list: add a new ``ccd/`` module, forget to list it, and a hole
+# opens. spec_044 **inverts** the rule for ``ccd/``: **default deny, explicit
+# allow**. Every ``.py`` under ``ccd/`` is protected unless its path appears in
+# the ``PRODUCT_FIXABLE`` allowlist below. A new ``ccd/`` module is protected
+# automatically (safe default); forgetting to *protect* something is now
+# structurally impossible — you can only forget to *un*protect, which fails
+# safe.
+#
+# ``迷えば CORE`` (when in doubt, CORE): false positives (a legitimate
+# ``protocol.py`` fix wrongly blocked) are cheap — they show up in the morning
+# brief §D and a human adds the module to ``PRODUCT_FIXABLE``. A false negative
+# (the loop edits its own machinery) is what we must never allow.
+
+# Modules the loop must NEVER rewrite — its own machinery and the human-facing
+# audit/report surfaces (tampering with a report *is* the cover-up). This set
+# is enumerated explicitly (not "everything except PRODUCT_FIXABLE") so the
+# §2-3 forced-classification test can tell a deliberately-CORE module apart
+# from a brand-new *unclassified* one and fail on the latter.
+CORE_CCD_MODULES: frozenset[str] = frozenset(
+    {
+        # loop / guard machinery
+        "guard.py",  # the inspector itself — "who guards the guard"
+        "nightly.py",  # orchestrator / Integrator
+        "loop.py",  # FixLoop (convergence / no-progress detection)
+        "retry.py",  # retryable-boundary classification
+        "translate.py",  # template translation (must stay a rigid body)
+        "metrics.py",  # honest-metrics computation
+        "backfill.py",  # metrics backfill
+        "discover.py",  # discovery oracle
+        "adversarial.py",  # adversarial-input oracle
+        "profile.py",  # safety-boundary validation
+        "integrate.py",  # Integrator
+        "agent.py",  # the loop's own fixer agent
+        "chain.py",  # spec→dispatch chaining
+        "cli.py",  # command surface
+        "dispatch.py",  # worker dispatch
+        "run_writer.py",  # run-record writer
+        "sweep.py",  # sweep machinery
+        # human-facing audit / report surfaces — tampering = cover-up
+        "dashboard.py",
+        "brief.py",
+        "ai_review.py",
+        "retrospect.py",
+        # package plumbing
+        "__init__.py",
+        "__main__.py",
+    }
+)
+
+# The ONLY ``ccd/`` modules a template-B fix may name: product logic that is
+# under test and is NOT guard machinery. Kept deliberately tiny. Adding a
+# module here to make a test pass defeats the purpose of this spec — when in
+# doubt, leave it CORE.
+PRODUCT_FIXABLE: frozenset[str] = frozenset(
+    {
+        "protocol.py",
+        "models.py",
+    }
 )
 
 # R3 default: a narrow scope-B fix that exceeds this many production-side
@@ -247,15 +332,79 @@ def inspect_diff(
 # --------------------------------------------------------------------------- #
 
 
+def _ccd_module_relpath(path: str | None) -> str | None:
+    """Return the path *relative to* ``ccd/`` iff ``path`` is a ``.py`` file
+    under the ``ccd/`` package, else ``None``.
+
+    ``"ccd/metrics.py"`` → ``"metrics.py"``; ``"ccd/sub/x.py"`` →
+    ``"sub/x.py"``; ``"tests/test_x.py"`` / ``"ccd/data.json"`` → ``None``.
+    """
+    if not path:
+        return None
+    pp = PurePosixPath(path)
+    if len(pp.parts) >= 2 and pp.parts[0] == "ccd" and pp.suffix == ".py":
+        return str(PurePosixPath(*pp.parts[1:]))
+    return None
+
+
+def classify_ccd_module(relpath: str) -> str:
+    """Classify a ``ccd/``-relative module path.
+
+    Returns ``"product_fixable"`` (template B may name it), ``"core"`` (the
+    loop's own machinery — never touchable), or ``"unclassified"`` (a module
+    nobody has triaged yet — treated as deny, and flagged by the §2-3 forced
+    test so a human classifies it). PRODUCT_FIXABLE wins ties, but the two
+    sets are kept disjoint.
+    """
+    if relpath in PRODUCT_FIXABLE:
+        return "product_fixable"
+    if relpath in CORE_CCD_MODULES:
+        return "core"
+    return "unclassified"
+
+
+def unclassified_ccd_modules(relpaths: Iterable[str]) -> list[str]:
+    """Return the subset of ``relpaths`` that is neither CORE nor
+    PRODUCT_FIXABLE, sorted. The §2-3 forced-classification test walks the
+    real ``ccd/`` tree through this and fails if it is non-empty.
+    """
+    return sorted(r for r in relpaths if classify_ccd_module(r) == "unclassified")
+
+
+def _ccd_default_deny_hit(fd: FileDiff) -> str | None:
+    """Inverted self-protection (spec_044): any ``ccd/*.py`` that is not on
+    the ``PRODUCT_FIXABLE`` allowlist is denied — CORE and unclassified alike.
+    Both old and new paths are checked so a rename can't smuggle a core module
+    out.
+    """
+    for candidate in (fd.new_path, fd.old_path):
+        rel = _ccd_module_relpath(candidate)
+        if rel is None or rel in PRODUCT_FIXABLE:
+            continue
+        kind = "core" if rel in CORE_CCD_MODULES else "unclassified"
+        return (
+            f"denylist: {candidate} は core 機構のため修正対象にできない"
+            f"（テンプレB は PRODUCT_FIXABLE のみ: {sorted(PRODUCT_FIXABLE)}"
+            f"; 分類={kind}）"
+        )
+    return None
+
+
 def _denylist_hit(fd: FileDiff) -> str | None:
-    """Return halt reason iff this FileDiff touches the denylist."""
+    """Return halt reason iff this FileDiff touches the denylist.
+
+    Two layers, denylist always wins over the caller's allowlist:
+    1. the enumerated non-``ccd/`` protections (CI / packaging / profile);
+    2. the inverted ``ccd/`` default-deny (spec_044) — everything under
+       ``ccd/`` except ``PRODUCT_FIXABLE``.
+    """
     for candidate in (fd.new_path, fd.old_path):
         if candidate and _matches_any(candidate, DENYLIST_GLOBS):
             return (
                 f"denylist: {candidate} is self-protected "
                 f"(guard / scheduler / CI / packaging / discovery config)"
             )
-    return None
+    return _ccd_default_deny_hit(fd)
 
 
 def _safe_halt_reason(fd: FileDiff) -> str | None:
@@ -566,10 +715,14 @@ def fetch_diff(repo: Path, base: str, head: str) -> str:
 
 
 __all__ = [
+    "CORE_CCD_MODULES",
     "DEFAULT_PROD_DIFF_LIMIT",
     "DENYLIST_GLOBS",
+    "PRODUCT_FIXABLE",
     "FileDiff",
     "GuardResult",
+    "classify_ccd_module",
     "fetch_diff",
     "inspect_diff",
+    "unclassified_ccd_modules",
 ]
