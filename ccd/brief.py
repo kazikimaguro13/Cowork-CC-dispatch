@@ -790,10 +790,7 @@ def _render_section_b_phase2(
     lines.append(
         f"- {r5_label}: **{'pass' if auto_fix.r5_killed else 'fail'}**"
     )
-    lines.append(
-        f"- R4 (`pytest -q` 全件 green): "
-        f"**{'pass' if auto_fix.r4_suite_passed else 'fail'}**"
-    )
+    lines.append(_r4_evidence_line(auto_fix, in_clone=False))
     if auto_fix.guard_passed:
         lines.append("- ガード (R1〜R3): **pass**")
     else:
@@ -903,10 +900,7 @@ def _render_section_b_propose(
     lines.append(
         f"- {r5_label}: **{'pass' if auto_fix.r5_killed else 'fail'}**"
     )
-    lines.append(
-        f"- R4 (`pytest -q` 全件 green in clone): "
-        f"**{'pass' if auto_fix.r4_suite_passed else 'fail'}**"
-    )
+    lines.append(_r4_evidence_line(auto_fix, in_clone=True))
     if auto_fix.guard_passed:
         lines.append("- ガード (R1〜R3): **pass**")
     else:
@@ -997,6 +991,26 @@ def _compose_push_command(repo: Path | None) -> str:
             repo_str = str(repo)
         return f"git -C {repo_str} push origin main"
     return "git push origin main"
+
+
+def _r4_evidence_line(auto_fix: AutoFixOutcome, *, in_clone: bool) -> str:
+    """spec_043 §2-4 — the §B R4 evidence line with the dynamic count.
+
+    Renders ``- R4 (`pytest -q` 全件 green[, baseline 比較]): **pass** —
+    collected N, passed N, baseline N`` when the suite runner reported
+    counts (``auto_fix.r4_detail`` non-empty), falling back to the plain
+    ``**pass/fail**`` line otherwise so a fake-runner / no-baseline night
+    keeps the spec_023〜042 §B layout bit-for-bit. On a count-driven R4
+    fail, ``r4_detail`` carries the regression reason (実行テスト数が
+    baseline を下回った …) and is surfaced verbatim after the verdict."""
+
+    where = " in clone" if in_clone else ""
+    verdict = "pass" if auto_fix.r4_suite_passed else "fail"
+    base = f"- R4 (`pytest -q` 全件 green{where}): **{verdict}**"
+    detail = (auto_fix.r4_detail or "").strip()
+    if detail:
+        return f"{base} — {detail}"
+    return base
 
 
 def _format_fix_loop_summary(auto_fix: AutoFixOutcome) -> str:
@@ -1236,10 +1250,7 @@ def _render_one_candidate_subsection(
         lines.append(
             f"- {r5_label}: **{'pass' if outcome.r5_killed else 'fail'}**"
         )
-        lines.append(
-            f"- R4 (`pytest -q` 全件 green): "
-            f"**{'pass' if outcome.r4_suite_passed else 'fail'}**"
-        )
+        lines.append(_r4_evidence_line(outcome, in_clone=False))
         if outcome.guard_passed:
             lines.append("- ガード (R1〜R3): **pass**")
         else:

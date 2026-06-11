@@ -284,11 +284,41 @@ def _is_test_file(path: str) -> bool:
 # Patterns that indicate a test was muted. We match the prefix on a stripped
 # line so leading whitespace doesn't matter; and we look for both decorator
 # and runtime forms ("pytest.skip(...)").
+#
+# spec_043 §2-3 — IMPORTANT: this is the **secondary, best-effort 保険
+# layer**, NOT the主防御. String matching against a diff is an arms race
+# the guard loses on principle: it can only catch the muting *spellings*
+# it knows. RT-7 (import-alias muting — ``from pytest import mark`` →
+# ``@mark.skip``; ``from unittest import skip`` → ``@skip``) is a worked
+# example of a spelling this list deliberately does NOT chase, because the
+# 主防御 catches it for free: the dynamic R4 count gate in
+# :func:`ccd.nightly._r4_verdict` rejects any fix whose post-fix suite
+# runs *fewer* tests than the pre-fix baseline — skip, deselect,
+# collection-hook removal, and import-alias muting all collapse into the
+# same single observable fact ("実行数が減った") regardless of how the
+# muting was spelled. The patterns below exist only to fail *early and
+# cheaply* on the common, statically-obvious cases; never treat their
+# absence as proof a diff is safe.
+#
+# The spec_043 additions over the spec_022 decorator/runtime set:
+#   (a) ``pytestmark = …`` — the module-level assignment form
+#       (``pytestmark = pytest.mark.skip``) the decorator regex misses.
+#   (b) ``collect_ignore`` — a new ``tests/conftest.py`` excluding files
+#       from collection.
+#   (c) ``pytest_collection_modifyitems`` / ``pytest_ignore_collect`` —
+#       collection hooks that deselect / drop items before they run.
 _SKIP_MARKER_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"@\s*pytest\.mark\.(?:skip|skipif|xfail)\b"),
     re.compile(r"@\s*unittest\.skip\b"),
     re.compile(r"\bpytest\.skip\s*\("),
     re.compile(r"\bpytest\.xfail\s*\("),
+    # spec_043 §2-3 (a) — module-level ``pytestmark`` assignment.
+    re.compile(r"^\s*pytestmark\s*="),
+    # spec_043 §2-3 (b) — collection exclusion list (conftest).
+    re.compile(r"\bcollect_ignore\b"),
+    # spec_043 §2-3 (c) — collection hooks that deselect / drop items.
+    re.compile(r"\bpytest_collection_modifyitems\b"),
+    re.compile(r"\bpytest_ignore_collect\b"),
 )
 
 

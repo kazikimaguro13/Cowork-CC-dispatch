@@ -304,6 +304,68 @@ def test_r2_skip_marker_added_to_existing_halts() -> None:
     ), res.halt_reasons
 
 
+def _diff_new_test_file_with_body(file: str, body: str) -> str:
+    lines = body.split("\n")
+    added = "\n".join(f"+{ln}" for ln in lines)
+    return (
+        f"diff --git a/{file} b/{file}\n"
+        "new file mode 100644\n"
+        "index 0000000..8888888\n"
+        "--- /dev/null\n"
+        f"+++ b/{file}\n"
+        f"@@ -0,0 +1,{len(lines)} @@\n"
+        f"{added}\n"
+    )
+
+
+def test_r2_pytestmark_assignment_halts() -> None:
+    """spec_043 §2-3(a) — the module-level ``pytestmark = pytest.mark.skip``
+    assignment form (which the decorator regex misses) is caught by the
+    secondary 保険 layer."""
+
+    res = inspect_diff(
+        diff=_diff_new_test_file_with_body(
+            "tests/test_muted.py",
+            "import pytest\npytestmark = pytest.mark.skip\n\ndef test_x():\n    assert True",
+        ),
+        allowed_files=["tests/"],
+        template="A",
+    )
+    assert res.passed is False
+    assert any("R2" in r for r in res.halt_reasons), res.halt_reasons
+
+
+def test_r2_collect_ignore_in_conftest_halts() -> None:
+    """spec_043 §2-3(b) — a new ``tests/conftest.py`` with ``collect_ignore``
+    is caught by the static layer."""
+
+    res = inspect_diff(
+        diff=_diff_new_test_file_with_body(
+            "tests/conftest.py",
+            'collect_ignore = ["test_slow.py"]',
+        ),
+        allowed_files=["tests/"],
+        template="A",
+    )
+    assert res.passed is False
+    assert any("R2" in r for r in res.halt_reasons), res.halt_reasons
+
+
+def test_r2_collection_hook_halts() -> None:
+    """spec_043 §2-3(c) — a collection hook that deselects items is caught."""
+
+    res = inspect_diff(
+        diff=_diff_new_test_file_with_body(
+            "tests/conftest.py",
+            "def pytest_collection_modifyitems(config, items):\n    items[:] = []",
+        ),
+        allowed_files=["tests/"],
+        template="A",
+    )
+    assert res.passed is False
+    assert any("R2" in r for r in res.halt_reasons), res.halt_reasons
+
+
 def test_r2_xfail_marker_in_brand_new_test_still_halts() -> None:
     """Even in a brand-new test file, adding @xfail counts as muting and
     must halt — the cheat just hides as a "new" test that never enforces."""

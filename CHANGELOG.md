@@ -2,6 +2,35 @@
 
 本プロジェクトの注目すべき変更を記録する。フォーマットは [Keep a Changelog](https://keepachangelog.com/) に準ずる。
 
+## [0.26.0] — 2026-06-11
+
+### Changed (security-hardening)
+
+- spec_043: **guard 動的検証の強化 ── R4 を「green 判定」から「実行テスト数の
+  非減少」へ**。2026-06-10 のレッドチーム (Fable 5) が見つけたテスト無効化バイパス
+  RT-1 / RT-4 / RT-7 への一本化対策。根本原因は「**diff の文字列を見て skip を
+  探している**」こと ── 文字列マッチは追いかけっこで原理的に負ける。CCD の一貫
+  原則「**自己申告でなく事実を見る**」に立ち返り、R4 検証を「pytest が green か」
+  から「**修正前より実行 (pass) テスト数・収集テスト数が減っていないこと**」に
+  格上げした。skip も deselect も collection-hook も import エイリアスも、すべて
+  「**実行数が減った**」という 1 つの事実に集約され、文字列を一切見ずに捕まる。
+  - `SuiteOutcome` に `collected: int | None` / `passed_count: int | None` を追加。
+    `_default_suite_runner` は `pytest -q -p no:cacheprovider` の出力から
+    `collected N items` と `N passed` を寛容にパース (読めなければ `None`)。
+  - ワーカーの隔離クローン内で、**修正を当てる前に 1 回** suite を実行して
+    ベースライン `(collected_base, passed_base)` を測定。修正後の R4 で得た
+    `(collected_after, passed_after)` と比較し、`passed_after >= passed_base`
+    かつ `collected_after >= collected_base` を R4 合格条件に**加える** (従来の
+    「pytest exit 0」条件は維持)。ベースラインが既知件数を持つとき、修正後件数が
+    `None` (パース不能) なら保守的に R4 fail (偽陽性は許す・偽陰性は許さない)。
+  - guard の `_SKIP_MARKER_PATTERNS` に **保険として** (a) `pytestmark =`、
+    (b) `collect_ignore`、(c) `pytest_collection_modifyitems` /
+    `pytest_ignore_collect` を追加。これは多層防御の外側で、**主防御ではない**
+    ことを docstring に明記。import エイリアス (RT-7) は実行数ベースで捕まるので
+    正規表現での追跡はしない。
+  - 朝レポート §B の検証証拠に `R4: … — collected N, passed N, baseline N` を表示。
+    件数減少で halt した場合は理由に「実行テスト数が baseline を下回った」を明示。
+
 ## [0.25.0] — 2026-06-10
 
 ### Added
