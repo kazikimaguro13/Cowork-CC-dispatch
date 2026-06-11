@@ -596,6 +596,23 @@ class SafetyConfig(BaseModel):
     ``_ai_workspace/nightly/proposals/`` (same shape as propose-mode
     artifacts) and surfaced in the morning brief. Allowed range
     is ``1..10``.
+
+    ``r5_recheck_times`` (spec_045 §2-1; レッドチーム RT-3 対策) is how
+    many times the template-A R5 mutation recheck is repeated before the
+    candidate is accepted. DESIGN §9.5 ルール5 already demands "決定的・
+    N回" — this field wires that wording to behavior. Default ``1`` keeps
+    the spec_023〜044 single-recheck behavior bit-for-bit (one mutmut
+    re-run, current 外形). When ``>= 2`` the recheck is run N times and
+    R5 passes ONLY if **every** run reports ``killed``; a single
+    ``survived`` / ``error`` makes R5 fail as a non-deterministic signal
+    (a flaky / timing-dependent test that occasionally "kills" a mutant
+    is a false positive RT-3 wants to halt, not merge). The morning brief
+    surfaces ``killed (N/N 回安定)`` on a stable pass and ``R5 不安定:
+    killed N回中 M回のみ`` on an unstable fail. Allowed range is ``1..5``
+    — mutmut re-runs are expensive, so the cap matches the other
+    per-night N-knobs; enabling N>=2 is an operator decision worth taking
+    only once spec_046's lightweight mutation subset makes the cost
+    realistic.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -606,6 +623,7 @@ class SafetyConfig(BaseModel):
     loop_max_iterations: int = 1
     parallelism: int = 1
     max_merges_per_night: int = 3
+    r5_recheck_times: int = 1
 
     @field_validator("fix_mode")
     @classmethod
@@ -681,6 +699,24 @@ class SafetyConfig(BaseModel):
         if v < 1 or v > 10:
             raise ValueError(
                 f"max_merges_per_night must be in 1..10; got {v}"
+            )
+        return v
+
+    @field_validator("r5_recheck_times")
+    @classmethod
+    def _r5_recheck_times_in_range(cls, v: int) -> int:
+        # spec_045 — bound to 1..5. Below 1 makes no sense (a "0 recheck"
+        # R5 would never verify the mutation kill); above 5 multiplies the
+        # already-expensive mutmut re-run cost beyond the night's
+        # wall-clock budget. Out-of-range loud-fails at load time, matching
+        # the SafetyConfig流儀.
+        if not isinstance(v, int) or isinstance(v, bool):
+            raise ValueError(
+                f"r5_recheck_times must be an int; got {type(v).__name__}"
+            )
+        if v < 1 or v > 5:
+            raise ValueError(
+                f"r5_recheck_times must be in 1..5; got {v}"
             )
         return v
 
@@ -1012,6 +1048,9 @@ def render_profile(result: ProfileLoadResult) -> str:
     lines.append(f"parallelism = {p.safety.parallelism}")
     lines.append(
         f"max_merges_per_night = {p.safety.max_merges_per_night}"
+    )
+    lines.append(
+        f"r5_recheck_times = {p.safety.r5_recheck_times}"
     )
     return "\n".join(lines)
 

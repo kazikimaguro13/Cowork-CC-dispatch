@@ -995,13 +995,17 @@ def _autofix_profile(
     *,
     autonomous: bool,
     channels: list[str] | None = None,
+    r5_recheck_times: int = 1,
 ) -> Profile:
     return Profile(
         discovery=DiscoveryConfig(
             channels=channels if channels is not None else ["mutation"]
         ),
         schedule=ScheduleConfig(),
-        safety=SafetyConfig(fix_mode="auto" if autonomous else "off"),
+        safety=SafetyConfig(
+            fix_mode="auto" if autonomous else "off",
+            r5_recheck_times=r5_recheck_times,
+        ),
     )
 
 
@@ -5953,3 +5957,400 @@ def test_r4_verdict_catches_pytestmark_skip_via_counts_not_strings() -> None:
     passed, detail = _r4_verdict(after, baseline)
     assert passed is False
     assert "passed 4 < baseline 5" in detail
+
+
+# --------------------------------------------------------------------------- #
+# spec_045 — R5 N回決定性 (RT-3) + Integrator 検証済み-diff ハッシュ照合 (RT-5)
+# --------------------------------------------------------------------------- #
+
+
+@dataclass
+class _SeqMutationRechecker:
+    """spec_045 — returns a *sequence* of statuses across repeated calls.
+
+    Lets a test feed e.g. ``["killed", "killed", "survived"]`` so the R5
+    N-times determinism check (``safety.r5_recheck_times``) sees a
+    non-deterministic signal on the 3rd recheck.
+    """
+
+    statuses: list[str] = field(default_factory=list)
+    calls: list[tuple[str, int, str]] = field(default_factory=list)
+
+    def __call__(
+        self,
+        *,
+        repo: Path,
+        file: str,
+        line: int,
+        mutation: str,
+        signature: str,
+    ) -> str:
+        idx = len(self.calls)
+        self.calls.append((file, line, signature))
+        # Repeat the last status if asked more times than supplied (keeps
+        # the fake robust if a test under-specifies the sequence).
+        return self.statuses[min(idx, len(self.statuses) - 1)]
+
+
+@dataclass
+class _SplitDiffGitOps(_FakeGitOps):
+    """spec_045 — returns a *different* diff for the worker clone vs live.
+
+    The worker phase requests ``gops.diff(repo=<clone>)`` and the
+    Integrator requests ``gops.diff(repo=<live>)``. By keying on the repo
+    directory name (``_auto_clone`` is the test seam's clone root) this
+    fake lets a test simulate "the live apply produced a different diff
+    than the worker verified" — the case spec_045 §2-2's hash照合 drops.
+    """
+
+    clone_diff: str = ""
+    live_diff: str = ""
+
+    def diff(self, *, repo: Path, base: str, head: str) -> str:
+        self.diffs_requested.append((base, head))
+        if Path(repo).name == "_auto_clone":
+            return self.clone_diff
+        return self.live_diff
+
+
+# --- 受け入れ基準1: r5_recheck_times=3, killed/killed/survived → R5 fail --- #
+
+
+def test_r5_recheck_n_times_unstable_killed_then_survived_fails(
+    tmp_path: Path,
+) -> None:
+    """基準1 — ``r5_recheck_times=3`` で recheck が "killed, killed,
+    survived" を返すと R5 fail（非決定的シグナルとして halt、merge されない）。
+    """
+
+    _write_mutation_discover_json(repo=tmp_path)
+    dispatcher = _FakeFixDispatcher()
+    suite = _FakeSuiteRunner(outcome=SuiteOutcome(passed=True))
+    recheck = _SeqMutationRechecker(statuses=["killed", "killed", "survived"])
+    guard = _FakeGuardInspector()
+    gops = _FakeGitOps()
+    brief_runner, _ = _make_fake_brief_runner()
+
+    result = run_nightly(
+        repo=tmp_path,
+        profile=_autofix_profile(autonomous=True, r5_recheck_times=3),
+        channel_runner=_RecordingChannelRunner(),
+        brief_runner=brief_runner,
+        windows_mirror=lambda _p: None,
+        fix_dispatcher=dispatcher,
+        suite_runner=suite,
+        mutation_rechecker=recheck,
+        guard_inspector=guard,
+        git_ops=gops,
+        **_auto_fix_test_seams(tmp_path),
+    )
+
+    af = result.auto_fix
+    assert af is not None
+    assert af.r5_killed is False
+    assert af.merged is False
+    assert gops.merges == []
+    # Recheck was run exactly N=3 times (the non-determinism check),
+    # not once.
+    assert len(recheck.calls) == 3
+    # The morning-brief halt reason names the instability.
+    assert "R5 不安定: killed 3回中 2回のみ" in af.halt_reason
+    assert af.r5_detail == "R5 不安定: killed 3回中 2回のみ"
+
+
+# --- 受け入れ基準2: r5_recheck_times=3, killed×3 → R5 pass; default=1 互換 - #
+
+
+def test_r5_recheck_n_times_all_killed_passes_and_merges(
+    tmp_path: Path,
+) -> None:
+    """基準2 — ``r5_recheck_times=3`` で "killed×3" なら R5 pass（安定）→
+    残りのゲートが緑なら従来どおり merge。stability 文言も surfaced される。
+    """
+
+    _write_mutation_discover_json(repo=tmp_path)
+    dispatcher = _FakeFixDispatcher(
+        outcome=FixDispatchOutcome(status="done", commits_made=1)
+    )
+    suite = _FakeSuiteRunner(outcome=SuiteOutcome(passed=True))
+    recheck = _SeqMutationRechecker(statuses=["killed", "killed", "killed"])
+    guard = _FakeGuardInspector(
+        result=GuardResult(
+            passed=True,
+            halt_reasons=(),
+            files_touched=("tests/x.py",),
+            template="A",
+        )
+    )
+    gops = _FakeGitOps(canned_diff="diff --git a/tests/x.py b/tests/x.py\n")
+    brief_runner, _ = _make_fake_brief_runner()
+
+    result = run_nightly(
+        repo=tmp_path,
+        profile=_autofix_profile(autonomous=True, r5_recheck_times=3),
+        channel_runner=_RecordingChannelRunner(),
+        brief_runner=brief_runner,
+        windows_mirror=lambda _p: None,
+        fix_dispatcher=dispatcher,
+        suite_runner=suite,
+        mutation_rechecker=recheck,
+        guard_inspector=guard,
+        git_ops=gops,
+        today=date(2026, 5, 25),
+        **_auto_fix_test_seams(tmp_path),
+    )
+
+    af = result.auto_fix
+    assert af is not None
+    assert af.r5_killed is True
+    assert af.merged is True
+    assert gops.merges == [af.branch]
+    # N=3 rechecks in the worker; the Integrator does NOT re-run R5
+    # (spec §2-3), so exactly 3 calls total.
+    assert len(recheck.calls) == 3
+    assert af.r5_detail == "killed (3/3 回安定)"
+
+
+def test_r5_recheck_default_one_is_behavior_compatible(tmp_path: Path) -> None:
+    """基準2(後半) — 既定 ``r5_recheck_times=1`` では recheck は1回だけ、
+    stability 文言は空（spec_023〜044 外形 bit-for-bit）。"""
+
+    _write_mutation_discover_json(repo=tmp_path)
+    dispatcher = _FakeFixDispatcher(
+        outcome=FixDispatchOutcome(status="done", commits_made=1)
+    )
+    suite = _FakeSuiteRunner(outcome=SuiteOutcome(passed=True))
+    recheck = _FakeMutationRechecker(status="killed")
+    guard = _FakeGuardInspector(
+        result=GuardResult(
+            passed=True,
+            halt_reasons=(),
+            files_touched=("tests/x.py",),
+            template="A",
+        )
+    )
+    gops = _FakeGitOps(canned_diff="diff --git a/tests/x.py b/tests/x.py\n")
+    brief_runner, _ = _make_fake_brief_runner()
+
+    result = run_nightly(
+        repo=tmp_path,
+        profile=_autofix_profile(autonomous=True),  # default r5_recheck_times=1
+        channel_runner=_RecordingChannelRunner(),
+        brief_runner=brief_runner,
+        windows_mirror=lambda _p: None,
+        fix_dispatcher=dispatcher,
+        suite_runner=suite,
+        mutation_rechecker=recheck,
+        guard_inspector=guard,
+        git_ops=gops,
+        today=date(2026, 5, 25),
+        **_auto_fix_test_seams(tmp_path),
+    )
+
+    af = result.auto_fix
+    assert af is not None
+    assert af.merged is True
+    # Exactly one recheck — no N-times multiplication at the default.
+    assert len(recheck.calls) == 1
+    # No stability detail at the default → §B layout unchanged.
+    assert af.r5_detail == ""
+
+
+# --- 受け入れ基準3: Integrator hash 不一致 → drop + 復元 + report 1行 ------ #
+
+
+def test_integrator_diff_hash_mismatch_drops_and_restores(
+    tmp_path: Path,
+) -> None:
+    """基準3 — worker の検証済み diff とライブ適用結果の diff がハッシュ
+    不一致なら drop（merge されない）+ live 復元 + 朝レポート halt 1行。"""
+
+    from ccd.nightly import _HALT_INTEGRATOR_DIFF_MISMATCH
+
+    _write_mutation_discover_json(repo=tmp_path)
+    dispatcher = _FakeFixDispatcher(
+        outcome=FixDispatchOutcome(status="done", commits_made=1)
+    )
+    suite = _FakeSuiteRunner(outcome=SuiteOutcome(passed=True))
+    recheck = _FakeMutationRechecker(status="killed")
+    guard = _FakeGuardInspector(
+        result=GuardResult(
+            passed=True,
+            halt_reasons=(),
+            files_touched=("tests/x.py",),
+            template="A",
+        )
+    )
+    # Worker verified one diff; live apply produced a DIFFERENT body line.
+    gops = _SplitDiffGitOps(
+        clone_diff=(
+            "diff --git a/tests/x.py b/tests/x.py\n@@ -1 +1 @@\n+assert ok\n"
+        ),
+        live_diff=(
+            "diff --git a/tests/x.py b/tests/x.py\n@@ -1 +1 @@\n+assert EVIL\n"
+        ),
+    )
+    brief_runner, _ = _make_fake_brief_runner()
+
+    result = run_nightly(
+        repo=tmp_path,
+        profile=_autofix_profile(autonomous=True),
+        channel_runner=_RecordingChannelRunner(),
+        brief_runner=brief_runner,
+        windows_mirror=lambda _p: None,
+        fix_dispatcher=dispatcher,
+        suite_runner=suite,
+        mutation_rechecker=recheck,
+        guard_inspector=guard,
+        git_ops=gops,
+        today=date(2026, 5, 25),
+        **_auto_fix_test_seams(tmp_path),
+    )
+
+    af = result.auto_fix
+    assert af is not None
+    assert af.merged is False
+    assert gops.merges == []
+    assert _HALT_INTEGRATOR_DIFF_MISMATCH in af.halt_reason
+    # Live was restored after the drop (discard fired on the live repo).
+    assert tmp_path.resolve() in [Path(p).resolve() for p in gops.discards]
+
+
+def test_integrator_diff_hash_match_merges_despite_index_and_newline(
+    tmp_path: Path,
+) -> None:
+    """基準4/5 — worker diff とライブ diff が ``index`` 行・末尾改行だけ
+    違う（本文は同一）なら正規化ハッシュは一致し、従来どおり merge される。"""
+
+    _write_mutation_discover_json(repo=tmp_path)
+    dispatcher = _FakeFixDispatcher(
+        outcome=FixDispatchOutcome(status="done", commits_made=1)
+    )
+    suite = _FakeSuiteRunner(outcome=SuiteOutcome(passed=True))
+    recheck = _FakeMutationRechecker(status="killed")
+    guard = _FakeGuardInspector(
+        result=GuardResult(
+            passed=True,
+            halt_reasons=(),
+            files_touched=("tests/x.py",),
+            template="A",
+        )
+    )
+    gops = _SplitDiffGitOps(
+        clone_diff=(
+            "diff --git a/tests/x.py b/tests/x.py\n"
+            "index 1111111..2222222 100644\n"
+            "@@ -1 +1 @@\n+assert ok\n"
+        ),
+        # Same body; different blob ids in the index line + no trailing
+        # newline. Normalization absorbs both → hashes match.
+        live_diff=(
+            "diff --git a/tests/x.py b/tests/x.py\n"
+            "index 9999999..8888888 100644\n"
+            "@@ -1 +1 @@\n+assert ok"
+        ),
+    )
+    brief_runner, _ = _make_fake_brief_runner()
+
+    result = run_nightly(
+        repo=tmp_path,
+        profile=_autofix_profile(autonomous=True),
+        channel_runner=_RecordingChannelRunner(),
+        brief_runner=brief_runner,
+        windows_mirror=lambda _p: None,
+        fix_dispatcher=dispatcher,
+        suite_runner=suite,
+        mutation_rechecker=recheck,
+        guard_inspector=guard,
+        git_ops=gops,
+        today=date(2026, 5, 25),
+        **_auto_fix_test_seams(tmp_path),
+    )
+
+    af = result.auto_fix
+    assert af is not None
+    assert af.merged is True
+    assert gops.merges == [af.branch]
+
+
+# --- 受け入れ基準5: 正規化のユニット仕様 ----------------------------------- #
+
+
+def test_normalize_diff_absorbs_index_and_trailing_newline() -> None:
+    """基準5 — ``index`` 行と末尾改行の無意味差をハッシュが吸収する。"""
+
+    from ccd.nightly import _diff_content_hash
+
+    a = (
+        "diff --git a/f b/f\n"
+        "index 111aaaa..222bbbb 100644\n"
+        "--- a/f\n+++ b/f\n@@ -1 +1 @@\n-old\n+new\n\n"
+    )
+    b = (
+        "diff --git a/f b/f\n"
+        "index 333cccc..444dddd 100644\n"
+        "--- a/f\n+++ b/f\n@@ -1 +1 @@\n-old\n+new"
+    )
+    assert _diff_content_hash(a) == _diff_content_hash(b)
+
+
+def test_normalize_diff_detects_one_char_body_change() -> None:
+    """基準5 — 本文1文字差はハッシュが検出する（吸収しない）。"""
+
+    from ccd.nightly import _diff_content_hash
+
+    a = "diff --git a/f b/f\n@@ -1 +1 @@\n-old\n+new\n"
+    b = "diff --git a/f b/f\n@@ -1 +1 @@\n-old\n+neW\n"
+    assert _diff_content_hash(a) != _diff_content_hash(b)
+
+
+def test_verify_r5_unit_n_times_all_killed_vs_one_flaky() -> None:
+    """``_verify_r5`` 単体 — 全回 killed なら pass+安定文言、1回でも
+    survived が混ざれば fail+不安定文言。"""
+
+    from ccd.nightly import _verify_r5
+    from ccd.translate import Finding
+
+    finding = Finding(
+        channel="mutation",
+        file="ccd/protocol.py",
+        line=46,
+        mutation="x == y → x != y",
+        status="survived",
+        signature="sig",
+        source_report=None,
+    )
+
+    def _seq(values: list[str]) -> Callable[..., str]:
+        box = {"i": 0}
+
+        def _call(**_kw: Any) -> str:
+            v = values[box["i"]]
+            box["i"] += 1
+            return v
+
+        return _call
+
+    passed, status, detail = _verify_r5(
+        template="A",
+        finding=finding,
+        recheck_mutation=_seq(["killed", "killed", "killed"]),
+        recheck_adversarial=lambda **_k: "graceful_error",
+        repo=Path("."),
+        recheck_times=3,
+    )
+    assert passed is True
+    assert status == "killed"
+    assert detail == "killed (3/3 回安定)"
+
+    passed, status, detail = _verify_r5(
+        template="A",
+        finding=finding,
+        recheck_mutation=_seq(["killed", "survived", "killed"]),
+        recheck_adversarial=lambda **_k: "graceful_error",
+        repo=Path("."),
+        recheck_times=3,
+    )
+    assert passed is False
+    assert status == "survived"
+    assert detail == "R5 不安定: killed 3回中 2回のみ"
