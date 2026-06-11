@@ -14,7 +14,7 @@ def test_version_string_is_semver_like() -> None:
 
 
 def test_version_is_0270() -> None:
-    assert ccd.__version__ == "0.29.0"
+    assert ccd.__version__ == "0.30.0"
 
 
 def test_parser_version_flag_exits_zero(capsys) -> None:

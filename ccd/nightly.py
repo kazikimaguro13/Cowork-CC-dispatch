@@ -465,6 +465,15 @@ class AutoFixOutcome:
     worker_id: str = ""
     worker_started_at: str = ""
     worker_finished_at: str = ""
+    # spec_047 §2-1 — when this candidate HALTed, the live directory the
+    # diagnostic artifacts (diff / smoke tail / feedback / result /
+    # classification) were copied out of the disposable clone into, so the
+    # morning brief's §D can link to it. ``None`` for merged / skipped /
+    # gate-off outcomes (artifacts are persisted on failure only — §4).
+    halt_artifacts_dir: Path | None = None
+    # spec_047 §2-2 — ids of older inbox specs retired to bridge/archive/
+    # because this candidate's translate reused their source signature.
+    superseded_ids: tuple[str, ...] = ()
 
 
 @dataclass
@@ -544,6 +553,11 @@ def run_nightly(
     fix_dispatcher: FixDispatcher | None = None,
     suite_runner: SuiteRunner | None = None,
     mutation_rechecker: MutationRechecker | None = None,
+    # spec_047 §2-3 — same-night staleness recheck seam (K≥2). ``None``
+    # keeps the production default (built inside the auto loop) and the
+    # K=1 no-op; tests inject a fake to exercise "a prior merge killed a
+    # later candidate's target".
+    staleness_rechecker: MutationRechecker | None = None,
     # spec_024 — template B R5 seam
     adversarial_rechecker: AdversarialRechecker | None = None,
     guard_inspector: GuardInspector | None = None,
@@ -572,6 +586,14 @@ def run_nightly(
     # point passes a per-policy directory so client repos never see a
     # write (mirrors the proposal_dir invariant).
     record_dir: Path | None = None,
+    # spec_047 §2-1 — per-policy HALT artifact directory. ``None`` keeps the
+    # default ``<repo>/_ai_workspace/nightly/halts/``. The sweep passes a
+    # per-policy ``nightly/<name>/halts`` so client repos never see a write
+    # (mirrors ``proposal_dir`` / ``record_dir``).
+    halts_dir: Path | None = None,
+    # spec_047 §2-4 — the policy name (TOML stem) for dispatch breadcrumbs /
+    # observability. Empty in legacy single-policy operation.
+    policy: str = "",
     # spec_030 — profile-driven adversarial parser injection +
     # synthetic channel-skip surfacing. ``adversarial_parsers`` is a
     # tuple of resolved adversarial parsers (see
@@ -697,6 +719,16 @@ def run_nightly(
     # introspecting individual outcomes.
     achieved_concurrency = 1
     night_drop_reasons: tuple[str, ...] = ()
+    # spec_047 — resolve the night id + HALT artifact directory once so both
+    # the auto and propose loops persist diagnostics to the same place the
+    # snapshot below reads. ``halts_dir`` mirrors the proposal/record
+    # per-policy redirection (sweep passes ``nightly/<name>/halts``).
+    night_id_str = (today if today is not None else _utc_today()).isoformat()
+    resolved_halts_dir = (
+        Path(halts_dir).resolve()
+        if halts_dir is not None
+        else repo / _NIGHTLY_HALTS_DIR_REL
+    )
     if fix_mode == "auto":
         (
             auto_fix,
@@ -737,6 +769,10 @@ def run_nightly(
             max_merges_per_night=max_merges_n,
             r5_recheck_times=r5_recheck_n,
             proposal_dir=proposal_dir,
+            policy=policy,
+            night_id=night_id_str,
+            halts_dir=resolved_halts_dir,
+            staleness_rechecker=staleness_rechecker,
         )
     elif fix_mode == "propose":
         auto_fix, auto_fix_extras = _run_propose_loop(
@@ -769,6 +805,9 @@ def run_nightly(
             max_candidates=max_k,
             loop_max_iterations=loop_max_iters,
             r5_recheck_times=r5_recheck_n,
+            policy=policy,
+            night_id=night_id_str,
+            halts_dir=resolved_halts_dir,
         )
 
     brief_result = run_brief_fn(
@@ -820,7 +859,6 @@ def run_nightly(
         if record_dir is not None
         else repo / _NIGHTLY_RECORDS_DIR_REL
     )
-    night_id_str = (today if today is not None else _utc_today()).isoformat()
     try:
         save_night_snapshot(
             nightly_result,
@@ -1025,6 +1063,23 @@ _HALT_REMAINING_SKIPPED_PREFIX = "remaining candidate(s) skipped"
 # rollup skip with one of these prefixes in `skip_reason`.
 _HALT_MAX_MERGES_REACHED_PREFIX = "max merges per night cap reached"
 _HALT_NIGHT_WALL_CLOCK_PREFIX = "night wall-clock budget exhausted"
+# spec_047 §2-3 — a K≥2 candidate whose target mutant a prior same-night
+# merge already killed (re-checked against live HEAD before dispatch). The
+# candidate is skipped WITHOUT a dispatch and WITHOUT consuming a merge
+# slot; the morning brief's §D pins this prefix.
+_HALT_STALE_CANDIDATE_PREFIX = "stale candidate skipped"
+
+# spec_047 §2-1 — where HALT diagnostics are persisted before the worker's
+# disposable clone is rmtree-d. One sub-directory per halting candidate
+# (``halts/<night_id>_<spec_id>/``) co-located with the per-night report so
+# §D can link to it relatively. Per-policy sweeps redirect via ``halts_dir``
+# (mirrors ``proposal_dir`` / ``record_dir``).
+_NIGHTLY_HALTS_DIR_REL: Path = Path("_ai_workspace") / "nightly" / "halts"
+
+# spec_047 §2-1 — per-halt artifact size ceiling. The captured diff +
+# suite/smoke tails + feedback/result files are individually tail-capped to
+# this so a runaway log cannot blow up the live ``_ai_workspace``.
+_HALT_ARTIFACT_MAX_BYTES: int = 1_000_000
 # spec_041 — anchor for the AutoFixOutcome a worker emits when its
 # spawn / dispatch raised an unhandled exception inside the
 # ThreadPoolExecutor. Captures the original exception so the morning
@@ -1096,6 +1151,10 @@ def _run_auto_fix_loop(
     r5_recheck_times: int = 1,
     night_wall_clock_budget_s: float | None = None,
     proposal_dir: Path | None = None,
+    policy: str = "",
+    night_id: str = "",
+    halts_dir: Path | None = None,
+    staleness_rechecker: MutationRechecker | None = None,
 ) -> tuple[
     AutoFixOutcome,
     tuple[AutoFixOutcome, ...],
@@ -1229,6 +1288,24 @@ def _run_auto_fix_loop(
     applier = (
         apply_patch if apply_patch is not None else _default_patch_applier
     )
+    merges_cap = max(1, int(max_merges_per_night or 1))
+    # spec_047 §2-3 — resolve the same-night staleness rechecker. It is a
+    # SEPARATE seam from the R5 recheck so a test that injects an R5 fake
+    # (returning ``killed`` for a fix-applied clone) does not accidentally
+    # trip the staleness skip (which queries un-fixed live HEAD). Explicit
+    # injection wins; otherwise it is only active in production (no R5 fake
+    # injected) on a K≥2 profile, where it reuses the real mutation recheck
+    # against live HEAD. At K=1 it stays ``None`` → no recheck, behaviour
+    # unchanged.
+    resolved_staleness_rechecker = (
+        staleness_rechecker
+        if staleness_rechecker is not None
+        else (
+            recheck_mutation
+            if (mutation_rechecker is None and merges_cap >= 2)
+            else None
+        )
+    )
 
     # spec_041 §2-2 — pre-translate ALL candidates serially BEFORE
     # workers are spawned. spec_auto IDs come from a monotonic counter
@@ -1282,10 +1359,14 @@ def _run_auto_fix_loop(
         loop_max_iterations=loop_max_iterations,
         r5_recheck_times=r5_recheck_times,
         parallelism=p_clamped,
-        max_merges_per_night=max(1, int(max_merges_per_night or 1)),
+        max_merges_per_night=merges_cap,
         night_wall_clock_budget_s=night_wall_clock_budget_s,
         proposal_dir=proposal_dir,
         backlog_skip_reason=_backlog_skip_reason,
+        policy=policy,
+        night_id=night_id,
+        halts_dir=halts_dir,
+        staleness_rechecker=resolved_staleness_rechecker,
     )
 
 
@@ -1328,6 +1409,9 @@ class _WorkerPhaseResult:
     worker_verification: IterationVerification | None
     fl: FixLoopOutcome | None
     halt_outcome: AutoFixOutcome | None
+    # spec_047 §2-2 — superseded inbox spec ids from this candidate's
+    # translate, threaded onto whatever final outcome the Integrator builds.
+    superseded_ids: tuple[str, ...] = ()
 
 
 def _now_iso_utc() -> str:
@@ -1368,6 +1452,277 @@ def _stamp_worker(
     )
 
 
+# --------------------------------------------------------------------------- #
+# spec_047 §2-1 — HALT artifact persistence (carried out of the clone)
+# --------------------------------------------------------------------------- #
+
+
+def _git_capture(repo: Path, args: list[str]) -> str:
+    """Run ``git -C repo <args>`` and return stdout (``""`` on any error).
+
+    Best-effort and never raises: the clone may not be a git repo (fake
+    workspace in tests) or the named ref may not exist — either way the
+    artifact capture degrades to "what we could read" rather than aborting
+    the halt path."""
+
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(repo), *args],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except (OSError, ValueError):
+        return ""
+    return completed.stdout or ""
+
+
+def _capture_clone_diff(clone_path: Path) -> str:
+    """Reconstruct "what CC produced" inside a halting clone.
+
+    Combines the uncommitted working-tree diff with the per-commit diff of
+    the candidate branch against the base (``main``/``master``); falls back
+    to the last few commits when neither base ref exists. Used for HALT
+    paths where no verified :class:`IterationVerification` diff is available
+    (e.g. ``smoke_failed`` — dispatch never reached verification)."""
+
+    sections: list[str] = []
+    working_tree = _git_capture(clone_path, ["diff"])
+    if working_tree.strip():
+        sections.append("# === uncommitted (working tree) ===\n" + working_tree)
+    committed = ""
+    for base in ("main", "master"):
+        committed = _git_capture(clone_path, ["log", "-p", f"{base}..HEAD"])
+        if committed.strip():
+            sections.append(
+                f"# === commits on candidate branch vs {base} ===\n" + committed
+            )
+            break
+    if not committed.strip():
+        recent = _git_capture(clone_path, ["log", "-p", "-n", "5"])
+        if recent.strip():
+            sections.append("# === recent commits ===\n" + recent)
+    return "\n\n".join(sections)
+
+
+def _tail_bytes(text: str, max_bytes: int) -> str:
+    """Return ``text`` capped to ``max_bytes`` UTF-8 bytes, keeping the TAIL.
+
+    Failures usually announce themselves at the END of a log (the traceback,
+    the failing assertion), so when we must truncate we keep the tail and
+    prepend a one-line marker noting how much was dropped (spec_047 §2-1)."""
+
+    raw = text.encode("utf-8", errors="replace")
+    if len(raw) <= max_bytes:
+        return text
+    kept = raw[-max_bytes:].decode("utf-8", errors="replace")
+    dropped = len(raw) - max_bytes
+    return f"…[{dropped} bytes truncated; tail kept]…\n{kept}"
+
+
+def _classify_halt(halt_reason: str) -> str:
+    """Map a free-text halt reason to a stable machine category (spec_047
+    §2-1). The category is what an operator greps the morning after; the
+    full reason is preserved verbatim alongside it."""
+
+    r = halt_reason or ""
+    table = (
+        ("smoke_failed", "smoke_failed"),
+        (_HALT_DISPATCH_TIMEOUT, "timeout"),
+        ("timed out", "timeout"),
+        (_HALT_INTEGRATOR_DIFF_MISMATCH, "integrator_diff_mismatch"),
+        (_HALT_INTEGRATOR_PREFIX, "integrator"),
+        (_HALT_GUARD_HALT, "guard_halt"),
+        ("guard", "guard_halt"),
+        (_HALT_R5_FAILED, "r5_failed"),
+        ("R5 failed", "r5_failed"),
+        ("R5 不安定", "r5_unstable"),
+        (_HALT_R4_FAILED, "r4_failed"),
+        ("R4 failed", "r4_failed"),
+        (_HALT_WORKER_CRASHED_PREFIX, "worker_crashed"),
+        ("agent_misread", "agent_misread"),
+        ("environment", "environment"),
+        ("merge_conflict", "merge_conflict"),
+        (_HALT_DISPATCH_FAILED, "dispatch_failed"),
+    )
+    for needle, category in table:
+        if needle and needle in r:
+            return category
+    return "other"
+
+
+def _persist_halt_artifacts(
+    *,
+    halts_dir: Path | None,
+    night_id: str,
+    spec_id: str,
+    clone_path: Path,
+    branch: str,
+    halt_reason: str,
+    phase: str,
+    fl: FixLoopOutcome | None = None,
+    max_bytes: int = _HALT_ARTIFACT_MAX_BYTES,
+) -> Path | None:
+    """spec_047 §2-1 — copy a halting candidate's diagnostics out of the
+    disposable clone BEFORE it is rmtree-d, into
+    ``<halts_dir>/<night_id>_<spec_id>/`` on the live side.
+
+    Persists (each tail-capped to ``max_bytes``):
+
+    - ``halt.md`` — machine category + phase + verbatim reason + branch.
+    - ``diff.patch`` — the verified-iteration diff when present, else a
+      reconstruction of CC's working-tree + branch commits from the clone.
+    - ``suite_output.txt`` — the R4/smoke stdout+stderr tail when a
+      verification ran.
+    - ``feedback/`` + ``outbox/`` — the per-iteration feedback files and any
+      result file CC wrote inside the clone's ``_ai_workspace``.
+
+    Best-effort: returns the destination on success, ``None`` when disabled
+    (``halts_dir is None``) or when the whole capture failed. Never raises —
+    a diagnostics-capture error must not change the halt verdict itself."""
+
+    if halts_dir is None:
+        return None
+    try:
+        dest = Path(halts_dir) / f"{night_id}_{spec_id}"
+        dest.mkdir(parents=True, exist_ok=True)
+
+        category = _classify_halt(halt_reason)
+        (dest / "halt.md").write_text(
+            "\n".join(
+                [
+                    f"# HALT {spec_id} ({night_id})",
+                    "",
+                    f"- **category**: `{category}`",
+                    f"- **phase**: `{phase}`",
+                    f"- **branch**: `{branch}`",
+                    f"- **reason**: {halt_reason or '(none recorded)'}",
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        diff_text = ""
+        if fl is not None and fl.final_verification is not None:
+            diff_text = fl.final_verification.diff or ""
+        if not diff_text.strip():
+            diff_text = _capture_clone_diff(clone_path)
+        if diff_text.strip():
+            (dest / "diff.patch").write_text(
+                _tail_bytes(diff_text, max_bytes), encoding="utf-8"
+            )
+
+        if fl is not None and fl.final_verification is not None:
+            suite_out = fl.final_verification.suite_output or ""
+            if suite_out.strip():
+                (dest / "suite_output.txt").write_text(
+                    _tail_bytes(suite_out, max_bytes), encoding="utf-8"
+                )
+
+        _copy_clone_dir(
+            src=clone_path / "_ai_workspace" / "logs",
+            dest=dest / "feedback",
+            max_bytes=max_bytes,
+        )
+        _copy_clone_dir(
+            src=clone_path / "_ai_workspace" / "bridge" / "outbox",
+            dest=dest / "outbox",
+            max_bytes=max_bytes,
+        )
+        return dest
+    except Exception:
+        # Diagnostics are a best-effort add-on; never let them perturb the
+        # halt path itself (spec_047 §4 — the verdict is unchanged).
+        return None
+
+
+def _copy_clone_dir(*, src: Path, dest: Path, max_bytes: int) -> None:
+    """Copy the (small) text files of a clone sub-directory into the halt
+    artifact dir, tail-capping each. Best-effort; missing src is a no-op."""
+
+    try:
+        if not src.is_dir():
+            return
+        for f in sorted(src.iterdir()):
+            if not f.is_file():
+                continue
+            try:
+                text = f.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            dest.mkdir(parents=True, exist_ok=True)
+            (dest / f.name).write_text(
+                _tail_bytes(text, max_bytes), encoding="utf-8"
+            )
+    except OSError:
+        return
+
+
+def _log_dispatch_start(
+    *,
+    live_repo: Path,
+    policy: str,
+    night_id: str,
+    spec_id: str,
+    spec_auto_path: Path | None,
+    branch: str,
+) -> None:
+    """spec_047 §2-4 — write a per-dispatch breadcrumb to the LIVE
+    ``_ai_workspace/logs/`` so a process list / log tail unambiguously
+    identifies "which policy's which spec" (the §1-3 observability gap:
+    spec_auto_NNN numbering is per-policy, so the number alone is
+    ambiguous). One file per candidate keeps concurrent workers from racing
+    on a shared handle. Best-effort — never raises."""
+
+    try:
+        logs_dir = Path(live_repo) / "_ai_workspace" / "logs"
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        abs_spec = (
+            str(Path(spec_auto_path).resolve())
+            if spec_auto_path is not None
+            else "(unknown)"
+        )
+        (logs_dir / f"dispatch_{night_id}_{spec_id}.log").write_text(
+            "\n".join(
+                [
+                    f"policy: {policy or '(unnamed)'}",
+                    f"night_id: {night_id}",
+                    f"spec_id: {spec_id}",
+                    f"spec_path: {abs_spec}",
+                    f"branch: {branch}",
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+    except OSError:
+        return
+
+
+def _archive_inbox_spec(
+    *, live_repo: Path, spec_auto_path: Path | None
+) -> Path | None:
+    """spec_047 §2-2 — move a merged candidate's inbox spec to
+    ``bridge/archive/``. inbox should hold only pending-dispatch specs; once
+    the Integrator has merged the fix, its spec is bookkeeping, not in
+    flight. Best-effort; returns the archive path or ``None``."""
+
+    if spec_auto_path is None:
+        return None
+    try:
+        src = Path(spec_auto_path)
+        if not src.is_file():
+            return None
+        archive_dir = Path(live_repo) / "_ai_workspace" / "bridge" / "archive"
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        target = archive_dir / src.name
+        src.replace(target)
+        return target
+    except OSError:
+        return None
+
+
 def _run_worker_phase(
     *,
     worker_id: str,
@@ -1387,6 +1742,9 @@ def _run_worker_phase(
     dispatch_timeout_s: float,
     loop_max_iterations: int,
     r5_recheck_times: int = 1,
+    policy: str = "",
+    night_id: str = "",
+    halts_dir: Path | None = None,
 ) -> _WorkerPhaseResult:
     """spec_041 §2-2 — execute one candidate's worker phase inside a
     disposable clone.
@@ -1451,8 +1809,36 @@ def _run_worker_phase(
 
     def _wrap_halt(
         outcome: AutoFixOutcome,
+        *,
+        clone_path: Path | None = None,
+        fl: FixLoopOutcome | None = None,
+        phase: str = "",
     ) -> _WorkerPhaseResult:
+        from dataclasses import replace
+
         finished_at = _finish()
+        # spec_047 §2-1/§2-2 — persist diagnostics out of the clone (when
+        # one exists) and fold in the supersede bookkeeping. Persistence is
+        # failure-only; merged/skip paths never reach here.
+        artifacts_dir = (
+            _persist_halt_artifacts(
+                halts_dir=halts_dir,
+                night_id=night_id,
+                spec_id=tr.spec_auto_id,
+                clone_path=clone_path,
+                branch=branch,
+                halt_reason=outcome.halt_reason,
+                phase=phase,
+                fl=fl,
+            )
+            if clone_path is not None
+            else None
+        )
+        outcome = replace(
+            outcome,
+            halt_artifacts_dir=artifacts_dir,
+            superseded_ids=tr.superseded_ids,
+        )
         return _WorkerPhaseResult(
             worker_id=worker_id,
             template=template,
@@ -1474,6 +1860,7 @@ def _run_worker_phase(
                 started_at=started_at,
                 finished_at=finished_at,
             ),
+            superseded_ids=tr.superseded_ids,
         )
 
     try:
@@ -1503,8 +1890,21 @@ def _run_worker_phase(
                             "worker: branch creation failed in clone: "
                             f"{type(exc).__name__}: {exc}"
                         ),
-                    )
+                    ),
+                    clone_path=clone_path,
+                    phase="setup",
                 )
+
+            # spec_047 §2-4 — breadcrumb the dispatch on the LIVE side so a
+            # process list / log tail names the policy + absolute spec path.
+            _log_dispatch_start(
+                live_repo=repo,
+                policy=policy,
+                night_id=night_id,
+                spec_id=tr.spec_auto_id,
+                spec_auto_path=tr.spec_auto_path,
+                branch=branch,
+            )
 
             # spec_043 §2-2 — measure the R4 baseline on the *unmodified*
             # clone, BEFORE the fix is dispatched. The feat branch is at
@@ -1568,7 +1968,9 @@ def _run_worker_phase(
                         iterations=0,
                         converged=False,
                         loop_halt_reason=LOOP_HALT_IMMEDIATE,
-                    )
+                    ),
+                    clone_path=clone_path,
+                    phase="dispatch",
                 )
 
             verif = fl.final_verification
@@ -1596,7 +1998,10 @@ def _run_worker_phase(
                         iterations=fl.iterations,
                         converged=False,
                         loop_halt_reason=fl.halt_reason,
-                    )
+                    ),
+                    clone_path=clone_path,
+                    fl=fl,
+                    phase="dispatch",
                 )
 
             # Worker HALT B: ran out of iterations without converging.
@@ -1648,7 +2053,10 @@ def _run_worker_phase(
                         iterations=fl.iterations,
                         converged=False,
                         loop_halt_reason=fl.halt_reason,
-                    )
+                    ),
+                    clone_path=clone_path,
+                    fl=fl,
+                    phase="verify",
                 )
 
             # Worker phase converged: snapshot the verified state.
@@ -1689,6 +2097,7 @@ def _run_worker_phase(
         worker_verification=verified_verification,
         fl=verified_fl,
         halt_outcome=None,
+        superseded_ids=tr.superseded_ids,
     )
 
 
@@ -1715,6 +2124,10 @@ def _drain_worker_pool(
     night_wall_clock_budget_s: float | None,
     proposal_dir: Path | None,
     backlog_skip_reason: Callable[[], str],
+    policy: str = "",
+    night_id: str = "",
+    halts_dir: Path | None = None,
+    staleness_rechecker: MutationRechecker | None = None,
 ) -> tuple[
     AutoFixOutcome,
     tuple[AutoFixOutcome, ...],
@@ -1788,40 +2201,99 @@ def _drain_worker_pool(
         max_workers=parallelism, thread_name_prefix="ccd-worker"
     )
 
+    def _stale_skip_reason(*, template: str, finding: Finding) -> str:
+        """spec_047 §2-3 — return a non-empty skip reason iff this K≥2
+        candidate's target mutant is already dead at live HEAD.
+
+        Engaged only once a prior merge has landed this night
+        (``merges_done >= 1``) AND a ``staleness_rechecker`` is wired. The
+        rechecker is resolved by ``_run_auto_fix_loop``: it is the real
+        mutation recheck in production (nothing injected) when
+        ``max_merges_per_night >= 2``, and ``None`` at K=1 (current
+        operation) — so this is a no-op and the spec_023〜046 behaviour is
+        bit-for-bit unchanged. It is a SEPARATE seam from the R5 recheck on
+        purpose: R5 runs in the fix-applied clone (expects ``killed``),
+        staleness runs on un-fixed live HEAD (expects ``survived`` for a
+        still-actionable candidate).
+
+        Mutation (template A) only; keyed by the mutant signature. A
+        definite ``"killed"`` means an earlier merge already covered this
+        target → skip the dispatch (no K/merge slot spent). ``"survived"`` /
+        ``"unknown"`` / rechecker error → dispatch normally (conservative:
+        never skip on doubt)."""
+
+        if staleness_rechecker is None or merges_done < 1 or template != "A":
+            return ""
+        try:
+            status = staleness_rechecker(
+                repo=repo,
+                file=finding.file,
+                line=finding.line,
+                mutation=finding.mutation,
+                signature=finding.signature,
+            )
+        except Exception:
+            return ""
+        if status == "killed":
+            return f"{_HALT_STALE_CANDIDATE_PREFIX}: {finding.signature}"
+        return ""
+
     def _submit_next() -> None:
-        if not queue:
+        nonlocal processed_count
+        while queue:
+            record = queue.pop(0)
+            (
+                template,
+                finding,
+                source_report,
+                candidate_count,
+                tr,
+                worker_id,
+                _branch_hint,
+            ) = record
+            stale = _stale_skip_reason(template=template, finding=finding)
+            if stale:
+                # spec_047 §2-3 — do NOT dispatch; record a skip and consume
+                # the candidate (but not a merge slot). Loop to the next
+                # queued record so the pool stays full.
+                outcomes.append(
+                    AutoFixOutcome(
+                        skipped=True,
+                        skip_reason=stale,
+                        finding_signature=finding.signature,
+                        candidate_count=candidate_count,
+                        spec_auto_id=getattr(tr, "spec_auto_id", "") or "",
+                        spec_auto_path=getattr(tr, "spec_auto_path", None),
+                        template=template,
+                    )
+                )
+                processed_count += 1
+                continue
+            fut = executor.submit(
+                _run_worker_phase,
+                worker_id=worker_id,
+                template=template,
+                finding=finding,
+                source_report=source_report,
+                candidate_count=candidate_count,
+                tr=tr,
+                repo=repo,
+                gops=gops,
+                dispatcher=dispatcher,
+                run_suite=run_suite,
+                recheck_mutation=recheck_mutation,
+                recheck_adversarial=recheck_adversarial,
+                inspect=inspect,
+                workspace_factory=workspace_factory,
+                dispatch_timeout_s=dispatch_timeout_s,
+                loop_max_iterations=loop_max_iterations,
+                r5_recheck_times=r5_recheck_times,
+                policy=policy,
+                night_id=night_id,
+                halts_dir=halts_dir,
+            )
+            in_flight[fut] = worker_id
             return
-        record = queue.pop(0)
-        (
-            template,
-            finding,
-            source_report,
-            candidate_count,
-            tr,
-            worker_id,
-            _branch_hint,
-        ) = record
-        fut = executor.submit(
-            _run_worker_phase,
-            worker_id=worker_id,
-            template=template,
-            finding=finding,
-            source_report=source_report,
-            candidate_count=candidate_count,
-            tr=tr,
-            repo=repo,
-            gops=gops,
-            dispatcher=dispatcher,
-            run_suite=run_suite,
-            recheck_mutation=recheck_mutation,
-            recheck_adversarial=recheck_adversarial,
-            inspect=inspect,
-            workspace_factory=workspace_factory,
-            dispatch_timeout_s=dispatch_timeout_s,
-            loop_max_iterations=loop_max_iterations,
-            r5_recheck_times=r5_recheck_times,
-        )
-        in_flight[fut] = worker_id
 
     def _maybe_save_dropped(wpr: _WorkerPhaseResult) -> None:
         """spec_041 §2-3 — 退避 a verified-but-dropped patch."""
@@ -1917,6 +2389,12 @@ def _drain_worker_pool(
                         started_at=wpr.started_at,
                         finished_at=wpr.finished_at,
                     )
+                    if wpr.superseded_ids:
+                        from dataclasses import replace
+
+                        integrated = replace(
+                            integrated, superseded_ids=wpr.superseded_ids
+                        )
                     outcomes.append(integrated)
                     if integrated.merged:
                         merges_done += 1
@@ -2583,6 +3061,9 @@ def _run_propose_loop(
     max_candidates: int = 1,
     loop_max_iterations: int = 1,
     r5_recheck_times: int = 1,
+    policy: str = "",
+    night_id: str = "",
+    halts_dir: Path | None = None,
 ) -> tuple[AutoFixOutcome, tuple[AutoFixOutcome, ...]]:
     """Drive the propose-mode loop for up to ``max_candidates``
     candidates in series (spec_028 §2-2 + spec_038 top-K extension).
@@ -2750,6 +3231,9 @@ def _run_propose_loop(
                 proposal_dir=proposal_dir,
                 loop_max_iterations=loop_max_iterations,
                 r5_recheck_times=r5_recheck_times,
+                policy=policy,
+                night_id=night_id,
+                halts_dir=halts_dir,
             )
         )
 
@@ -2777,6 +3261,9 @@ def _process_one_propose_candidate(
     proposal_dir: Path | None,
     loop_max_iterations: int = 1,
     r5_recheck_times: int = 1,
+    policy: str = "",
+    night_id: str = "",
+    halts_dir: Path | None = None,
 ) -> AutoFixOutcome:
     """spec_038 §2-3 — per-candidate body, extended by spec_039 §2-3 to
     run the dispatch + verify cycle through :func:`ccd.loop.run_fix_loop`
@@ -2826,22 +3313,62 @@ def _process_one_propose_candidate(
                 clone=clone_path,
             )
 
+            def _persist_propose_halt(
+                outcome: AutoFixOutcome,
+                *,
+                fl: FixLoopOutcome | None = None,
+                phase: str = "",
+            ) -> AutoFixOutcome:
+                """spec_047 §2-1/§2-2 — persist the propose halt's
+                diagnostics out of the clone and fold in supersede ids."""
+
+                from dataclasses import replace
+
+                art = _persist_halt_artifacts(
+                    halts_dir=halts_dir,
+                    night_id=night_id,
+                    spec_id=tr.spec_auto_id,
+                    clone_path=clone_path,
+                    branch=branch,
+                    halt_reason=outcome.halt_reason,
+                    phase=phase,
+                    fl=fl,
+                )
+                return replace(
+                    outcome,
+                    halt_artifacts_dir=art,
+                    superseded_ids=tr.superseded_ids,
+                )
+
             try:
                 gops.create_and_checkout_branch(
                     repo=clone_path, branch=branch
                 )
             except Exception as exc:
-                return _propose_halt_outcome(
-                    template=template,
-                    finding=finding,
-                    tr=tr,
-                    candidate_count=candidate_count,
-                    branch=branch,
-                    halt_reason=(
-                        "propose: branch creation failed in clone: "
-                        f"{type(exc).__name__}: {exc}"
+                return _persist_propose_halt(
+                    _propose_halt_outcome(
+                        template=template,
+                        finding=finding,
+                        tr=tr,
+                        candidate_count=candidate_count,
+                        branch=branch,
+                        halt_reason=(
+                            "propose: branch creation failed in clone: "
+                            f"{type(exc).__name__}: {exc}"
+                        ),
                     ),
+                    phase="setup",
                 )
+
+            # spec_047 §2-4 — dispatch breadcrumb on the LIVE side.
+            _log_dispatch_start(
+                live_repo=repo,
+                policy=policy,
+                night_id=night_id,
+                spec_id=tr.spec_auto_id,
+                spec_auto_path=tr.spec_auto_path,
+                branch=branch,
+            )
 
             # spec_039 — build the iteration verifier closure and run
             # the convergence loop inside the clone. The verifier
@@ -2877,16 +3404,19 @@ def _process_one_propose_candidate(
                     spec_id=tr.spec_auto_id,
                 )
             except Exception as exc:
-                return _propose_halt_outcome(
-                    template=template,
-                    finding=finding,
-                    tr=tr,
-                    candidate_count=candidate_count,
-                    branch=branch,
-                    halt_reason=(
-                        f"{_HALT_PROPOSE_DISPATCH_FAILED}: "
-                        f"{type(exc).__name__}: {exc}"
+                return _persist_propose_halt(
+                    _propose_halt_outcome(
+                        template=template,
+                        finding=finding,
+                        tr=tr,
+                        candidate_count=candidate_count,
+                        branch=branch,
+                        halt_reason=(
+                            f"{_HALT_PROPOSE_DISPATCH_FAILED}: "
+                            f"{type(exc).__name__}: {exc}"
+                        ),
                     ),
+                    phase="dispatch",
                 )
 
             dispatch_status = fl.final_dispatch_status
@@ -2899,15 +3429,21 @@ def _process_one_propose_candidate(
                     or fl.halt_reason
                     or "no reason"
                 )
-                halt_outcome = _propose_halt_outcome(
-                    template=template,
-                    finding=finding,
-                    tr=tr,
-                    candidate_count=candidate_count,
-                    branch=branch,
-                    dispatched=fl.final_dispatched,
-                    dispatch_status=dispatch_status or "failed",
-                    halt_reason=f"{_HALT_PROPOSE_DISPATCH_FAILED}: {reason}",
+                halt_outcome = _persist_propose_halt(
+                    _propose_halt_outcome(
+                        template=template,
+                        finding=finding,
+                        tr=tr,
+                        candidate_count=candidate_count,
+                        branch=branch,
+                        dispatched=fl.final_dispatched,
+                        dispatch_status=dispatch_status or "failed",
+                        halt_reason=(
+                            f"{_HALT_PROPOSE_DISPATCH_FAILED}: {reason}"
+                        ),
+                    ),
+                    fl=fl,
+                    phase="dispatch",
                 )
                 return _attach_loop_meta(
                     outcome=halt_outcome,
@@ -2938,29 +3474,33 @@ def _process_one_propose_candidate(
                     and loop_max_iterations > 1
                 ):
                     halt_reason = f"{halt_reason} [{fl.halt_reason}]"
-                return AutoFixOutcome(
-                    skipped=False,
-                    spec_auto_id=tr.spec_auto_id,
-                    spec_auto_path=tr.spec_auto_path,
-                    finding_signature=finding.signature,
-                    candidate_count=candidate_count,
-                    template=template,
-                    branch=branch,
-                    dispatched=True,
-                    dispatch_status=dispatch_status,
-                    r5_killed=r5_killed,
-                    r4_suite_passed=r4_passed,
-                    r4_detail=r4_detail,
-                    r5_detail=r5_detail,
-                    guard_passed=guard_passed,
-                    guard_halt_reasons=guard_reasons,
-                    merged=False,
-                    halt_reason=halt_reason,
-                    mode="propose",
-                    proposed=False,
-                    iterations=fl.iterations,
-                    converged=False,
-                    loop_halt_reason=fl.halt_reason,
+                return _persist_propose_halt(
+                    AutoFixOutcome(
+                        skipped=False,
+                        spec_auto_id=tr.spec_auto_id,
+                        spec_auto_path=tr.spec_auto_path,
+                        finding_signature=finding.signature,
+                        candidate_count=candidate_count,
+                        template=template,
+                        branch=branch,
+                        dispatched=True,
+                        dispatch_status=dispatch_status,
+                        r5_killed=r5_killed,
+                        r4_suite_passed=r4_passed,
+                        r4_detail=r4_detail,
+                        r5_detail=r5_detail,
+                        guard_passed=guard_passed,
+                        guard_halt_reasons=guard_reasons,
+                        merged=False,
+                        halt_reason=halt_reason,
+                        mode="propose",
+                        proposed=False,
+                        iterations=fl.iterations,
+                        converged=False,
+                        loop_halt_reason=fl.halt_reason,
+                    ),
+                    fl=fl,
+                    phase="verify",
                 )
 
             # 7. Diff must be non-empty — a "verified proposal" with no
@@ -4051,6 +4591,12 @@ def _integrate_one_candidate(
     _delete_feature_branch_after_merge(
         gops=gops, repo=live_repo, branch=branch
     )
+
+    # spec_047 §2-2 — the fix is merged, so its inbox spec is no longer a
+    # pending-dispatch item; retire it to bridge/archive/ so inbox reflects
+    # only live work (the auto_002 残留 the spec observed). Best-effort: a
+    # failed move never un-does the merge.
+    _archive_inbox_spec(live_repo=live_repo, spec_auto_path=spec_auto_path)
 
     # Success — surface the diff captured AFTER apply on live (it's the
     # canonical "what landed on main"). When live and clone are at the

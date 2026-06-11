@@ -315,6 +315,7 @@ def _process_policy(
         brief_dir: Path | None = None
         proposal_dir: Path | None = None
         record_dir: Path | None = None
+        halts_dir: Path | None = None
     else:
         discover_dir = (
             ccd_repo / "_ai_workspace" / "discover" / entry.name
@@ -324,6 +325,9 @@ def _process_policy(
         ).resolve()
         proposal_dir = (brief_dir / "proposals").resolve()
         record_dir = (brief_dir / "records").resolve()
+        # spec_047 §2-1 — per-policy HALT artifacts co-located with the
+        # per-policy report so its §D links resolve relatively.
+        halts_dir = (brief_dir / "halts").resolve()
 
     # spec_030 — profile-driven adversarial parser injection. In
     # genuine registry mode (NOT fallback) a施策 that lists
@@ -371,6 +375,11 @@ def _process_policy(
     call_kwargs["brief_dir"] = brief_dir
     call_kwargs["proposal_dir"] = proposal_dir
     call_kwargs["record_dir"] = record_dir
+    call_kwargs["halts_dir"] = halts_dir
+    # spec_047 §2-4 — the policy name (TOML stem) so dispatch breadcrumbs
+    # name "which施策" unambiguously (per-policy spec_auto_NNN numbering is
+    # otherwise ambiguous across policies).
+    call_kwargs["policy"] = entry.name
     if adversarial_parsers is not None:
         call_kwargs["adversarial_parsers"] = adversarial_parsers
     if channel_skips:
