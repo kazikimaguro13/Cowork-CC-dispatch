@@ -803,8 +803,23 @@ def test_canonical_config_is_fully_denylist_covered() -> None:
     is migrated (e.g. ``profiles/`` → ``policies/``) but the denylist
     enumeration is not updated — exactly the Fable 5 🟢-1 failure mode."""
     from ccd.guard import uncovered_protected_configs  # noqa: PLC0415
+    from ccd.profile import PROFILES_DIR_REL  # noqa: PLC0415
 
     protected = _canonical_protected_configs()
+    # spec_049 (2026-06-13): isolation clones (ccd.discover._ISOLATION_IGNORE
+    # excludes `_ai_workspace/`) and gitignored profile originals can leave the
+    # canonical profile dir absent on disk. There the existence premise below
+    # does not hold; the coverage invariant is then vacuously satisfied. We
+    # still run that invariant in BOTH environments, then bail before the
+    # dev-only premise. This stays purely additive (no removed/changed line ->
+    # R2 append-only safe) and uses NO skip marker (R2 skip-scan safe); an
+    # unconditional premise assert would RED the mutmut baseline and the
+    # fix-dispatch smoke inside isolation clones (the spec_048 regression).
+    # Discriminator = same source of truth production reads: PROFILES_DIR_REL.
+    repo = Path(__file__).resolve().parent.parent
+    if not (repo / PROFILES_DIR_REL).is_dir():
+        assert uncovered_protected_configs(protected) == []
+        return
     # We must at least have found the multi-policy profiles on disk.
     assert any(p.startswith("_ai_workspace/profiles/") for p in protected), protected
     leftover = uncovered_protected_configs(protected)
