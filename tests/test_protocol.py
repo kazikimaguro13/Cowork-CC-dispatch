@@ -252,6 +252,27 @@ def test_parse_result_handles_constructed_file(tmp_path: Path) -> None:
     assert result.commits == ["abc1234 first", "def5678 second"]
 
 
+def test_write_result_status_line_is_exact_for_every_status(tmp_path: Path) -> None:
+    """Pin the `- **Status**: <value>` header line emitted by `write_result`.
+
+    `protocol.write_result` builds the Status header line from the literal
+    prefix `"- **Status**: "` plus `result.status.value`. This test exercises
+    every `DispatchStatus` member and asserts the produced header line matches
+    exactly, so any corruption of that line's label or interpolated value is
+    caught with a specific assertion (not a generic failure).
+    """
+
+    for status in DispatchStatus:
+        out = tmp_path / f"result_{status.value}.md"
+        write_result(Result(spec_id="spec_010", status=status, body="x"), out)
+        lines = out.read_text(encoding="utf-8").splitlines()
+
+        status_lines = [ln for ln in lines if ln.startswith("- **Status**:")]
+        assert status_lines == [f"- **Status**: {status.value}"], (
+            f"unexpected Status header for {status!r}: {status_lines}"
+        )
+
+
 def test_spec_round_trip_starting_from_object(tmp_path: Path) -> None:
     """A Spec created in code must survive write → parse unchanged (sans path)."""
 
